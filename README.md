@@ -34,16 +34,17 @@ in VRAM (99.8% cache hits). Engine 0.1.40.3, measured 2026-10-11.
 
 **Reads your prompt** (tokens/s):
 
-| Prompt | Before, `--prefill auto:32768` | Before, `--prefill auto` | This fork | Speedup vs. `auto:32768` |
-| ---: | ---: | ---: | ---: | ---: |
-| 4K | 713-751 | 697-750 | **1,080** | 1.5x |
-| 16K | 891-908 | 1,466-1,498 | **2,240** | 2.5x |
-| 32K | 809-883 | 1,996-2,112 | **2,920** | 3.4x |
+| Prompt | Before, `--prefill auto:32768` | This fork | Speedup vs. `auto:32768` |
+| ---: | ---: | ---: | ---: |
+| 4K | 713-751 | **1,080** | 1.5x |
+| 16K | 891-908 | **2,240** | 2.5x |
+| 32K | 809-883 | **2,920** | 3.4x |
+| 100K | — | **3,974** | — |
 
 **Writes answers:** 57-60 tokens/s for one request (unchanged: decoding is GPU-bound, the 8 cards run their layers
 one after another). **8 requests at once:** 136 tokens/s in total, against 50 tokens/s one at a time.
 
-The "before" columns are two requests each, from [docs/MULTI_GPU.md](docs/MULTI_GPU.md#what-each-card-holds) (the step by step
+The "before" column is upstream with `--prefill auto:32768`, two requests each, from [docs/MULTI_GPU.md](docs/MULTI_GPU.md#what-each-card-holds) (the step by step
 numbers are there too). Tried on these cards with no gain: `--spec 6` (slower), `--mtp-q4 all`, `STRATA_HC_Q8`.
 
 The settings, added to the config setup wrote (`strata-<model>.json`):

@@ -35,17 +35,18 @@ todos los expertos en VRAM (99,8 % de aciertos de caché). Motor 0.1.40.3, medid
 
 **Lee tu prompt** (tokens/s):
 
-| Prompt | Antes, `--prefill auto:32768` | Antes, `--prefill auto` | Este fork | Mejora vs. `auto:32768` |
-| ---: | ---: | ---: | ---: | ---: |
-| 4K | 713-751 | 697-750 | **1.080** | 1,5x |
-| 16K | 891-908 | 1.466-1.498 | **2.240** | 2,5x |
-| 32K | 809-883 | 1.996-2.112 | **2.920** | 3,4x |
+| Prompt | Antes, `--prefill auto:32768` | Este fork | Mejora vs. `auto:32768` |
+| ---: | ---: | ---: | ---: |
+| 4K | 713-751 | **1.080** | 1,5x |
+| 16K | 891-908 | **2.240** | 2,5x |
+| 32K | 809-883 | **2.920** | 3,4x |
+| 100K | — | **3.974** | — |
 
 **Escribe respuestas:** 57-60 tokens/s con una petición (sin cambios: la decodificación está limitada por la GPU, las
 8 tarjetas calculan sus capas una tras otra). **8 peticiones a la vez:** 136 tokens/s en total, frente a 50 tokens/s
 una por una.
 
-Las columnas «Antes» son dos peticiones cada una, de [docs/MULTI_GPU.md](docs/MULTI_GPU.md#what-each-card-holds) (allí
+La columna «Antes» es el proyecto original con `--prefill auto:32768`, dos peticiones cada una, de [docs/MULTI_GPU.md](docs/MULTI_GPU.md#what-each-card-holds) (allí
 están también las cifras paso a paso). Probado en estas tarjetas sin ganancia: `--spec 6` (más lento),
 `--mtp-q4 all`, `STRATA_HC_Q8`.
 

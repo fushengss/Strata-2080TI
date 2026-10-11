@@ -35,17 +35,18 @@ cartes, tous les experts en VRAM (99,8 % de succès du cache). Moteur 0.1.40.3, 
 
 **Lit votre prompt** (tokens/s) :
 
-| Prompt | Avant, `--prefill auto:32768` | Avant, `--prefill auto` | Ce fork | Gain vs. `auto:32768` |
-| ---: | ---: | ---: | ---: | ---: |
-| 4K | 713-751 | 697-750 | **1 080** | 1,5x |
-| 16K | 891-908 | 1 466-1 498 | **2 240** | 2,5x |
-| 32K | 809-883 | 1 996-2 112 | **2 920** | 3,4x |
+| Prompt | Avant, `--prefill auto:32768` | Ce fork | Gain vs. `auto:32768` |
+| ---: | ---: | ---: | ---: |
+| 4K | 713-751 | **1 080** | 1,5x |
+| 16K | 891-908 | **2 240** | 2,5x |
+| 32K | 809-883 | **2 920** | 3,4x |
+| 100K | — | **3 974** | — |
 
 **Écrit les réponses :** 57-60 tokens/s pour une requête (inchangé : le décodage est limité par le GPU, les 8 cartes
 calculent leurs couches l'une après l'autre). **8 requêtes à la fois :** 136 tokens/s au total, contre 50 tokens/s
 une par une.
 
-Les colonnes « Avant » portent sur deux requêtes chacune, tirées de
+La colonne « Avant » est le projet d'origine avec `--prefill auto:32768`, deux requêtes chacune, tirées de
 [docs/MULTI_GPU.md](docs/MULTI_GPU.md#what-each-card-holds) (les chiffres étape par étape y sont aussi). Essayé sur ces
 cartes sans gain : `--spec 6` (plus lent), `--mtp-q4 all`, `STRATA_HC_Q8`.
 

@@ -34,17 +34,18 @@ Experte im VRAM (99,8 % Cache-Treffer). Engine 0.1.40.3, gemessen am 2026-10-11.
 
 **Liest deinen Prompt** (Tokens/s):
 
-| Prompt | Vorher, `--prefill auto:32768` | Vorher, `--prefill auto` | Dieser Fork | Faktor ggü. `auto:32768` |
-| ---: | ---: | ---: | ---: | ---: |
-| 4K | 713-751 | 697-750 | **1.080** | 1,5x |
-| 16K | 891-908 | 1.466-1.498 | **2.240** | 2,5x |
-| 32K | 809-883 | 1.996-2.112 | **2.920** | 3,4x |
+| Prompt | Vorher, `--prefill auto:32768` | Dieser Fork | Faktor ggü. `auto:32768` |
+| ---: | ---: | ---: | ---: |
+| 4K | 713-751 | **1.080** | 1,5x |
+| 16K | 891-908 | **2.240** | 2,5x |
+| 32K | 809-883 | **2.920** | 3,4x |
+| 100K | — | **3.974** | — |
 
 **Schreibt Antworten:** 57-60 Tokens/s für eine Anfrage (unverändert: das Dekodieren ist GPU-gebunden, die 8 Karten
 rechnen ihre Schichten nacheinander). **8 Anfragen gleichzeitig:** 136 Tokens/s insgesamt, gegenüber 50 Tokens/s
 nacheinander.
 
-Die „Vorher“-Spalten sind je zwei Anfragen aus [docs/MULTI_GPU.md](docs/MULTI_GPU.md#what-each-card-holds) (dort auch
+Die „Vorher“-Spalte ist das Originalprojekt mit `--prefill auto:32768`, je zwei Anfragen, aus [docs/MULTI_GPU.md](docs/MULTI_GPU.md#what-each-card-holds) (dort auch
 die Zahlen Schritt für Schritt). Auf diesen Karten ohne Gewinn getestet: `--spec 6` (langsamer), `--mtp-q4 all`,
 `STRATA_HC_Q8`.
 
