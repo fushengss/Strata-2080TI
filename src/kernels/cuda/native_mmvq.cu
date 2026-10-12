@@ -43,6 +43,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <cstdio>
 #include <vector>
@@ -1118,6 +1119,22 @@ struct SmallTraits<Q80Block, 8> {
         const float d1 = __low2float(x->ds);
         return r.d0 * d1 * float(sumi);
     }
+    // the activation half of apply, loaded once per (block, column) and applied to every row of the block: the same
+    // ints and scale, the same expression, so the same bits as apply
+    struct X { int u[2]; float d1; };
+    __device__ static X load_x(const Q81Block* __restrict__ x, int iqs) {
+        X r;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) r.u[i] = reinterpret_cast<const int*>(x->qs)[iqs + i];
+        r.d1 = __low2float(x->ds);
+        return r;
+    }
+    __device__ static float apply_x(const W& r, const X& xv) {
+        int sumi = 0;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) sumi = STRATA_DP4A(r.v[i], xv.u[i], sumi);
+        return r.d0 * xv.d1 * float(sumi);
+    }
 };
 
 template<>
@@ -1157,6 +1174,10 @@ static bool s26_tsum_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
     return on;
 }
+
+// traits with load_x / apply_x (Q8_0): the multi-column kernel loads each column's activations once per block
+template<typename F, typename = void> struct has_load_x : std::false_type {};
+template<typename F> struct has_load_x<F, std::void_t<typename F::X>> : std::true_type {};
 
 // S26 STRATA_LFUSE (PAIR): blocks n_out.. compute the same rows of w2 into y2 (two matrices of one shape on one
 // input in one launch; each output's code is the single matrix's)
@@ -1205,14 +1226,30 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
     for (; kbx < blocks_per_row; kbx += BPI) {
         const int kby = kbx * F::KBY;
         const int kqs = F::kqs(tid);
+        if constexpr (has_load_x<F>::value) {
+            // the rows' weights first (DRAM), then each column's activations once for all the rows (they were read
+            // again for every row: the per-column loads, not the weights, bound the kernel at 3-5 columns on sm_75)
+            typename F::W wv[ROWS];
 #pragma unroll
-        for (int i = 0; i < ROWS; ++i) {
-            if (row0 + i < n_out) {
-                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
-                const typename F::W wv = F::load(w + block, kqs);      // once per (row, block)
+            for (int i = 0; i < ROWS; ++i)
+                if (row0 + i < n_out) wv[i] = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
 #pragma unroll
-                for (int j = 0; j < NCOLS; ++j)                         // then per column
-                    tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+            for (int j = 0; j < NCOLS; ++j) {
+                const typename F::X xv = F::load_x(x + std::size_t(j) * x_stride + kby, kqs);
+#pragma unroll
+                for (int i = 0; i < ROWS; ++i)
+                    if (row0 + i < n_out) tmp[j][i] += F::apply_x(wv[i], xv);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (row0 + i < n_out) {
+                    const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                    const typename F::W wv = F::load(w + block, kqs);      // once per (row, block)
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j)                         // then per column
+                        tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+                }
             }
         }
     }
