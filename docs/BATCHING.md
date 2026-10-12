@@ -185,6 +185,10 @@ at once, 256 tokens each, greedy, one round:
 Four slots beat eight there: the slots' sessions took 57 of each card's 3,072 expert-cache slots with four and 268
 with eight, so with eight more experts ran on the CPU; four groups already keep the eight cards busy. With fewer
 cache slots a request alone also gives a different (equally coherent) greedy text than without `"parallel"`.
+The slots also cost prompts 8-16% there. Adding `--trim-stage-weights` (with `"layer_split": "auto"` it trims every
+card after the first) gave cards 2-8 back all 3,072 slots, and in one run each (engine built from this source, with
+`--split-chunks 4`, `STRATA_BF16_TC=1`, `STRATA_PREFILL_ZC=1`): a request alone decoded at 59.7 tok/s and read 4K /
+16K / 32K prompts at 1,028 / 2,396 / 3,112 tok/s, and four requests at once ran 130.9 tok/s, the last done in 7.8 s.
 
 ## Together with conversation parking
 
