@@ -558,6 +558,24 @@ ThreadAffinity pin_current_thread(int core) {
 #endif
 }
 
+namespace {
+#if !defined(_WIN32)
+// the CPUs the process started with, read before main() runs (before the host thread is pinned)
+struct StartMask {
+    std::vector<unsigned long> mask;
+    bool ok = false;
+    StartMask() { ok = detail::get_thread_affinity(mask) == 0; }
+};
+const StartMask g_start_mask;
+#endif
+}  // namespace
+
+void unpin_current_thread() {
+#if !defined(_WIN32)
+    if (g_start_mask.ok) (void) detail::set_thread_affinity(g_start_mask.mask);
+#endif
+}
+
 void restore_thread_affinity(const ThreadAffinity& previous) {
     if (!previous.valid) return;
 #if defined(_WIN32)

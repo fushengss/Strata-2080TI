@@ -140,6 +140,9 @@ std::vector<uint8_t> q8_0_of_bf16(const uint16_t* x, uint64_t n) {
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
+    // a GGUF with the model's own MTP layer (blk.48, nextn_predict_layers 1) carries its projections too: the engine
+    // runs the 48 main layers and drafts with its own MTP runtime, so those are not served here
+    if (std::strtol(name.c_str() + 4, nullptr, 10) >= 48) return false;
     // Match the native PLE kernel: Q2_0, IQ3_XXS, IQ4_XS and Q8_0 (UD-Q4_K_XL). Other keys retain the packed BF16
     // fallback.
     if (name == "blk.1.ple_key.weight")

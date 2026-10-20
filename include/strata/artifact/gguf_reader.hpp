@@ -709,6 +709,14 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
     };
     for (const Key& k : keys)
         if (!read_int(k.key, g.*k.field, k.required)) return err;
+    // a GGUF that carries the model's own MTP layer (orcarouter's "-MTP" Q8_0) counts it in block_count and says so in
+    // nextn_predict_layers; the engine runs the main layers and drafts with its own MTP runtime, so blk.48 goes unused
+    int64_t n_nextn = 0;
+    if (const MetaValue* v = f.get(p + "nextn_predict_layers"); v != nullptr && v->is_num() && (int64_t) v->u > 0 &&
+                                                                 (int64_t) v->u < g.n_layers) {
+        n_nextn = (int64_t) v->u;
+        g.n_layers -= n_nextn;
+    }
 
     int64_t value_length = g.head_dim, ff_shexp = g.n_ff;
     if (!read_int("attention.value_length", value_length, false) ||
@@ -747,7 +755,8 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
     // The layer split, twice over: the interval, and a ratio per layer that is non-zero (the indexer's pooling
     // block) exactly on the full-attention layers.
     if (const MetaValue* v = f.get(p + "attention.compress_ratios")) {
-        if (v->type != MetaType::ARRAY || v->count != (uint64_t) g.n_layers || v->items.size() != v->count)
+        if (v->type != MetaType::ARRAY || (v->count != (uint64_t) g.n_layers && v->count != (uint64_t) (g.n_layers + n_nextn)) ||
+            v->items.size() != v->count)
             return p + "attention.compress_ratios must list one entry for each of the " + std::to_string(g.n_layers) +
                    " layers";
         // A list of zeros only is a converter's placeholder, not a layer split (#2396: orcarouter's

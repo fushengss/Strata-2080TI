@@ -152,6 +152,11 @@ struct ThreadAffinity {
 /// Restore on the same calling thread. Pool-owned workers use hard group affinity instead.
 ThreadAffinity pin_current_thread(int core);
 void restore_thread_affinity(const ThreadAffinity& previous);
+/// Puts the caller back on the CPUs the process started with (Linux).  A thread started by the pinned host thread
+/// inherits its one core: the prompt path's per-stage, copy-issue and PLE threads call this first, or a layer
+/// split's stages all queue on that core.  No-op on Windows, where a new thread does not inherit its creator's CPU
+/// Set selection.
+void unpin_current_thread();
 
 class ExpertPool {
 public:

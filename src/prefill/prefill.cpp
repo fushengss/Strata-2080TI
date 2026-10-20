@@ -137,6 +137,23 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // the group that read it was gathered (the walk stages at most STAGE_GRP - MMQ_GROUP - 1 entries ahead)
 constexpr int STAGE_GRP = 32;
 constexpr int kSplitHelpRing = 48;  // layer split help: the helper stage's ring slots it streams through (at most)
+// STRATA_PREFILL_ZC=1 (opt-in): the zero-copy MMQ read.  A resident expert's blob is read in place by one MMQ launch
+// per product over the cache's slots as channels, instead of being copied into a group buffer first.  Not the same
+// bits: the greedy text of 4K-32K prompts drifted after some tokens in exact mode (STRATA_IQ_MT_MIN=1 --pcie-frac 0
+// --adapt-every 1000000, which repeats the default read bit for bit), as with other summation-order changes; MMQ
+// picks its stream-k split of K from a launch's tile count, which differs between one launch and 16-expert groups.
+// 8x RTX 2080 Ti, Unsloth Q8_0, --split-chunks 4, that exact mode: 4K / 16K / 32K prompts 1,035 / 2,190 / 2,839 ->
+// 1,114 / 2,269 / 2,938 tok/s.
+inline bool zc_enabled() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_ZC"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+// The most rows an expert may have and still be read in place: MMQ gives every channel of a launch the tiles of its
+// fullest one, so one hot expert multiplies the empty blocks of every other slot.  STRATA_PREFILL_ZC_MAXR=N.
+inline int64_t zc_max_rows() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_ZC_MAXR"); return e ? (int64_t) std::atoll(e) : (int64_t) 128; }();
+    return v;
+}
 // STRATA_PREFILL_STREAM_AHEAD=0 keeps the previous routed-only upload schedule (A/B).
 inline bool stream_ahead_enabled() {
     static const bool on = [] {
@@ -865,6 +882,14 @@ struct Prefill::Impl {
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
     bool borrowed = false, borrow_spill = false;
+    // the zero-copy MMQ read (zc_enabled): the bytes the prompt path borrowed from the cache (prompt buffers, not
+    // experts), its per-slot bounds, and how much it took (reported with STRATA_PREFILL_TIMING)
+    const uint8_t* lent_lo = nullptr;
+    uint64_t lent_bytes = 0;
+    int32_t* zc_bounds_dev = nullptr;
+    int64_t zc_bounds_cap = 0;
+    std::vector<int32_t> zc_bounds_host;
+    int64_t zc_experts = 0, zc_gathered = 0, zc_channels = 0;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     std::vector<void*> owned;
@@ -1419,6 +1444,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
     m.borrow_spill = m.borrowed && borrow_spill;
+    m.lent_lo = (const uint8_t*) borrow;
+    m.lent_bytes = borrow != nullptr ? borrow_bytes : 0;
     bool ok = true;
     // one-time: events, the stager, the host buffers (for the largest chunk), the identity page table
     for (int i = 0; i < ring_cap(); ++i) {
@@ -1664,6 +1691,8 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
         return false;
     }
     bool ok = true;
+    m.lent_lo = (const uint8_t*) borrow;
+    m.lent_bytes = borrow_bytes;
     Alloc o;
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
@@ -2781,7 +2810,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // layer 1 on, and gathering them here first left the GPU idle for the whole read (~0.4 s of a 32K prompt)
         if (ple_on && !ple_next.valid())
             ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {
-                strata::aux_cpus::pin_current_thread();
+                strata::kernels::cpu::unpin_current_thread();   // not on the pinned host's core
+                strata::aux_cpus::pin_current_thread();   // --aux-cpus (when on): onto the spare CPUs instead
                 return ple_gather(c0, b, ple_next_err);
             });
         bool ple_pending = ple_on;
@@ -2810,7 +2840,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     return false;
                 }
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + C, b = ple_buf ^ 1] {
-                    strata::aux_cpus::pin_current_thread();
+                    strata::kernels::cpu::unpin_current_thread();
+                    strata::aux_cpus::pin_current_thread();   // --aux-cpus (when on): onto the spare CPUs instead
                     return ple_gather(c1, b, ple_next_err);
                 });
             }
@@ -2996,7 +3027,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const bool threaded_issue = stream_all && issuer_on;
         if (threaded_issue) {
             issuer = std::thread([&] {
-                strata::aux_cpus::pin_current_thread();
+                strata::kernels::cpu::unpin_current_thread();   // not on the pinned host's core
+                strata::aux_cpus::pin_current_thread();   // --aux-cpus (when on): onto the spare CPUs instead
                 const core::OnDevice od(m.device);
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
@@ -3854,10 +3886,63 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             rows_local = T * K - rows_peer;
                         }
+                        // the zero-copy read (zc_enabled): the resident experts MMQ reads in place, one launch per
+                        // product with the cache's slots as its channels (base + slot * stride) instead of a gather into
+                        // the group buffers first; their rows go first, in slot order.  A product over a row length
+                        // that is not a multiple of 256 values (down: 640) reads up to 256 values past an expert's last
+                        // row (MMQ_TAIL), so an expert qualifies only when the next slot holds expert bytes (not the
+                        // borrowed prompt buffers, not past the cache).  The others keep the gather.
+                        std::vector<std::pair<int32_t, int32_t>> zc;   // (slot, expert), in slot order
+                        std::vector<char> is_zc;
+                        int64_t rows_zc = 0, zc_maxr = 0;
+                        const uint8_t* zc_base = nullptr;
+                        size_t zc_stride = 0;
+                        if (zc_enabled() && use_mmq && lay.native && !fused_l && on_peer.empty() && m.cache != nullptr &&
+                            m.host_res != nullptr && m.mmq_ctx && !detail::mmq_resident_sort_requested() &&
+                            m.cache->slots() >= 2) {
+                            const int64_t ns = m.cache->slots();
+                            zc_base = m.cache->device_slot(0);
+                            zc_stride = (size_t) (m.cache->device_slot(1) - zc_base);
+                            // bytes of 256 values of each type (a whole number of its blocks), the two products' matrices
+                            const size_t ug = mmq::matrix_bytes(mmq_gt, 1, 256), ud = mmq::matrix_bytes(mmq_dt, 1, 256);
+                            const size_t gub = mmq::matrix_bytes(mmq_gt, 1280, N), db = mmq::matrix_bytes(mmq_dt, N, 640);
+                            const auto& f = lay.fmt[(size_t) l];
+                            bool even = true;   // every slot at base + slot * stride (a few thousand compares)
+                            for (int64_t s = 2; s < ns && even; ++s)
+                                even = m.cache->device_slot((int32_t) s) == zc_base + (size_t) s * zc_stride;
+                            // the slots at one stride; a blob that is gate + up then down, as the gather lays them out;
+                            // a stride of whole blocks of either type; every channel's offset within MMQ's 32-bit block
+                            // offsets (counted in the smaller type's 32-value blocks, an upper bound)
+                            if (even && 2 * f.up_off == gub && f.down_off == gub && gub + db <= zc_stride &&
+                                zc_stride % ug == 0 && zc_stride % ud == 0 &&
+                                (uint64_t) ns * zc_stride < (1ull << 31) * (uint64_t) (std::min(ug, ud) / 8)) {
+                                for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                                    const int32_t s = m.host_res[(size_t) l * m.g->n_expert + e];
+                                    if (m.cnt[(size_t) e] == 0 || s < 0 || (!on_cpu.empty() && on_cpu[(size_t) e]) ||
+                                        m.cnt[(size_t) e] > zc_max_rows())
+                                        continue;
+                                    const uint8_t* next = zc_base + (size_t) (s + 1) * zc_stride;
+                                    const bool tail_ok = s + 1 < ns &&
+                                                         !(m.lent_bytes > 0 && next + ud > m.lent_lo && next < m.lent_lo + m.lent_bytes);
+                                    if (tail_ok) zc.emplace_back(s, e);
+                                    else ++m.zc_gathered;
+                                }
+                                std::sort(zc.begin(), zc.end());
+                            }
+                        }
+                        if (!zc.empty()) is_zc.assign((size_t) m.g->n_expert, 0);
                         {
                             int32_t r = 0;
+                            for (const auto& [s, e] : zc) {
+                                is_zc[(size_t) e] = 1;
+                                m.off[(size_t) e] = r;
+                                r += m.cnt[(size_t) e];
+                                zc_maxr = std::max<int64_t>(zc_maxr, m.cnt[(size_t) e]);
+                            }
+                            rows_zc = r;
                             for (int32_t e = 0; e < m.g->n_expert; ++e)
-                                if ((on_peer.empty() || !on_peer[(size_t) e]) && (on_cpu.empty() || !on_cpu[(size_t) e])) {
+                                if ((on_peer.empty() || !on_peer[(size_t) e]) && (on_cpu.empty() || !on_cpu[(size_t) e]) &&
+                                    (is_zc.empty() || !is_zc[(size_t) e])) {
                                     m.off[(size_t) e] = r;
                                     r += m.cnt[(size_t) e];
                                 }
@@ -3881,7 +3966,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::vector<int32_t> order, order_peer;
                         for (int32_t e = 0; e < m.g->n_expert; ++e)
                             if (m.cnt[(size_t) e] > 0 && (on_peer.empty() || on_peer[(size_t) e] != 2) &&
-                                (on_cpu.empty() || !on_cpu[(size_t) e]))
+                                (on_cpu.empty() || !on_cpu[(size_t) e]) && (is_zc.empty() || !is_zc[(size_t) e]))
                                 (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
                         for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)   // the peer-streamed ones last:
                             if (on_peer[(size_t) e] == 2) order_peer.push_back(e);        // their copies get the most time
@@ -3965,6 +4050,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 cudaEventRecord(m.cpu_ev[0], m.cs);
                             }
                             cpu_fut = std::async(std::launch::async, [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, src_h, l, T, r0c, this]() -> bool {
+                                strata::kernels::cpu::unpin_current_thread();
                                 const auto t0 = std::chrono::steady_clock::now();
                                 constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
                                 // a Q2_0 layer (gate/up on the pool's Q2_0 kernels): ActQ activations, as decode's
@@ -4052,6 +4138,53 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     err = "prefill: the group bounds' upload failed";
                                     return false;
                                 }
+                            }
+                            if (!zc.empty()) {
+                                // the zero-copy experts' products: channels are the cache slots zc's first..last, each
+                                // with its expert's rows (none for a slot of another expert); rows [0, rows_zc) of Xq,
+                                // GU, H, Hq and Dm, before the groups reuse H and Hq on the same stream
+                                const int32_t s0 = zc.front().first;
+                                const int64_t nch = (int64_t) zc.back().first - s0 + 1;
+                                m.zc_bounds_host.assign((size_t) nch + 1, 0);
+                                {
+                                    size_t i = 0;
+                                    int32_t r = 0;
+                                    for (int64_t c = 0; c < nch; ++c) {
+                                        m.zc_bounds_host[(size_t) c] = r;
+                                        if (i < zc.size() && zc[i].first == s0 + c) r += m.cnt[(size_t) zc[i++].second];
+                                    }
+                                    m.zc_bounds_host[(size_t) nch] = r;
+                                }
+                                if (m.zc_bounds_cap < nch + 1) {   // once, for every slot the cache can have
+                                    const int64_t cap = std::max<int64_t>(m.cache->full_slots(), nch) + 1;
+                                    if (cudaMalloc((void**) &m.zc_bounds_dev, (size_t) cap * 4) != cudaSuccess) {
+                                        err = "prefill: the zero-copy bounds buffer";
+                                        return false;
+                                    }
+                                    m.owned.push_back(m.zc_bounds_dev);
+                                    m.zc_bounds_cap = cap;
+                                }
+                                cudaMemcpyAsync(m.zc_bounds_dev, m.zc_bounds_host.data(), (size_t) (nch + 1) * 4,
+                                                cudaMemcpyHostToDevice, m.cs);
+                                const uint8_t* w0 = zc_base + (size_t) s0 * zc_stride;
+                                pt.mark(kPfGemmGU, cs);
+                                mmq::Product gu;
+                                gu.w = w0; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = zc_stride;
+                                gu.n = (int) nch; gu.xq = m.Xq; gu.bounds = m.zc_bounds_dev; gu.ids = m.ids_identity;
+                                gu.total_rows = T * K; gu.max_rows = zc_maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                                m.mmq_ctx->run(gu, m.cs);
+                                mmq::swiglu(m.GU, m.H, rows_zc, 640, !lay.native, m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, rows_zc, m.cs);
+                                mmq::Product dn;
+                                dn.w = w0 + lay.fmt[(size_t) l].down_off; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640;
+                                dn.expert_bytes = zc_stride; dn.n = (int) nch; dn.xq = m.Hq; dn.bounds = m.zc_bounds_dev;
+                                dn.ids = m.ids_identity; dn.total_rows = rows_zc; dn.max_rows = zc_maxr; dn.dst = m.Dm;
+                                dn.ld_dst = N;
+                                m.mmq_ctx->run(dn, m.cs);
+                                stats_.experts_resident += (int64_t) zc.size();
+                                m.zc_experts += (int64_t) zc.size();
+                                m.zc_channels += nch;
                             }
                         } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
@@ -4880,7 +5013,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }));
             } else
             next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
-                strata::aux_cpus::pin_current_thread();
+                // the next stage's host work: without this every stage of a split inherits the pinned host's one
+                // core (8x RTX 2080 Ti: 35 of the engine's threads on CPU 0, the GPUs waiting on it, "host grouping")
+                strata::kernels::cpu::unpin_current_thread();
+                strata::aux_cpus::pin_current_thread();   // --aux-cpus (when on): onto the spare CPUs instead
                 return next_->run_impl(tokens + c0, T, p0, next_err_);
             });
             hand_buf_ ^= 1;
@@ -4997,7 +5133,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                      (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str());
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
-                             "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+                             "PLE %.0f ms; zero-copy experts %lld over %lld slot channels, gathered for their tail %lld\n",
+                     host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple, (long long) m.zc_experts,
+                     (long long) m.zc_channels, (long long) m.zc_gathered);
+        m.zc_experts = m.zc_gathered = m.zc_channels = 0;
         if (pe.on) {
             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
             std::string pl;
