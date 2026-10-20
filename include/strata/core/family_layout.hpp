@@ -71,6 +71,13 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
         num("attention.indexer.key_length", g.idx_key_dim);
     }
     g.n_layers = block_count - g.n_mtp_layers;
+    if (family != strata::ModelFamily::Qwen35Moe) {
+        // orcarouter's "-MTP" Q8_0 counts its MTP layer in block_count (nextn_predict_layers 1): the engine runs the
+        // main layers and drafts with its own MTP runtime, so that layer is not part of the model it runs
+        int64_t nextn = 0;
+        num("nextn_predict_layers", nextn);
+        if (nextn > 0 && nextn < g.n_layers) g.n_layers -= nextn;
+    }
     g.ssm_conv_channels = 2 * g.ssm_state_size * g.ssm_k_heads + g.ssm_value_dim;
     if (const strata::MetaValue* v = meta.get("tokenizer.ggml.tokens"))
         if (v->type == strata::MetaType::ARRAY && v->count > 0) g.n_vocab = (int64_t) v->count;
