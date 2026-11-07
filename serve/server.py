@@ -4860,6 +4860,7 @@ class Service:
         self.reasoning_loop_recovery = False
         self.reasoning_budget_configured = False         # the config named reasoning_budget_tokens (0 included): no family default
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+        self.max_tokens_cap = 0                          # config "max_tokens_cap": the most tokens any reply may take (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
@@ -5990,6 +5991,8 @@ class Service:
             print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves that much "
                   f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
             max_new = max(1, room)          # a shorter completion beats a 400 (the default)
+        if self.max_tokens_cap and max_new > self.max_tokens_cap:
+            max_new = self.max_tokens_cap   # one runaway reply would hold a batch slot for its whole length
         if images:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
@@ -10340,6 +10343,12 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         if budget:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
+    cap = cfg.get("max_tokens_cap", 0)
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
+        raise SystemExit(f"[strata] config \"max_tokens_cap\" must be a whole number >= 0 (0 = none), not {cap!r}")
+    svc.max_tokens_cap = cap
+    if cap:
+        print(f"[strata] every reply is capped at {cap} tokens (max_tokens_cap)", flush=True)
     recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
     if recovery is True:
         recovery = "recover"
