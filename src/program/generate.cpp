@@ -8516,6 +8516,23 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB\n",
                          st.dev, (double) fb / 1073741824.0, (double) tb / 1073741824.0, (double) room / 1073741824.0);
         }
+        // A stage that holds every one of its (layer, expert) pairs gives them slots in layer order (hottest first inside a
+        // layer): nothing is left out or evicted then, so the order only decides where each one lives, and a layer's experts in
+        // one run of slots at one stride is what the zero-copy prompt read (STRATA_PREFILL_ZC) needs when the slots differ in
+        // size from layer to layer (a native pack whose layers differ in blob size: Q5_K_M's down is Q8_0 in half of them).
+        // Only with STRATA_PREFILL_ZC=1; STRATA_STAGE_LAYER_ORDER=0 keeps the hottest-first order.
+        if (native_pack && std::getenv("STRATA_PREFILL_ZC") != nullptr && std::getenv("STRATA_PREFILL_ZC")[0] == '1' &&
+            !(std::getenv("STRATA_STAGE_LAYER_ORDER") != nullptr && std::getenv("STRATA_STAGE_LAYER_ORDER")[0] == '0')) {
+            int64_t all = 0;
+            for (const auto& pr : st.profile)
+                all += strata::core::ExpertCache::slot_stride((int64_t) nib::slot_bytes(pr.first), slot_guard);
+            if (all <= room) {
+                std::stable_sort(st.profile.begin(), st.profile.end(),
+                                 [](const std::pair<int32_t, int32_t>& a, const std::pair<int32_t, int32_t>& b) { return a.first < b.first; });
+                std::fprintf(stderr, "strata generate: layer split, CUDA%d: every expert of the stage fits, slots in layer order "
+                                     "(STRATA_PREFILL_ZC)\n", st.dev);
+            }
+        }
         std::vector<int64_t> sized;
         int64_t used = 0;
         for (const auto& pr : st.profile) {

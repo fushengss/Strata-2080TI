@@ -4907,21 +4907,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.host_res != nullptr && m.mmq_ctx && !detail::mmq_resident_sort_requested() &&
                             m.cache->slots() >= 2) {
                             const int64_t ns = m.cache->slots();
-                            zc_base = m.cache->device_slot(0);
-                            zc_stride = (size_t) (m.cache->device_slot(1) - zc_base);
+                            // THIS LAYER's slots: with sized slots (a native pack whose layers differ in blob size: Q5_K_M's
+                            // down is Q8_0 in half of the layers, Q5_1 in the others) the stride differs from layer to layer,
+                            // so the stride and the base are the layer's own: the resident experts' slots span [lo, hi], and
+                            // slot s is at zc_base + s * zc_stride for s in [lo, hi + 1] (the slot after the last one is read
+                            // by the down product's tail over-read)
+                            int32_t lo = INT32_MAX, hi = -1;
+                            for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                                const int32_t s = m.host_res[(size_t) l * m.g->n_expert + e];
+                                if (s >= 0) { lo = std::min(lo, s); hi = std::max(hi, s); }
+                            }
+                            const bool span_ok = hi > lo && (int64_t) hi < ns;
+                            if (span_ok) {
+                                zc_stride = (size_t) (m.cache->device_slot(lo + 1) - m.cache->device_slot(lo));
+                                zc_base = m.cache->device_slot(lo) - (size_t) lo * zc_stride;
+                            }
                             // bytes of 256 values of each type (a whole number of its blocks), the two products' matrices
                             const size_t ug = mmq::matrix_bytes(mmq_gt, 1, 256), ud = mmq::matrix_bytes(mmq_dt, 1, 256);
                             const size_t gub = mmq::matrix_bytes(mmq_gt, 1280, N), db = mmq::matrix_bytes(mmq_dt, N, 640);
                             const auto& f = lay.fmt[(size_t) l];
-                            bool even = true;   // every slot at base + slot * stride (a few thousand compares)
-                            for (int64_t s = 2; s < ns && even; ++s)
-                                even = m.cache->device_slot((int32_t) s) == zc_base + (size_t) s * zc_stride;
+                            bool even = span_ok;   // every slot of the layer at base + slot * stride (a few hundred compares)
+                            for (int64_t s = (int64_t) lo + 1; span_ok && s <= std::min<int64_t>((int64_t) hi + 1, ns - 1) && even; ++s)
+                                even = m.cache->device_slot((int32_t) s) == m.cache->device_slot(lo) + (size_t) (s - lo) * zc_stride;
                             // the slots at one stride; a blob that is gate + up then down, as the gather lays them out;
                             // a stride of whole blocks of either type; every channel's offset within MMQ's 32-bit block
                             // offsets (counted in the smaller type's 32-value blocks, an upper bound)
                             if (even && 2 * f.up_off == gub && f.down_off == gub && gub + db <= zc_stride &&
                                 zc_stride % ug == 0 && zc_stride % ud == 0 &&
-                                (uint64_t) ns * zc_stride < (1ull << 31) * (uint64_t) (std::min(ug, ud) / 8)) {
+                                (uint64_t) ((int64_t) hi + 2 - lo) * zc_stride < (1ull << 31) * (uint64_t) (std::min(ug, ud) / 8)) {
                                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                     const int32_t s = m.host_res[(size_t) l * m.g->n_expert + e];
                                     if (m.cnt[(size_t) e] == 0 || s < 0 || (!on_cpu.empty() && on_cpu[(size_t) e]) ||
