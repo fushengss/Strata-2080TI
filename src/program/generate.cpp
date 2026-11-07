@@ -11765,8 +11765,16 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_PIPED_TARGET_HEAD");
             return v != nullptr && std::atoi(v) != 0;
         }();
+        const bool piped_async_sample = [] {
+            const char* v = std::getenv("STRATA_PIPED_ASYNC_SAMPLE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
         if (piped_target_head && (!piped_mtp || !batch_mtp || batch_df2 || o.batch_groups <= 1)) {
             std::fprintf(stderr, "strata serve: STRATA_PIPED_TARGET_HEAD requires deferred-commit piped MTP batches\n");
+            return 1;
+        }
+        if (piped_async_sample && (!piped_mtp || !batch_mtp || batch_df2 || o.batch_groups <= 1)) {
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_ASYNC_SAMPLE requires deferred-commit piped MTP batches\n");
             return 1;
         }
         if (const char* v = std::getenv("STRATA_DECODE_HEAD_GPU"); v != nullptr && v[0] != '\0' && std::strcmp(v, "-1") != 0) {
@@ -11832,6 +11840,15 @@ int main(int argc, char** argv) {
                          decode_head_device,
                          second ? (std::string("+") + std::to_string(decode_head_devices[1])).c_str() : "",
                          stage_ver_p(n_stages - 1, 0).device());
+        }
+        if (piped_async_sample) {
+            auto& last = stage_ver_p(n_stages - 1, 0);
+            if (!last.enable_piped_async_sampling(err)) {
+                std::fprintf(stderr, "strata serve: piped async sample: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_ASYNC_SAMPLE: source CUDA%d, "
+                                 "event-polled slot sampling with persistent history\n", last.device());
         }
         // Keep the drafter's body/KV and prefill in place. Only explicitly selected solo PW2 chains may
         // use these two vocabulary shards, and their full logits return before the original probability tail.
@@ -14806,7 +14823,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: STRATA_PIPED_TARGET_HEAD requires the deferred-commit piped route\n");
             return 1;
         }
+        if (piped_async_sample && !pmtp) {
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_ASYNC_SAMPLE requires the deferred-commit piped route\n");
+            return 1;
+        }
         uint64_t target_head_reported_windows = 0, target_head_reported_rows = 0;
+        uint64_t async_sample_reported_windows = 0, async_sample_reported_rows = 0;
         std::vector<uint64_t> pmtp_head_reported(piped_mtp_head ? slot_mtp.size() : 0, 0);
         if (piped && batch_mtp && !pmtp)   // #1413: said, not silent
             std::fprintf(stderr,
@@ -15279,6 +15301,15 @@ int main(int argc, char** argv) {
                                  (unsigned long long) (rows - target_head_reported_rows));
                     target_head_reported_windows = windows;
                     target_head_reported_rows = rows;
+                }
+                if (piped_async_sample) {
+                    const auto& last = stage_verifier(n_pipe - 1);
+                    const uint64_t windows = last.piped_async_sample_windows(), rows = last.piped_async_sample_rows();
+                    std::fprintf(stderr, "strata piped async sample: %llu windows, %llu sampled rows completed in this batch\n",
+                                 (unsigned long long) (windows - async_sample_reported_windows),
+                                 (unsigned long long) (rows - async_sample_reported_rows));
+                    async_sample_reported_windows = windows;
+                    async_sample_reported_rows = rows;
                 }
                 if (piped_mtp_head) {
                     for (size_t b = 0; b < slot_mtp.size(); ++b) {

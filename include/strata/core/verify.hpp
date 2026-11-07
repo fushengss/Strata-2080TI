@@ -352,6 +352,11 @@ public:
     bool set_piped_target_head(const NativeHead& head, std::string& err, const NativeHead* second = nullptr);
     uint64_t piped_target_head_windows() const { return piped_target_head_windows_; }
     uint64_t piped_target_head_rows() const { return piped_target_head_rows_; }
+    /// Let batch_poll yield while the original per-slot sampler runs. Pinned/device history rows are reserved
+    /// here, before any batch runs; every row stays owned until its completion event and the window's verdict.
+    bool enable_piped_async_sampling(std::string& err);
+    uint64_t piped_async_sample_windows() const { return piped_async_sample_windows_; }
+    uint64_t piped_async_sample_rows() const { return piped_async_sample_rows_; }
     bool pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
     /// Stage a window ahead of its launch (positions, and the PLE rows from `ple_prev` = the two tokens before the
     /// window as they WILL be, their pages prefetched).  A later `pl_launch` of the same window (T, pos0, tokens, and
@@ -494,8 +499,18 @@ private:
     std::vector<std::vector<int32_t>> slot_tail_;        ///< per slot: its reply tail for the penalty window (set_slot_history)
     int32_t* slot_hist_d_ = nullptr;                     ///< the penalty-history rows of the current batch window (device)
     size_t slot_hist_cap_ = 0;
-    bool sample_rows(int S, std::string& err);
-    int slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, const int32_t*& hist, int& hlen, std::vector<int32_t>& hrows, std::string& err);   ///< the sampled slots' rows of the last batch window
+    bool sample_rows(int S, std::string& err, bool wait = true, int* queued_rows = nullptr);
+    int slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, const int32_t*& hist, int& hlen,
+                      std::vector<int32_t>& hrows, std::string& err, bool async_history = false);   ///< the sampled slots' rows of the last batch window
+    static constexpr int kSlotHistMax = 4096;   // serve's kPenaltyWindowCap, per row
+    int32_t *async_hist_host_ = nullptr, *async_hist_device_ = nullptr;
+    int async_hist_rows_ = 0;
+    cudaEvent_t async_sample_done_ = nullptr;
+    bool piped_async_sampling_ = false, b_sample_pending_ = false;
+    std::chrono::steady_clock::time_point b_sample_since_{};
+    int b_sample_rows_ = 0;
+    uint64_t piped_async_sample_windows_ = 0, piped_async_sample_rows_ = 0;
+    int finish_polled_batch(int S);
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot

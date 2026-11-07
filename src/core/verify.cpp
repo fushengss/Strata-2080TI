@@ -750,6 +750,9 @@ Verifier::~Verifier() {
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     for (float* b : slot_bias_dev_) if (b) cudaFree(b);
     if (slot_hist_d_) cudaFree(slot_hist_d_);
+    if (async_hist_host_) cudaFreeHost(async_hist_host_);
+    if (async_hist_device_) cudaFree(async_hist_device_);
+    if (async_sample_done_) cudaEventDestroy(async_sample_done_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
@@ -4904,8 +4907,7 @@ bool Verifier::set_slot_logit_bias(int slot, const std::vector<float>& bias, std
 // Row t of the last window feeds last_tokens_[t] into slot last_rows_[t]; the penalty-history row is the slot's reply tail plus its tokens in this window up to t
 // (slot_penalty_rows), staged on the device like a solo window's.
 int Verifier::slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, const int32_t*& hist, int& hlen, std::vector<int32_t>& hrows,
-                            std::string& err) {
-    constexpr int kSlotHistMax = 4096;   // serve's kPenaltyWindowCap
+                            std::string& err, bool async_history) {
     sp = slot_sp_[(size_t) last_rows_[t]];
     const bool pen = sp.penalty_last_n > 0 && (sp.penalty_repeat != 1.0f || sp.penalty_freq != 0.0f || sp.penalty_present != 0.0f);
     const bool bias = sp.logit_bias != nullptr;
@@ -4922,6 +4924,23 @@ int Verifier::slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, co
     hrows.assign(need, -1);
     strata::kernels::slot_penalty_rows(last_rows_, last_tokens_, S, tails.data(), n_tails.data(), hlen, hrows.data());
     const OnDevice on_hist(device_);
+    if (async_history) {
+        if (!async_hist_host_ || !async_hist_device_ || S > async_hist_rows_) {
+            err = "verify batch: asynchronous penalty history was not reserved";
+            return -1;
+        }
+        // The temporary vector is only a CPU builder. Every row gets a distinct persistent pinned slice, even
+        // when slots have different penalty lengths. Neither host nor device storage is resized/reused in flight.
+        const size_t offset = (size_t) t * kSlotHistMax;
+        std::memcpy(async_hist_host_ + offset, hrows.data() + (size_t) t * hlen, (size_t) hlen * sizeof(int32_t));
+        if (cudaMemcpyAsync(async_hist_device_ + offset, async_hist_host_ + offset, (size_t) hlen * sizeof(int32_t),
+                            cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+            err = "verify batch: asynchronous penalty-history copy failed";
+            return -1;
+        }
+        hist = async_hist_device_ + offset;
+        return 1;
+    }
     if (slot_hist_cap_ < need) {
         if (slot_hist_d_ != nullptr) cudaFree(slot_hist_d_);
         slot_hist_d_ = nullptr;
@@ -4939,9 +4958,11 @@ int Verifier::slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, co
     return 1;
 }
 
-bool Verifier::sample_rows(int S, std::string& err) {
+bool Verifier::sample_rows(int S, std::string& err, bool wait, int* queued_rows) {
+    if (queued_rows) *queued_rows = 0;
 #if defined(STRATA_GPU_METAL)
     (void) S;
+    (void) wait;
     err = "verify batch: sample_rows is the CUDA / HIP path";
     return false;
 #else
@@ -4951,15 +4972,36 @@ bool Verifier::sample_rows(int S, std::string& err) {
         strata::kernels::SamplerParams sp;
         const int32_t* hist = nullptr;
         int hlen = 0;
-        const int r = slot_row_draw(S, t, sp, hist, hlen, hrows, err);
+        const int r = slot_row_draw(S, t, sp, hist, hlen, hrows, err, !wait);
         if (r < 0) return false;
         if (r == 0) continue;
         strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, hist, hlen, sp, m_out_ + t, cs_);
         any = true;
+        if (queued_rows) ++*queued_rows;
     }
-    if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
+    if (any && wait && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
     return true;
 #endif
+}
+
+bool Verifier::enable_piped_async_sampling(std::string& err) {
+    const OnDevice on_device(device_);
+    if (!g_ || !last_stage() || slots_.empty() || dc_rows_ < 1 || b_running_ || fl_active_ ||
+        piped_async_sampling_ || async_hist_host_ || async_hist_device_ || async_sample_done_) {
+        err = "verify batch: asynchronous sampling needs an idle final verifier with slots";
+        return false;
+    }
+    async_hist_rows_ = std::min(max_t_, (int) strata::kernels::kVerifyMaxT);
+    const size_t bytes = (size_t) async_hist_rows_ * kSlotHistMax * sizeof(int32_t);
+    if (async_hist_rows_ < 1 ||
+        cudaHostAlloc((void**) &async_hist_host_, bytes, cudaHostAllocPortable) != cudaSuccess ||
+        cudaMalloc((void**) &async_hist_device_, bytes) != cudaSuccess ||
+        cudaEventCreateWithFlags(&async_sample_done_, cudaEventDisableTiming) != cudaSuccess) {
+        err = "verify batch: reserving asynchronous sample history/event failed";
+        return false;
+    }
+    piped_async_sampling_ = true;
+    return true;
 }
 
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
@@ -5037,6 +5079,22 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
 
 int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     if (!b_running_) return 1;
+    if (b_sample_pending_) {
+        const OnDevice on_device(device_);
+        const cudaError_t q = cudaEventQuery(async_sample_done_);
+        if (q == cudaErrorNotReady) {
+            if (Clock::now() - b_sample_since_ <= std::chrono::seconds(20)) return 0;
+            err = "verify batch: asynchronous row sampling timed out";
+            b_running_ = false;
+            return -1;
+        }
+        if (q != cudaSuccess) {
+            err = std::string("verify batch: asynchronous row sampling: ") + cudaGetErrorString(q);
+            b_running_ = false;
+            return -1;
+        }
+        return finish_polled_batch(last_t_);
+    }
     // set_external_serve: another thread serves the doorbells (batch_serve) and this one only checks for a window that
     // will not finish, as below: its graph ended (or failed) with a layer still to ring, or no layer rang for 20 s.
     // The stream query can wait for the driver's lock while a read's call holds it; the doorbells go on meanwhile.
@@ -5101,9 +5159,35 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     }
     if (prof_on_) collect_profile();
     if (last_stage()) {
-        if (!sample_rows(S, err)) { b_running_ = false; return -1; }
+        int queued = 0;
+        if (!sample_rows(S, err, !piped_async_sampling_, &queued)) { b_running_ = false; return -1; }
+        if (piped_async_sampling_ && queued > 0) {
+            if (cudaEventRecord(async_sample_done_, cs_) != cudaSuccess) {
+                err = "verify batch: asynchronous sampling event record failed";
+                b_running_ = false;
+                return -1;
+            }
+            b_sample_rows_ = queued;
+            b_sample_since_ = Clock::now();
+            b_sample_pending_ = true;
+            // The stage remains busy: the pump may advance other stages but cannot publish picks, commit this
+            // group's state, or reuse its logits/host history until the completion event is observed.
+            return 0;
+        }
+    }
+    return finish_polled_batch(S);
+}
+
+int Verifier::finish_polled_batch(int S) {
+    if (last_stage()) {
         for (int t = 0; t < S; ++t) b_out_[t] = ((volatile int32_t*) h_out_)[t];
         note_nonfinite(S, last_pos_b_);
+    }
+    if (b_sample_pending_) {
+        ++piped_async_sample_windows_;
+        piped_async_sample_rows_ += (uint64_t) b_sample_rows_;
+        b_sample_pending_ = false;
+        b_sample_rows_ = 0;
     }
     ++windows;
     if (b_target_head_) {
