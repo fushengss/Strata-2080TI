@@ -105,8 +105,60 @@ engine/mtp_head_test --gguf MODEL.gguf --draft-vocab draft_vocab.bin --source 7 
 The test includes original-owner reset, partial-chain drain/reuse and one workspace's reset/rebind while
 peers have queued work. Its log is `/srv/bench100k-20261107-concurrency-mtp/head-build/parity.log` on the test
 host. Engine SHA256: `c9305b08b24e6ff85e363147063827760c54c8243eeec6b2362587159cda5ca6`.
-End-to-end concurrency and prefill measurements are still in progress; these low-level checks do not establish
-a speedup or authorize deployment. HIP has not been built. Metal checks cover syntax and the unavailable stub.
+The end-to-end measurements below followed these checks. The piped-slot option remains undeployed and off by
+default. HIP has not been built. Metal checks cover syntax and the unavailable stub.
+
+### Piped-slot GPU measurements, 2026-11-07
+
+The same 8×RTX 2080 Ti host used Q5_K_M, six layers per GPU, eight slots/groups, all experts resident and the
+original 3.80 GiB prompt buffers per card. Both arms kept batch/piped MTP enabled, self-commit disabled, main-head
+targets 2/4 and MTP-head targets 3/5. Only `STRATA_PIPED_MTP_HEAD` changed. Both used engine `c9305b08…` above and
+server SHA256 `40c5e9dfc96ab208b6514bd2f5f48986afb3e01b3927f873cff8d358d62528c9`, with the default-off
+`reasoning_budget_engine_cap` explicitly enabled in both arms.
+
+| Workload and order | Head off | Head on | API throughput change |
+|---|---:|---:|---:|
+| Eight short prompts, off→on | 248.752 tokens/s | 264.296 tokens/s | +6.25% |
+| Eight short prompts, on→off | 256.544 tokens/s | 272.790 tokens/s | +6.33% |
+| Four residents with two cold joins, one off→on pair | 106.426 tokens/s | 106.153 tokens/s | -0.26% |
+| Four cold 100K prompts, one off→on pair | 26.2246 tokens/s | 26.3936 tokens/s | +0.64% |
+
+Each eight-stream run had 8192 complete output tokens from 66/68-token prompts, four sampled and four greedy.
+Across the two rounds, total tokens divided by total time increased by 6.29%. The first round ran budget checks
+before prefill/C8; the reverse round started with prefill, with other tests between the rounds. This is a repeated
+directional observation, not a contiguous ABBA with identical startup and thermal history.
+
+The mixed four-resident workload had 8793-token contexts, cold joins of 8793 and 52080 tokens, and 8320 completed
+output tokens. Its maximum mixed-phase SSE gap remained 10.433 s off versus 10.441 s on. It showed no whole-run
+throughput improvement. The separate four-way long test used actual 101147–101148-token prompts, explicit zero
+cached tokens, two sampled/two greedy requests, thinking disabled and 512 output tokens each. All four streams
+had a common output interval of 7.237/7.264 seconds off/on. Whole time was 78.095/77.595 seconds. The +0.64% result
+is one pair, without evidence of repeatability; per-lane TTFT also changed with admission order.
+
+All rates above include admission/prefill and final drain. SSE arrival gaps are not per-token TBT. The complete
+request/output/channel hashes and usage matched in the two C8 rounds, mixed C4 and long C4 comparisons. The
+budget suite passed nine complete requests plus a cancellation shared-prefix/recovery check. With head sharing
+disabled, the new executable also matched the older MTP-on executable's fixed-request outputs and usage; that
+cross-run compatibility check does not compare performance.
+
+Each round also had three cold and three warm solo 100K prefill pairs, with 256 output tokens. Their six full
+outputs, usage and exact cache reuse matched within and across rounds. The cold/warm read medians were:
+
+| Order | Cold off/on | Cold change | Warm off/on | Warm change |
+|---|---:|---:|---:|---:|
+| off→on | 16012 / 16294 ms | +1.76% | 2186 / 2056 ms | -5.95% |
+| on→off | 16498 / 16442 ms | -0.34% | 2206 / 2179 ms | -1.22% |
+
+Cold changes had opposite signs. The descriptive pooled cold median changed by +0.70%, while the median of six
+fixture-paired relative changes was -0.22%; startup/suite order and the small sample affect these summaries.
+All solo prefill logs recorded zero piped-head steps. Prefill preservation remains a deployment requirement;
+these measurements do not guarantee zero regression for other conditions. Deployment is still pending.
+
+Evidence is under `bench/results/2026-11-07-8x2080ti-q5-100k/concurrency-stability/` in the benchmark checkout:
+`head-pilot-analysis/`, `head-reverse-analysis/` and `head-long-analysis/`, with corresponding raw-data directories.
+The reports preserve per-request checks, input hashes, actual process/library/flag evidence and resource gates.
+See [concurrency measurements](CONCURRENCY_STABILITY.md) for the separate budget/batch MTP comparison and the
+remaining long-prompt stall.
 
 ## Validation status, 2026-11-07
 

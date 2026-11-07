@@ -128,8 +128,8 @@ using `--offline`, or use the interpreter of an existing environment containing 
 These 2026-11-07 measurements used Qwen3.8-Flash-Next-Uncensored Q5_K_M on eight RTX 2080 Ti cards, six layers per
 card, eight slots and eight pipeline groups. All experts remained resident, and each card retained its original
 3.80 GiB prompt buffers. Main-head shards stayed on GPUs 2/4 and the solo MTP-head shards on GPUs 3/5. These are
-isolated synthetic tests, with one sequential off/on pair per comparison; they do not establish a production tail
-latency guarantee. The prompt-read guard described above remains unmeasured and undeployed.
+isolated synthetic tests with the single-pair and repeated-round scopes stated below; they do not establish a
+production tail latency guarantee. The prompt-read guard described above remains unmeasured and undeployed.
 
 The v4 budget comparison used engine SHA256
 `113a4ea9bf2101a9ad9a3449ae611f8a21f892cc62293fa9a779d302dc2df96f` and the server candidate identified above.
@@ -171,22 +171,40 @@ residency and original prompt-buffer allocation were checked in both arms.
 
 | Shared piped-slot head comparison | Off | On | Change |
 |---|---:|---:|---:|
-| C8 complete API throughput | 248.752 tokens/s | 264.296 tokens/s | +6.25% |
+| C8 complete API throughput, off→on | 248.752 tokens/s | 264.296 tokens/s | +6.25% |
+| C8 complete API throughput, on→off | 256.544 tokens/s | 272.790 tokens/s | +6.33% |
 | C4 complete API throughput | 106.426 tokens/s | 106.153 tokens/s | -0.26% |
-| Cold 100K read-time median | 16012 ms | 16294 ms | +1.76% |
-| Warm 100K read-time median | 2186 ms | 2056 ms | -5.95% |
+| Four cold 100K requests, complete API throughput | 26.2246 tokens/s | 26.3936 tokens/s | +0.64% |
+| Cold 100K read-time median, off→on | 16012 ms | 16294 ms | +1.76% |
+| Cold 100K read-time median, on→off | 16498 ms | 16442 ms | -0.34% |
+| Warm 100K read-time median, off→on | 2186 ms | 2056 ms | -5.95% |
+| Warm 100K read-time median, on→off | 2206 ms | 2179 ms | -1.22% |
 
 The head candidate passed the same nine complete budget requests plus cancellation-prefix check, six prefill
 pairs, eight C8 requests and six C4 requests, with full output and usage agreement. The on-arm logs recorded 2097,
 4672 and 5219 head steps for the budget, C8 and C4 suites respectively, and zero during solo prefill. C4 maximum
-mixed gap remained 10.433 versus 10.441 s. The cold prefill median increased in this pair; further repetitions are
-required before accepting a prefill-preservation claim or deploying this option.
+mixed gap remained 10.433 versus 10.441 s. The reverse on→off round separately passed six prefill pairs and eight
+C8 requests, including exact cross-round output/usage/cache checks. C8 improved in both directions, with +6.29%
+for total tokens divided by total time across the two rounds. Cold prefill changed in opposite directions;
+the descriptive pooled read median was +0.70%, while the median of six fixture-paired relative changes was -0.22%.
+The first round ran budget checks before prefill/C8 and the reverse round started with prefill. Other tests
+separated them, so this is not a contiguous ABBA with identical startup and thermal history. These observations
+show no consistent cold-prefill slowdown, but do not establish a zero-regression guarantee.
+
+The separate long comparison used four cold 101147–101148-token prompts, two sampled and two greedy, thinking
+disabled and 512 output tokens each. All four request/output/channel hashes and full usage matched, with explicit
+cached_tokens=0. Four-way common output intervals were 7.237 s off and 7.264 s on. The complete 2048-token batch took
+78.095 s versus 77.595 s, including all four prefills/admissions and drain. Its +0.64% API throughput change is one
+pair and does not establish a repeatable long-context gain. Per-lane TTFT moved with admission order. The mixed C4
+case still showed no throughput gain or reduction of the long prompt-read stall.
+
 With the new head disabled, its fixed-request outputs and usage also matched the older v4/v5 MTP-on engine; suite
 order differed, so that compatibility check makes no cross-run performance comparison.
 
 Reproducible local records are under
 `bench/results/2026-11-07-8x2080ti-q5-100k/concurrency-stability/` in the benchmark checkout:
 `budget-v4-analysis/` and `budget-v4-c4-sampled/` for v4, `c8-v5/` for the eight-stream batch comparison, and
-`head-pilot-analysis/` plus `head-pilot/` for the shared-head pilot. The analysis directories include input SHA256
-manifests and per-request checks. None of these candidate switches has been deployed to the normal service as of
-this report. Long-context concurrency and additional prefill/head repetitions remain separate deployment gates.
+`head-pilot-analysis/`, `head-reverse-analysis/` and `head-long-analysis/` plus their corresponding raw directories
+for the shared-head comparisons. The analysis directories include input SHA256 manifests and per-request checks.
+None of these candidate switches has been deployed to the normal service as of this report. Deployment and
+prefill-preservation decisions remain pending; the measured C8 gain does not resolve mixed-prefill stalls.
