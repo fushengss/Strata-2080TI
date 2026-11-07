@@ -29,6 +29,7 @@
 #endif
 
 #include "strata/core/native_head.hpp"
+#include "strata/core/decode_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -710,8 +711,13 @@ Verifier::~Verifier() {
         slot.compare_exchange_strong(me, nullptr);
     }
     if (cs_) cudaStreamSynchronize(cs_);
+    decode_head_.reset();
+    decode_head_second_.reset();
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     for (auto& row : exec_)
+        for (auto& e : row)
+            if (e) cudaGraphExecDestroy(e);
+    for (auto& row : exec_decode_head_)
         for (auto& e : row)
             if (e) cudaGraphExecDestroy(e);
     for (auto& row : exec_nr_)
@@ -2609,6 +2615,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
                 if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
+                if (record_decode_head_) {
+                    // Keep the final mixer's exact Q8_1 image. Each chunk has its own portable staging rows;
+                    // xq_ is reused by the next chunk, so publish it here before proceeding.
+                    const size_t row_bytes = strata::kernels::native_q8_1_bytes((int) N, 1);
+                    for (auto* window : {decode_head_.get(), decode_head_second_.get()}) {
+                        if (!window) continue;
+                        auto* dst = static_cast<unsigned char*>(window->handoff()) + (size_t) h0 * row_bytes;
+                        copy_from_mapped(reinterpret_cast<float*>(dst), reinterpret_cast<const float*>(xq_),
+                                         (int64_t) HT * (int64_t) row_bytes / sizeof(float), cs);
+                    }
+                    continue;
+                }
                 if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
                     if (HT >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);
                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, hl, (int) N,
@@ -2624,6 +2642,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
+        if (!record_decode_head_) {
         if (argmax_rows_wanted()) {   // sm_80 to sm_89 (sm_7x opt-in): the pick over many blocks a row (bitwise the one-block kernel's)
             argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
         } else {
@@ -2634,6 +2653,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
         if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+        }
     }
     stamp(g.n_layers, 1, 0);
     if (tap_on_ && !batch_rec_ && tap_file_ != nullptr) copy_from_mapped(m_tap_, tap_dev_, (int64_t) T * (int64_t) tap_layers_.size() * N, cs);
@@ -2747,7 +2767,8 @@ void Verifier::refresh_ar() {
 
 bool Verifier::capture(int T, std::string& err) {
     const auto cap_t0 = std::chrono::steady_clock::now();
-    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];
+    cudaGraphExec_t& exec_t = record_decode_head_ ? exec_decode_head_[sel_long_][T]
+                                                 : ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];
     if (exec_t != nullptr) return true;
     {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
         size_t free_b = 0, total_b = 0;
@@ -3252,6 +3273,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     last_batch_ = false;
+    last_decode_head_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     // a layer split's hand-off buffers hold kVerifyMaxT rows
     if (T > kVerifyMaxT && (next_ != nullptr || lb_ > 0)) { err = "verify: windows past 8 tokens need one stage"; return false; }
@@ -3799,7 +3821,13 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     }
     // run() synchronized cs_ before returning, so the head of this window is complete
     std::vector<float> h((size_t) T * (size_t) n_vocab_);
-    if (cudaMemcpy(h.data(), head_logits_, h.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+    if (last_decode_head_ && decode_head_) {
+        for (int t = 0; t < T; ++t)
+            if (!copy_logits(t, h.data() + (size_t) t * (size_t) n_vocab_)) {
+                err = "window_logprobs: the remote head logits copy failed";
+                return false;
+            }
+    } else if (cudaMemcpy(h.data(), head_logits_, h.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
         err = "window_logprobs: the head logits copy failed";
         return false;
     }
@@ -4639,6 +4667,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
     row_base_ = hbase;   // the graphs' key (and nothing else) reads it until the next stage_batch
     last_batch_ = true;
+    last_decode_head_ = false;
     for (int t = 0; t < S; ++t) { last_tokens_[t] = tokens[t]; last_pos_b_[t] = pos[t]; }
     ms_host += ms_since(t0);
     return true;
@@ -4661,6 +4690,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     last_t_ = S;
     for (int t = 0; t < S; ++t) { last_rows_[t] = rows[t]; last_tokens_[t] = tokens[t]; last_pos_b_[t] = pos[t]; }
     last_batch_ = true;
+    last_decode_head_ = false;
     // a slot with its own sampling, penalties or logit bias (set_slot_sampling / set_slot_history / set_slot_logit_bias): its row is drawn again from the
     // window's logits with Philox(seed, position), as a solo window draws it; a plain greedy slot keeps the window's argmax token
     {
@@ -5112,6 +5142,10 @@ bool Verifier::copy_logits(int t, float* host) const {
     return strata::metal_engine::window_copy_logits(metal_, t, host);
 #endif
     if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
+    if (last_decode_head_ && decode_head_) {
+        if (!decode_head_->copy_logits(t, host)) return false;
+        return !decode_head_second_ || decode_head_second_->copy_logits(t, host + decode_head_second_->row_begin());
+    }
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
     return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
@@ -5139,6 +5173,53 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
                     "commit event %s (commit launched %d)\n", name, fl_active_ ? "IN FLIGHT" : "idle", last_t_,
                  (long long) last_pos0_, (long long) fl_k_, (long long) fl_total_, rd(h_seq_), rd(h_flag_), rd(h_flagA_),
                  rd(h_flagB_), ev(ev_done_), ev(ev_commit_), (int) commit_live_);
+}
+
+bool Verifier::set_decode_head(const NativeHead& head, std::string& err, const NativeHead* second) {
+    const OnDevice on_device(device_);
+    if (!g_ || !last_stage() || !head_ || !head_->loaded() || !head.loaded() || head.device() == device_ ||
+        head.type() != head_->type() || head.weight_bytes() != head_->weight_bytes() || fl_active_) {
+        err = "decode head: requires an idle final verifier and the same native weights on another GPU";
+        return false;
+    }
+    if (second && (!second->loaded() || second->device() == device_ || second->device() == head.device() ||
+                   second->type() != head.type() || second->weight_bytes() != head.weight_bytes())) {
+        err = "decode head: the second shard needs the same weights on another GPU";
+        return false;
+    }
+    // Whole quantized rows, with a tile-aligned boundary; every row retains its original dot-product order.
+    const int cut = second ? ((int) n_vocab_ / 2 / 128) * 128 : 0;
+    if (second && (cut <= 0 || cut >= n_vocab_)) { err = "decode head: vocabulary too small to shard"; return false; }
+    auto window = std::make_unique<DecodeHeadWindow>();
+    if (!window->init(head, device_, (int) g_->n_embd, (int) n_vocab_, max_t_,
+                      g_mmvq_il(), strata::kernels::argmax_rows_wanted(), nan_guard_on(), err, 0, cut)) return false;
+    std::unique_ptr<DecodeHeadWindow> other;
+    if (second) {
+        other = std::make_unique<DecodeHeadWindow>();
+        if (!other->init(*second, device_, (int) g_->n_embd, (int) n_vocab_, max_t_,
+                         g_mmvq_il(), strata::kernels::argmax_rows_wanted(), nan_guard_on(), err,
+                         cut, (int) n_vocab_ - cut)) return false;
+    }
+    decode_head_ = std::move(window);
+    decode_head_second_ = std::move(other);
+    return true;
+}
+
+bool Verifier::prepare_decode_head(std::string& err) {
+    if (!decode_head_) return true;
+    const OnDevice on_device(device_);
+    if (fl_active_ || ar_off_) { err = "decode head: prepare requires idle, resident PW windows"; return false; }
+    struct Reset { bool& flag; ~Reset() { flag = false; } } reset{record_decode_head_};
+    struct NoEvict { bool& flag; bool old; ~NoEvict() { flag = old; } } keep{no_window_eviction_, no_window_eviction_};
+    no_window_eviction_ = true;
+    record_decode_head_ = true;
+    for (int sl = 0; sl < (select_long_on() ? 2 : 1); ++sl) {
+        sel_long_ = sl;
+        for (int T = 1; T <= max_t_; ++T)
+            if (!capture(T, err)) { sel_long_ = 0; return false; }
+    }
+    sel_long_ = 0;
+    return decode_head_->capture_all(err) && (!decode_head_second_ || decode_head_second_->capture_all(err));
 }
 
 bool Verifier::capture_all(std::string& err) {
@@ -5221,6 +5302,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     const Clock::time_point t0 = Clock::now();
     last_batch_ = false;
+    last_decode_head_ = false;
     bool staged = pl_prestaged_ && last_t_ == T && last_pos0_ == pos0;
     for (int t = 0; staged && t < T; ++t) staged = last_tokens_[t] == tokens[t];
     if (staged && ss.ple.ready() && ple_stage())
@@ -5237,11 +5319,24 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
     strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
-    const cudaError_t le = cudaGraphLaunch(exec_[sl][T], cs_);
+    // Only PW2 decode enables this. Bias/history and probability acceptance keep the original graph.
+    fl_decode_head_ = decode_head_active_ && decode_head_ && !ar_off_ && head_sampling_ &&
+                      hist_d_ == nullptr && sampling_.penalty_last_n <= 0 && sampling_.logit_bias == nullptr &&
+                      spec_q_ == nullptr && !spec_measure_ &&
+                      (!decode_head_second_ || sampling_.greedy || sampling_.temperature <= 0.0f);
+    cudaGraphExec_t graph = fl_decode_head_ ? exec_decode_head_[sl][T] : exec_[sl][T];
+    if (graph == nullptr) { err = "decode head: body graph was not prepared"; return false; }
+    const cudaError_t le = cudaGraphLaunch(graph, cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
     if (cudaEventRecord(ev_done_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
+    if (fl_decode_head_) {
+        // Queue the remote head now. Its independent stream waits for the producer event across devices,
+        // so completion does not need a host round trip before the projection can start.
+        if (!decode_head_->launch(T, &sampling_, (uint64_t) pos0, err, ev_done_) ||
+            (decode_head_second_ && !decode_head_second_->launch(T, &sampling_, (uint64_t) pos0, err, ev_done_))) return false;
+    }
     (void) cudaStreamQuery(cs_);   // WDDM: submit now
     fl_active_ = true;
     fl_since_ms_ = fl_flush_ms_ = fl_launch_ms_ = now_ms();
@@ -5358,6 +5453,15 @@ bool Verifier::done(std::string& err) {
         if (cudaStreamQuery(copy_) == cudaErrorNotReady) return false;
         copy_used_ = false;
     }
+    if (fl_decode_head_) {
+        const bool first_done = decode_head_->done(err);
+        if (!err.empty()) return false;
+        const bool second_done = !decode_head_second_ || decode_head_second_->done(err);
+        if (!first_done || !second_done) {
+            if (err.empty() && now_ms() - fl_since_ms_ > 20000.0) err = "decode head: remote projection timed out";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -5371,8 +5475,33 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
     trace_ev("DONE (pipelined)", -1, -1, (int64_t) (now_ms() - fl_launch_ms_));
     if (le_ < g.n_layers) return true;   // an earlier stage: the hand-off is written
     const int T = fl_T_;
+    last_decode_head_ = fl_decode_head_;
+    if (fl_decode_head_) {
+        ++decode_head_windows_;
+        if (decode_head_second_) {
+            for (int t = 0; t < T; ++t) {
+                const int32_t ids[] = {decode_head_->picks()[t],
+                    decode_head_second_->row_begin() + decode_head_second_->picks()[t]};
+                const float scores[] = {decode_head_->scores()[t], decode_head_second_->scores()[t]};
+                h_out_[t] = decode_head_merge_argmax(ids, scores, 2);
+                if (nan_guard_on()) {
+                    // The diagnostics consume a per-row OR; the shards' bin boundaries differ from the full head.
+                    uint32_t bad = 0;
+                    for (int b = 0; b < kNonfiniteBlocks; ++b)
+                        bad |= decode_head_->nonfinite()[t * kNonfiniteBlocks + b] |
+                               decode_head_second_->nonfinite()[t * kNonfiniteBlocks + b];
+                    std::memset(h_nf_ + t * kNonfiniteBlocks, 0, kNonfiniteBlocks * sizeof(uint32_t));
+                    h_nf_[t * kNonfiniteBlocks] = bad;
+                }
+            }
+        } else {
+            std::memcpy(h_out_, decode_head_->picks(), (size_t) T * sizeof(int32_t));
+            if (nan_guard_on()) std::memcpy(h_nf_, decode_head_->nonfinite(),
+                                          (size_t) T * kNonfiniteBlocks * sizeof(uint32_t));
+        }
+    }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
+    if (!fl_decode_head_ && head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) last_pos0_;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
