@@ -85,6 +85,11 @@ public:
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
     int64_t chunk() const;
+    /// Actual storage, not a configuration hint: concurrent resident decode must not read borrowed expert slots.
+    bool owns_prompt_buffers() const;
+    /// Reserve known pinned uploads and private PLE fallback scratch, and create MMQ contexts while decode is drained. MMQ/GEMM may still
+    /// grow internal workspaces lazily; callers must not leave GPU work waiting for an unpublished host flag.
+    bool prepare_concurrent_read(int64_t rows, std::string& err);
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.

@@ -1203,8 +1203,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
         static const bool hi = [] {   // (STRATA_PIPED_CONCURRENT_PRIO=0: the default priority)
             const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
+            const char* m = std::getenv("STRATA_PIPED_CONCURRENT_MTP");
             const char* p = std::getenv("STRATA_PIPED_CONCURRENT_PRIO");
-            return v != nullptr && std::atoi(v) != 0 && (p == nullptr || std::atoi(p) != 0);
+            return ((v != nullptr && std::atoi(v) != 0) || (m != nullptr && std::atoi(m) != 0)) &&
+                   (p == nullptr || std::atoi(p) != 0);
         }();
         int lo = 0, top = 0;
         if (hi) {
@@ -4684,6 +4686,18 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    // The resident concurrent reader can allocate a lazy MMQ/GEMM workspace. A device-wide allocation barrier
+    // must not wait for a graph whose PLE flag would only be raised after another CUDA launch returns and sets
+    // b_running_. stage_batch has already gathered every PLE row above; publish that prepared data before the
+    // first graph launch. Do not publish b_running_ early or change nonresident/default batch behavior.
+    static const bool concurrent_mtp = [] {
+        const char* v = std::getenv("STRATA_PIPED_CONCURRENT_MTP");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (concurrent_mtp && ext_serve_.load(std::memory_order_acquire) && ar_on() && ss_->ple.ready() && ple_stage()) {
+        strata_store_fence();
+        *(volatile uint32_t*) h_flag_ = 1;
+    }
     last_t_ = S;
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
     row_base_ = hbase;   // the graphs' key (and nothing else) reads it until the next stage_batch

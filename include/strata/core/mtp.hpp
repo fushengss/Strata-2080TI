@@ -123,7 +123,8 @@ public:
     /// A prompt read beside running batch windows (STRATA_PIPED_CONCURRENT): the prompt pass's graphs captured and its
     /// input records sized for chunks of up to n rows now, with nothing in flight.  On the read's thread a capture or
     /// a free waits for the device, whose windows wait for the main thread's doorbell service (#31).
-    bool reserve_prefill(int64_t n, std::string& err);
+    /// strict_uploads: a pinned-ring reservation failure returns false instead of the legacy warning and retry.
+    bool reserve_prefill(int64_t n, std::string& err, bool strict_uploads = false);
     cudaStream_t stream() const { return cs_; }
 
     /// Successful producer result, including a generated row that failed admission.
