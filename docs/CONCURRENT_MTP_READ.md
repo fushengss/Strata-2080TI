@@ -26,6 +26,8 @@ Each prompt part checks the live state after the normal pipeline drain:
 - No pending tier change, asynchronous tier worker, KV growth, peer path,
   helper expert cache, remote expert work, or Foresight swap space.
 - One text prompt. Images and co-reads use the existing path.
+- A PLE stage with a native quantized key and no BF16 key uses the serial
+  path: that key's quantization scratch belongs to the shared weight table.
 - The old source restrictions remain: no prefill helper, DMA doorbell,
   staging/recycled source buffers, or unknown source type.
 

@@ -17561,7 +17561,7 @@ int main(int argc, char** argv) {
                         // The optional strict mode preserves reserve_prefill's legacy warning-only behavior elsewhere.
                         std::string prep_err;
                         if (!mtp.reserve_prefill(C, prep_err, true)) why = "draft_reserve_failed";
-                        else if (!sp.prepare_concurrent_read(C, prep_err)) why = "prompt_reserve_failed";
+                        else if (!sp.prepare_concurrent_read(C, prep_err)) why = "prompt_prepare_failed";
                     }
                     resident_read = why == nullptr;
                     if (why)

@@ -7847,13 +7847,23 @@ bool Prefill::prepare_concurrent_read(int64_t T, std::string& err) {
         err = "prefill: concurrent read needs private prompt buffers";
         return false;
     }
+    for (Prefill* p = this; p != nullptr; p = p->next_) {
+        if (!p->owns_prompt_buffers()) { err = "prefill: a stage does not own its prompt buffers"; return false; }
+        const Impl& m = *p->impl_;
+        // ple_block's native-key path also writes PleWeights::key_native_q8_1, which belongs to the shared
+        // weight table. Isolating the ordinary PLE scratch is not enough for that route. Keep it serial.
+        if (m.ss->ple.ready() && p->stage_lb_ <= 1 && (p->stage_le_ < 0 || p->stage_le_ > 1) &&
+            m.ss->ple.w.key_bf16 == nullptr && m.ss->ple.w.key_native_data != nullptr) {
+            err = "prefill: the native PLE key shares quantization scratch with decode";
+            return false;
+        }
+    }
     if (!reserve_uploads(T)) {
         err = "prefill: concurrent read upload reservation failed";
         return false;
     }
     try {
         for (Prefill* p = this; p != nullptr; p = p->next_) {
-            if (!p->owns_prompt_buffers()) { err = "prefill: a stage does not own its prompt buffers"; return false; }
             Impl& m = *p->impl_;
             const core::OnDevice on_device(m.device);
             if (m.ss->ple.ready() && p->stage_lb_ <= 1 && (p->stage_le_ < 0 || p->stage_le_ > 1) &&
