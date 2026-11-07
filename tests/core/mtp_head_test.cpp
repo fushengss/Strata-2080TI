@@ -1,5 +1,6 @@
 // Manual three-GPU parity test. No running engine or peer-access enablement is needed.
 // mtp_head_test --gguf MODEL.gguf --draft-vocab draft_vocab.bin --source 7 --target 3 --target2 5
+// Add --shared-slots 8 for shared read-only weights with eight independent streams/workspaces.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/mtp_head.hpp"
 #include "strata/core/on_device.hpp"
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -178,6 +180,119 @@ void default_contract() {
                          "unsupported Q5 head was accepted");
     err.clear(); require(!h.init((const void*) 1, 7, 14, kN, kVocab, 2, 2, err) && !err.empty() && !h.initialized(),
                          "duplicate target devices were accepted");
+    strata::core::MtpHeadShards clone;
+    err.clear(); require(!clone.init_shared(h, err) && !err.empty() && !clone.initialized(),
+                         "uninitialized owner was accepted for shared weights");
+    require(!clone.shares_weights_with(h), "inert helpers report shared weights");
+}
+
+struct SharedSlot {
+    // The helper is destroyed before Source: its cross-device waits still refer to Source's stream.
+    Source source;
+    Tail reference, candidate;
+    float *mixed, *inputs;
+    void* q8;
+    cudaGraphExec_t body = nullptr, original = nullptr, ref_tail = nullptr, got_tail = nullptr;
+    strata::core::MtpHeadShards head;
+
+    SharedSlot(int device, const void* weights, const strata::core::MtpHeadShards& owner)
+        : source(device), reference(source), candidate(source) {
+        using namespace strata::kernels;
+        mixed = source.device_buffer<float>(kN);
+        inputs = source.host_buffer<float>((size_t) kSteps * kN);
+        q8 = source.device_buffer<uint8_t>(native_q8_1_bytes(kN, 1));
+        body = source.capture([&] { native_quantize_q8_1(mixed, q8, kN, 1, source.stream); });
+        original = source.capture([&] {
+            native_mmvq(14, weights, q8, reference.logits, kN, kVocab, 1, source.stream);
+        });
+        std::string err;
+        require(head.init_shared(owner, err), err);
+        current_is(device);
+        require(head.shares_weights_with(owner), "slot copied rather than shared the owner's weight bank");
+        for (int shard = 0; shard < 2; ++shard)
+            require(head.row_begin(shard) == owner.row_begin(shard) && head.row_count(shard) == owner.row_count(shard),
+                    "shared slot changed the head row partition");
+    }
+    void tails(bool split_prob, bool rows_argmax, const int32_t* vocab) {
+        ref_tail = source.capture([&] { reference.record(split_prob, rows_argmax, vocab, source.stream); });
+        got_tail = source.capture([&] { candidate.record(split_prob, rows_argmax, vocab, source.stream); });
+    }
+    void enqueue(int step) {
+        gpu(cudaMemcpyAsync(mixed, inputs + (size_t) step * kN, kN * sizeof(float),
+                            cudaMemcpyHostToDevice, source.stream));
+        gpu(cudaGraphLaunch(body, source.stream));
+        gpu(cudaGraphLaunch(original, source.stream));
+        gpu(cudaGraphLaunch(ref_tail, source.stream));
+        reference.save(step, source.stream);
+        std::string err;
+        require(head.enqueue(source.stream, q8, candidate.logits, step, err), err);
+        gpu(cudaGraphLaunch(got_tail, source.stream));
+        candidate.save(step, source.stream);
+        current_is(source.device);
+    }
+};
+
+void shared_slots(int count, int cycles, int device, const void* weights, const int32_t* vocab,
+                  const std::vector<int32_t>& ids, strata::core::MtpHeadShards& owner) {
+    std::vector<std::unique_ptr<SharedSlot>> slots;
+    for (int b = 0; b < count; ++b) slots.emplace_back(new SharedSlot(device, weights, owner));
+    for (int b = 1; b < count; ++b)
+        require(slots[b]->head.shares_weights_with(slots[0]->head), "slots own different head weight banks");
+    owner.reset(); current_is(device);
+    require(!owner.initialized(), "shared owner reset retained its workspace");
+    // All work below runs after the original owner was reset. Clones must retain the weight bank themselves.
+    size_t cases = 0, partial_cases = 0;
+    for (bool rows_argmax : {true, false}) for (bool split_prob : {false, true}) {
+        for (auto& slot : slots) slot->tails(split_prob, rows_argmax, vocab);
+        for (int cycle = 0; cycle < cycles; ++cycle) {
+            // First abandon a chain after three steps, then drain and reuse every step index from zero.
+            // This models a cancelled request's cleanup; it does not claim to cancel already launched CUDA work.
+            for (int steps : {3, kSteps}) {
+                for (int b = 0; b < count; ++b)
+                    fill_inputs(slots[b]->inputs, 1 + 1009 * cycle + 37 * b + 101 * steps, steps);
+                for (int step = 0; step < steps; ++step)
+                    for (int offset = 0; offset < count; ++offset) {
+                        // Rotate and reverse launch order so a fixed stream ordering cannot hide buffer aliasing.
+                        const int b = (step + cycle + (cycle % 2 ? count - 1 - offset : offset)) % count;
+                        slots[b]->enqueue(step);
+                    }
+                // No host wait between slots/steps above. Completion of one slot may not stand in for a peer.
+                for (int b = count - 1; b >= 0; --b) {
+                    std::string err;
+                    require(slots[b]->head.drain(err), err); current_is(device);
+                }
+                for (int b = 0; b < count; ++b) for (int step = 0; step < steps; ++step) {
+                    const std::string label = "shared slot=" + std::to_string(b) + " cycle=" + std::to_string(cycle) +
+                        " steps=" + std::to_string(steps) + " step=" + std::to_string(step) +
+                        " argmax=" + std::to_string(rows_argmax) + " split_prob=" + std::to_string(split_prob);
+                    compare(slots[b]->reference, slots[b]->candidate, step, ids, label);
+                    ++cases;
+                    if (steps < kSteps) ++partial_cases;
+                }
+            }
+        }
+    }
+    // Queue every slot, then destroy one workspace before host-draining any peers. This exercises independent
+    // lifetimes without asserting that GPU work is still physically in flight when the host reaches reset().
+    for (int b = 0; b < count; ++b) {
+        fill_inputs(slots[b]->inputs, 90001 + b, 1);
+        slots[b]->enqueue(0);
+    }
+    // reset() drains this source stream only. Reuse the existing body/tail graphs, avoiding a new source capture.
+    slots.back()->head.reset(); current_is(device);
+    std::string err;
+    require(slots.back()->head.init_shared(slots.front()->head, err), err);
+    require(slots.back()->head.shares_weights_with(slots.front()->head), "rebound slot lost shared weight identity");
+    fill_inputs(slots.back()->inputs, 91001 + count, 1);
+    slots.back()->enqueue(0);
+    for (int b = 0; b < count; ++b) {
+        require(slots[b]->head.drain(err), err); current_is(device);
+        compare(slots[b]->reference, slots[b]->candidate, 0, ids, "shared slot rebind=" + std::to_string(b));
+        ++cases;
+    }
+    std::printf("PASS: MTP_HEAD_SHARED_SLOTS slots=%d cases=%zu logits=%zu source_streams=%d weight_bank=shared "
+                "owner_reset=passed rebind=passed partial_chain_outputs=%zu\n", count, cases, cases * kVocab, count, partial_cases);
+    std::fflush(stdout);
 }
 }  // namespace
 
@@ -188,7 +303,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::strcmp(argv[1], "--contract-only") == 0) {
             std::puts("PASS: MTP_HEAD_DEFAULT_UNSUPPORTED_CONTRACT"); return 0;
         }
-        std::string model, vocab_file; int source = 7, target0 = 2, target1 = 4, cycles = 4;
+        std::string model, vocab_file; int source = 7, target0 = 2, target1 = 4, cycles = 4, n_shared_slots = 0;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i]; require(i + 1 < argc, "missing value for " + a);
             if (a == "--gguf") model = argv[++i];
@@ -197,11 +312,13 @@ int main(int argc, char** argv) {
             else if (a == "--target") target0 = std::stoi(argv[++i]);
             else if (a == "--target2") target1 = std::stoi(argv[++i]);
             else if (a == "--cycles") cycles = std::stoi(argv[++i]);
+            else if (a == "--shared-slots") n_shared_slots = std::stoi(argv[++i]);
             else throw std::runtime_error("unknown option " + a);
         }
         require(!model.empty() && !vocab_file.empty() && cycles >= 3 && source >= 0 && target0 >= 0 && target1 >= 0 &&
-                    source != target0 && source != target1 && target0 != target1,
-                "usage: mtp_head_test --gguf MODEL --draft-vocab FILE --source 7 --target 2 --target2 4 [--cycles 4, minimum 3]");
+                    source != target0 && source != target1 && target0 != target1 && (n_shared_slots == 0 || n_shared_slots == 8),
+                "usage: mtp_head_test --gguf MODEL --draft-vocab FILE --source 7 --target 2 --target2 4 "
+                "[--cycles 4, minimum 3] [--shared-slots 8]");
         int count = 0; const cudaError_t counted = cudaGetDeviceCount(&count);
         if (counted != cudaSuccess || std::max({source, target0, target1}) >= count) {
             std::fprintf(stderr, "SKIP: requested three GPUs unavailable (count=%d, CUDA=%s)\n", count, cudaGetErrorString(counted)); return 77;
@@ -274,6 +391,7 @@ int main(int argc, char** argv) {
             std::printf("tail: argmax_rows=%d split_probability=%d passed %zu T1 outputs\n", rows_argmax, split_prob, index);
             std::fflush(stdout);
         }
+        if (n_shared_slots) shared_slots(n_shared_slots, cycles, source, weights, dvocab, ids, helper);
         helper.reset(); require(!helper.initialized(), "reset left helper initialized"); current_is(source);
         std::printf("PASS: MTP_HEAD_BITWISE_LOGITS_PROBABILITIES cases=%zu logits=%zu dvocab_mapping=exact\n", cases, cases * kVocab);
         std::printf("PASS: MTP_HEAD_CHAIN_REUSE outputs=%zu steps=8 repeated_chains=%d\n", chained, cycles * 4);

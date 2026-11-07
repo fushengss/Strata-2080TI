@@ -793,6 +793,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         }
         dhead_ = shared->dhead_;
         dhead_type_ = shared->dhead_type_;   // the subset's type (the main head's, or Q4_0): -1 failed every --batch-mtp step
+        dhead_plain_ = shared->dhead_plain_; // layout metadata, not ownership: only a validated shared bank may use it
         dvocab_ = shared->dvocab_;
         n_dvocab_ = shared->n_dvocab_;
         owns_draft_head_ = false;
@@ -1985,6 +1986,27 @@ bool MtpDrafter::prepare_head_shards(int target0, int target1, std::string& err)
     return true;
 }
 
+bool MtpDrafter::prepare_shared_head_shards(const MtpDrafter& owner, std::string& err) {
+    const OnDevice on_device(device_);
+    if (head_shards_.initialized()) { err = "mtp head: shared workspace already prepared"; return false; }
+    if (!force_on_ || !cs_ || !g_ || !head_ || !head_logits_ || chain_live_ || owner.chain_live_ ||
+        coupled_active_ || max_t_ < 2 || max_t_ > 8) {
+        err = "mtp head: shared workspace needs a bound idle greedy-chain slot, before prepare_chain";
+        return false;
+    }
+    if (!owner.head_shards_.initialized() || !owner.g_ || !owner.owns_draft_head_ || owns_draft_head_ ||
+        device_ != owner.device_ || head_ != owner.head_ || g_->n_embd != owner.g_->n_embd ||
+        n_vocab_ != owner.n_vocab_ || n_dvocab_ != owner.n_dvocab_ || dhead_ != owner.dhead_ ||
+        dvocab_ != owner.dvocab_ || dhead_type_ != owner.dhead_type_ || dhead_type_ != 14 ||
+        !dhead_ || !dvocab_ || !dhead_plain_ || !owner.dhead_plain_ || q4_head_ || owner.q4_head_ ||
+        strata::kernels::native_q6_k_packed_enabled()) {
+        err = "mtp head: slot must share the owner's exact plain Q6_K subset, mapping, source device and shape";
+        return false;
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp head: shared source stream is not idle"; return false; }
+    return head_shards_.init_shared(owner.head_shards_, err);
+}
+
 bool MtpDrafter::prepare_chain(std::string& err) {
     const OnDevice on_device(device_);
     if (!force_on_ || h_force_ == nullptr) { err = "mtp: chains need set_force_capture before load"; return false; }
@@ -2026,8 +2048,8 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     if (round_exec_[T] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
     for (int j = 1; j < n_out; ++j)
         if (step_exec_[j] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
-    // Request eligibility is controlled by the solo PW2 caller. Coupled sampling can never take the greedy
-    // split tail, even if a caller accidentally leaves the opt-in active across requests.
+    // Solo request eligibility is controlled by its PW2 caller. Piped slots always draft greedily, including
+    // sampled targets. Coupled sampling can never take this greedy split tail, regardless of either caller.
     const bool head_split = head_shards_active_ && head_shards_.initialized() && !coupled_active_;
     if (head_split) {
         if (!head_round_body_[T] || !head_tail_[0]) { err = "mtp head: split round graphs not prepared"; return false; }

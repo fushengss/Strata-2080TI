@@ -4,9 +4,10 @@
 **off by default**. The draft layer's body, K/V state and probability calculation stay on the original MTP GPU.
 This setting is independent of `STRATA_DECODE_HEAD_GPU`, which controls the main verifier head.
 
-The current implementation is limited to a plain, unpacked **Q6_K draft-vocabulary subset** and eligible greedy
-solo `--pipeline-windows 2` chains in a layer split. It does not replace the ordinary draft graphs or the batch
-and prefill paths. See [multi-GPU settings](MULTI_GPU.md) for the existing layer split and PW2 requirements.
+The supported weights are a plain, unpacked **Q6_K draft-vocabulary subset**. By itself this setting only changes
+eligible greedy solo `--pipeline-windows 2` chains in a layer split. A separate experimental piped-slot option is
+described below; prefill and ordinary draft graphs stay intact. See [multi-GPU settings](MULTI_GPU.md) for the
+existing layer split and PW2 requirements.
 
 ## Selecting the targets
 
@@ -27,13 +28,13 @@ cause a clear startup error when the option was requested. The engine does not s
 unsupported requested configuration is active.
 
 The supported subset must be owned by the main drafter, contain at least 256 rows and use the original Q6_K
-layout. Full-vocabulary heads, shared slot-drafter heads, `--mtp-q4` head copies, `STRATA_Q6_PACKED=1` and other
+layout. Full-vocabulary heads, direct initialization from borrowed slot heads, `--mtp-q4` head copies, `STRATA_Q6_PACKED=1` and other
 weight types/layouts are rejected. Each target owns only its row shard; the original source head remains
 available for the ordinary paths.
 
 ## Request eligibility and fallback
 
-Only the solo PW2 path enables the shards for a request, and only when the request is greedy with no history
+With `STRATA_MTP_HEAD_GPU` alone, only the solo PW2 path enables the shards for a request, and only when it is greedy with no history
 penalty, logit bias or active coupled draft sampling. Sampled requests, requests with penalties/bias, prefill,
 serial drafts and batch execution retain their original graphs. The chain entry also checks coupled sampling
 internally before selecting the split graphs.
@@ -68,6 +69,44 @@ and destruction also wait for source consumption before freeing buffers or event
 
 The implementation is in [mtp.cpp](../src/core/mtp.cpp) and [mtp_head.cpp](../src/core/mtp_head.cpp), with the
 low-level interface in [mtp_head.hpp](../include/strata/core/mtp_head.hpp).
+
+## Experimental piped-slot workspaces
+
+`STRATA_PIPED_MTP_HEAD=1` additionally uses the already initialized solo head bank for piped MTP slot chains.
+It is off by default and requires an active `STRATA_BATCH_MTP=1`, `STRATA_PIPED_MTP=1` route with
+`STRATA_BATCH_SELF_COMMIT=0`, plus the existing two-target `STRATA_MTP_HEAD_GPU` setting. It does not choose new
+targets or enable a missing solo head configuration. An unsupported requested combination fails at startup.
+
+The two read-only weight shards are shared through a reference-counted bank; they are not copied once per
+slot. Each slot has its own portable mapped activation/logits, target scratch, streams, graph executables,
+and all eight steps' events. Equal step indices in concurrent slots therefore refer to different buffers and
+events. A workspace drains its source consumer and both target streams before releasing resources and its
+bank reference. Resetting the original helper leaves the other workspaces' weights alive. This does not change
+the older drafter lifetime rule: the main `MtpDrafter` must still outlive clones borrowing its dense weights,
+experts and subset map.
+
+Slot proposals are greedy even when the target request samples or uses penalties/bias. These slot chains can
+use the split head; coupled draft sampling is still excluded at chain entry. Admission's first draft, prefill,
+ordinary drafts and target verification remain unchanged. With the new flag off, slot initialization keeps
+its original ordering. With it on, chain capture waits until the existing solo head bank is ready.
+
+Startup reports the number of private workspaces, both targets, the source and one shared weight bank. Each
+completed piped batch then reports `strata piped MTP head: slot B, CUDA3+5, N draft steps offloaded in this batch`.
+These per-slot deltas, rather than the configuration alone, establish whether the path ran.
+
+On 2026-11-07, this candidate built with CUDA 13 / sm75 on the same 8×RTX 2080 Ti 22 GiB host. The additional
+eight-workspace test passed 1416 cases and 150519384 complete logits bitwise, including probability bits and
+mapped tokens. The original 144 cases and repeated-chain checks also passed. The command was:
+
+```sh
+engine/mtp_head_test --gguf MODEL.gguf --draft-vocab draft_vocab.bin --source 7 --target 3 --target2 5 --shared-slots 8
+```
+
+The test includes original-owner reset, partial-chain drain/reuse and one workspace's reset/rebind while
+peers have queued work. Its log is `/srv/bench100k-20261107-concurrency-mtp/head-build/parity.log` on the test
+host. Engine SHA256: `c9305b08b24e6ff85e363147063827760c54c8243eeec6b2362587159cda5ca6`.
+End-to-end concurrency and prefill measurements are still in progress; these low-level checks do not establish
+a speedup or authorize deployment. HIP has not been built. Metal checks cover syntax and the unavailable stub.
 
 ## Validation status, 2026-11-07
 
