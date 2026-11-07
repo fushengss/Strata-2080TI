@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <vector>
 
 using strata::program::batch_read_piece;
 using strata::program::concurrent_read_off;
@@ -11,6 +12,7 @@ using strata::program::ConcurrentReadSetup;
 using strata::program::piped_decode_budget_ms;
 using strata::program::piped_read_lead_in;
 using strata::program::piped_read_piece;
+using strata::program::PipedReadHistory;
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
@@ -67,6 +69,45 @@ int main() {
     CHECK(piped_read_piece(5000, 0) == 32);             // chunk 0 guarded as 1 (and the cap applies)
     for (int64_t c : {1024, 2048, 6144, 8192})
         for (int64_t p : {1, 1000, 9000, 50000, 300000}) CHECK(piped_read_piece(p, c) % c == 0);   // the header's rule
+    // Decode-only keeps a solo prompt whole and rechecks at every drained boundary. The simulated slot counts
+    // are those left after each decode budget (or the lead-in before the first piece), not GPU work itself.
+    auto spans = [](bool decode_only, std::vector<int> active) {
+        std::vector<int64_t> out;
+        int64_t remaining = 61000;
+        size_t boundary = 0;
+        while (remaining > 0) {
+            const int count = active[std::min(boundary, active.size() - 1)];
+            const int64_t piece = piped_read_piece(16384, 8192, decode_only, count > 0);
+            const int64_t n = piece > 0 ? std::min(piece, remaining) : remaining;
+            out.push_back(n);
+            remaining -= n;
+            ++boundary;
+        }
+        return out;
+    };
+    CHECK(spans(true, {0}) == std::vector<int64_t>({61000}));   // no slots, or the lead-in finished them all
+    CHECK(spans(true, {3, 2, 1, 1}) == std::vector<int64_t>({16384, 16384, 16384, 11848}));
+    CHECK(spans(true, {3, 0}) == std::vector<int64_t>({16384, 44616}));   // merge the entire idle remainder
+    CHECK(spans(true, {3, 1, 0}) == std::vector<int64_t>({16384, 16384, 28232}));
+    CHECK(spans(false, {0}) == std::vector<int64_t>({16384, 16384, 16384, 11848}));   // original PIECE behavior
+    CHECK(piped_read_piece(0, 8192, true, true) == 0);   // the guard alone never enables slicing
+    CHECK(piped_read_piece(20000, 8192, true, true) == 16384);   // the original chunk grid
+    // A completed mixed read may give the next read a lead-in. An idle remainder or any early exit clears it,
+    // even if a later admission arrives immediately. Legacy mode keeps its prior history semantics.
+    for (bool complete : {false, true}) {
+        for (bool active : {false, true}) {
+            PipedReadHistory h{true, 900.0};
+            h.finish(true, complete, active);
+            CHECK(h.have_previous == (complete && active));
+            CHECK(h.piece_ms == (complete && active ? 900.0 : 0.0));
+            PipedReadHistory legacy{true, 900.0};
+            legacy.finish(false, complete, active);
+            CHECK(legacy.have_previous && legacy.piece_ms == 900.0);
+        }
+    }
+    PipedReadHistory idle;
+    idle.finish(true, true, true);
+    CHECK(!idle.have_previous && idle.piece_ms == 0.0);   // finishing alone cannot invent a prior read
     // piped_decode_budget_ms: share x piece, capped, floored; negatives are 0
     CHECK(piped_decode_budget_ms(2000.0, 2.0, 400.0, 0.0) == 400.0);
     CHECK(piped_decode_budget_ms(2000.0, 0.35, 3000.0, 0.0) == 700.0);

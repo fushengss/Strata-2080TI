@@ -17538,6 +17538,10 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_PIPED_READ_PIECE");
                     return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0;
                 }();
+                static const bool pr_decode_only = [] {
+                    const char* v = std::getenv("STRATA_PIPED_READ_DECODE_ONLY");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
                 static const double pr_cap = [] {
                     const char* v = std::getenv("STRATA_PIPED_DECODE_MAX_MS");
                     return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
@@ -17548,7 +17552,8 @@ int main(int argc, char** argv) {
                 }();
                 const bool pr_on = piped && pr_piece > 0;
                 auto piece_now = [&]() -> int64_t {
-                    return pr_on ? strata::program::piped_read_piece(pr_piece, C)
+                    return pr_on ? strata::program::piped_read_piece(pr_piece, C, pr_decode_only,
+                                                                     !pr_decode_only || batch_on())
                                  : strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C,
                                                                      yield_chunks);
                 };
@@ -17574,15 +17579,23 @@ int main(int argc, char** argv) {
                 };
                 // prompts arriving back to back: one decode budget before a read that follows a piecewise read
                 static Clock::time_point pr_prev_end{};
-                static bool pr_have_prev = false;
-                static double pr_prev_piece_ms = 0.0;   // the previous read's last full piece
+                static strata::program::PipedReadHistory pr_history;
+                // Only the new mode discards history on an idle remainder or an early exit. The old PIECE mode
+                // keeps its existing lead-in behavior, including reads made with no decoding slot.
+                struct ReadHistoryEnd {
+                    strata::program::PipedReadHistory& history;
+                    bool decode_only;
+                    decltype(batch_on)& decoding;
+                    bool completed = false;
+                    ~ReadHistoryEnd() { if (decode_only) history.finish(true, completed, decoding()); }
+                } history_end{pr_history, pr_on && pr_decode_only, batch_on};
                 if (pr_on) {
                     const double lead =
-                        pr_prev_piece_ms > 0.0
-                            ? strata::program::piped_decode_budget_ms(pr_prev_piece_ms, decode_share, pr_cap, pr_floor)
+                        pr_history.piece_ms > 0.0
+                            ? strata::program::piped_decode_budget_ms(pr_history.piece_ms, decode_share, pr_cap, pr_floor)
                             : (pr_cap > 0.0 ? pr_cap : std::max(pr_floor, 200.0));
                     const double since =
-                        pr_have_prev ? std::chrono::duration<double, std::milli>(Clock::now() - pr_prev_end).count()
+                        pr_history.have_previous ? std::chrono::duration<double, std::milli>(Clock::now() - pr_prev_end).count()
                                      : -1.0;
                     if (strata::program::piped_read_lead_in(true, batch_on(), since, lead)) {
                         const int64_t rows0 = pipe_rows;
@@ -17593,14 +17606,22 @@ int main(int argc, char** argv) {
                                      std::chrono::duration<double, std::milli>(Clock::now() - tl).count());
                     }
                 }
+                // The prior piece supplied the lead-in above. A short new read must not inherit its timing.
+                if (pr_on && pr_decode_only) pr_history.piece_ms = 0.0;
                 int64_t piece = piece_now();
                 if (piece <= 0) return run(a0, b0);
                 for (int64_t q = a0; q < b0;) {
+                    if (pr_on && pr_decode_only) {
+                        // piped_decode drained all groups. If its last slot finished, read the remaining planned
+                        // chunks in one run; no new slot can be admitted while this read holds the control lines.
+                        piece = piece_now();
+                        if (piece <= 0) return run(q, b0);
+                    }
                     const int64_t r = std::min(b0, q + piece);
                     const auto tq = Clock::now();
                     if (!run_conc(q, r)) return false;
                     const double piece_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
-                    if (pr_on && r < b0) pr_prev_piece_ms = piece_ms;
+                    if (pr_on && r < b0) pr_history.piece_ms = piece_ms;
                     const int64_t piece_tokens = r - q;
                     q = r;
                     if (q >= b0) continue;
@@ -17656,7 +17677,8 @@ int main(int argc, char** argv) {
                         std::fflush(stderr);
                     }
                 }
-                if (pr_on) { pr_prev_end = Clock::now(); pr_have_prev = true; }   // for the next read's lead-in
+                if (pr_on) { pr_prev_end = Clock::now(); pr_history.have_previous = true; }   // for the next read's lead-in
+                history_end.completed = true;
                 return true;
             };
             apply_pending(true);
