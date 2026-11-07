@@ -215,6 +215,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation full,incremental;
     check(conversation_snapshot_save(full,view,ss,g,draft.st,error), "full capture through host transfer backend");
     const size_t full_copies = copied_bytes;
+    const int full_copy_calls = copy_calls;
     ConversationKvReuse reuse{full.kv,9,9};
     size_t peak = 0, reused = 0;
     check(conversation_snapshot_capture_bytes(reuse,view,ss,g,draft.st,peak,error), "incremental capture admission without transfers");
@@ -238,6 +239,44 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation unpublished;
     check(!conversation_snapshot_save(unpublished,view,ss,g,draft.st,error,std::move(reuse)), "incremental capture copy failure is reported");
     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
+    // No-zero-fill capture must preserve a kept prefix and overwrite every new
+    // byte, whether an existing image shrinks, stays the same size, or grows.
+    reset();
+    const std::vector<ConversationImageKey> no_images;
+    const std::vector<ConversationCheckpoint> no_checkpoints;
+    for (int64_t tokens : {1,5,9,17,65}) {
+        std::vector<int32_t> ids((size_t) tokens);
+        for (int64_t i=0;i<tokens;++i) ids[(size_t) i]=(int32_t) i+1;
+        const ConversationView changed{ids,no_images,no_checkpoints,true};
+        SavedConversation fresh,kept;
+        check(conversation_snapshot_save(fresh,changed,ss,g,draft.st,error), "fresh extent capture");
+        ConversationKvReuse retained{full.kv,9,std::min<int64_t>(9,tokens)};
+        check(conversation_snapshot_save(kept,changed,ss,g,draft.st,error,std::move(retained)),
+              "retained capture after shrink, same extent or growth");
+        check(kept.kv.size()==fresh.kv.size(), "retained extent has every K/V layer");
+        for (size_t i=0;i<fresh.kv.size();++i)
+            check(kept.kv[i].k==fresh.kv[i].k && kept.kv[i].v==fresh.kv[i].v &&
+                  kept.kv[i].k_scale==fresh.kv[i].k_scale && kept.kv[i].v_scale==fresh.kv[i].v_scale &&
+                  kept.kv[i].pooled==fresh.kv[i].pooled, "every retained/new byte equals a fresh capture");
+    }
+    // Sweep past the running-state copies into every K/V transfer. A failed
+    // capture must leave even an existing output object entirely unpublished.
+    for (int at=1;at<=full_copy_calls;++at) {
+        reset(); fail_copy=at;
+        SavedConversation sentinel;
+        sentinel.live.ids={-7};
+        check(!conversation_snapshot_save(sentinel,view,ss,g,draft.st,error), "each capture transfer failure is reported");
+        check(sentinel.live.ids==std::vector<int32_t>{-7} && sentinel.kv.empty() && sentinel.live.gdn.empty(),
+              "partial copy never replaces the caller's image");
+    }
+    reset();
+    QsaState missing=draft.st;
+    missing.k_pool=nullptr; missing.k_q=nullptr; missing.k_q4=nullptr;
+    SavedConversation sentinel;
+    sentinel.live.ids={-7};
+    check(!conversation_snapshot_save(sentinel,view,ss,g,missing,error), "missing source fails after local allocation");
+    check(sentinel.live.ids==std::vector<int32_t>{-7} && sentinel.kv.empty() && sentinel.live.gdn.empty(),
+          "missing source cannot publish an unwritten K/V buffer");
 #endif
 }
 }

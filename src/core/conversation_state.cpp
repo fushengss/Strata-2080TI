@@ -512,7 +512,7 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 }
 
 // (conversation_snapshot.cpp) STRATA_PARK_TRACE: conversation_kv_save's time since the park's begin, by part (ms)
-void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms);
+void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms, size_t& overwrite_added);
 
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
@@ -587,11 +587,12 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
         size_t kvb = 0;
         for (const auto& k : captured.kv) kvb += k.bytes();
         double attrs_ms = 0, resize_ms = 0, copy_ms = 0;
-        conversation_kv_save_trace(attrs_ms, resize_ms, copy_ms);   // (the main layers' saves above)
+        size_t overwrite_added = 0;
+        conversation_kv_save_trace(attrs_ms, resize_ms, copy_ms, overwrite_added);   // (the main layers' saves above)
         std::fprintf(stderr, "strata parktrace: joins %.1f ms, sync %.1f ms, %zu checkpoints copied %.1f ms, live state %.1f ms, "
-                             "begin %.1f ms, K/V %zu MB %.1f ms (layer max %.2f, sum %.2f; attrs %.2f, resize %.2f, copy %.2f)\n",
+                             "begin %.1f ms, K/V %zu MB %.1f ms (layer max %.2f, sum %.2f; attrs %.2f, resize %.2f, copy %.2f; overwrite_added_bytes %zu)\n",
                      ms(pj, p0), ms(p0, p1), captured.checkpoints.size(), ms(p1, p2), ms(p2, p3), ms(p3, p4), kvb >> 20,
-                     ms(p4, now()), kv_max, kv_sum, attrs_ms, resize_ms, copy_ms);
+                     ms(p4, now()), kv_max, kv_sum, attrs_ms, resize_ms, copy_ms, overwrite_added);
     }
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.

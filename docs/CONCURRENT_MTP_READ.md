@@ -9,9 +9,12 @@ decode-budget pieces. This candidate has no measured performance claim yet.
 This flag is sufficient to request the path; `STRATA_PIPED_CONCURRENT` and
 `STRATA_PIPED_READ_PIECE` are not required. The existing
 `STRATA_PIPED_CONCURRENT_MIN`, `_PRIO`, and `_UNPIN` controls still apply.
-Verifier streams request high priority unless `_PRIO=0`. GPU stream priority
-does not guarantee preemption or latency; solo and mixed prefill performance
-must both be measured.
+Verifier-owned streams request high priority unless `_PRIO=0`. An externally
+supplied pipeline stream keeps its original priority: with `--pipeline-windows
+2`, the main verifier graphs use those default-priority streams. MTP and output
+head streams have their own creation rules. GPU stream priority does not
+guarantee preemption or latency; solo and mixed prefill performance must both
+be measured.
 
 ## Eligibility and lifetime
 
@@ -106,3 +109,26 @@ describe their individual states. An `end` line alone does not prove that
 the final drain, admission, or request completed successfully. Validation
 must also check completed outputs and usage, cancellation and slot reuse,
 absence of engine errors, solo 100k prefill, and mixed-stream output gaps.
+
+## Synchronous snapshot buffer experiment
+
+`STRATA_PARK_OVERWRITE=1` separately opts into allocating synchronous K/V
+snapshot buffers without first clearing bytes that the following transfer
+overwrites. It is off by default. Before growing a buffer, the snapshot path
+checks that the reusable prefix fits the old buffer; all bytes after that
+prefix are copied before the image can be published. A failed transfer leaves
+the caller's output image unchanged. Streams, synchronization and snapshot
+ownership remain the same.
+
+This applies to all synchronous `conversation_kv_save` callers, including the
+temporary K/V images used when moving MTP state between the main session and a
+slot. It does not change the existing asynchronous park paths or remove
+checkpoint copies. The overwrite variant therefore needs the same output,
+cancellation, slot reuse and yield/resume validation as the reader experiment.
+
+With `STRATA_PARK_TRACE`, `overwrite_added_bytes` counts new bytes allocated by
+this path in the current stage's main-layer K/V saves. The trace is printed
+before the draft-layer save, so it is not the complete park's byte count.
+Removing a clear can move first-touch page faults into the subsequent copy;
+the old resize time is not a prediction of time saved. Compare complete park
+time and end-to-end request latency on the same hardware and workload.

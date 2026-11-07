@@ -248,11 +248,25 @@ bool on_device(const void* p) {
 }
 // STRATA_PARK_TRACE: where conversation_kv_save's time goes since the park's begin (ms): the pointer-attribute
 // queries, the host buffer resizes and the copies (into the stage, or the synchronous ones).  Read by the park trace.
-struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; };
+struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; size_t overwrite_added = 0; };
 KvSaveTrace& kv_save_trace() { static KvSaveTrace t; return t; }
 bool park_trace_on() {
     static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr;
     return on;
+}
+
+// Opt-in A/B: synchronous saves overwrite every added byte, too. The caller has
+// checked keep <= the old size; only [keep, n) is copied, preserving its prefix.
+// On transfer failure snapshot_save discards its local captured image.
+bool park_overwrite_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PARK_OVERWRITE"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+void resize_snapshot_part(ConversationBuffer& out, size_t n) {
+    if (!park_overwrite_on()) { out.resize(n); return; }
+    const size_t added = n > out.size() ? n - out.size() : 0;
+    out.resize_for_overwrite(n);
+    if (park_trace_on()) kv_save_trace().overwrite_added += added;
 }
 
 bool transfer(void* dst, const void* src, size_t n, std::string& error) {
@@ -339,7 +353,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                             return true;
                         })) return false;
                 } else {
-                    dst[i]->resize(sizes[i]);
+                    resize_snapshot_part(*dst[i], sizes[i]);
                     if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                             return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
                         })) return false;
@@ -358,7 +372,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                             (st.kv_mode == 0 || on_device(src[i]));
         const auto t1 = tick();
         if (staged) dst[i]->resize_for_overwrite(sizes[i]);
-        else dst[i]->resize(sizes[i]);
+        else resize_snapshot_part(*dst[i], sizes[i]);
         const auto t2 = tick();
         const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                 const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
@@ -587,9 +601,10 @@ void conversation_park_join() {
     }
 }
 
-void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms) {
+void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms, size_t& overwrite_added) {
     const KvSaveTrace& t = kv_save_trace();
     attrs_ms = t.attrs; resize_ms = t.resize; copy_ms = t.copy;
+    overwrite_added = t.overwrite_added;
 }
 
 bool conversation_park_async_begin(size_t need) {
