@@ -33,6 +33,8 @@ struct SourceBuffers {
     float *mixed = nullptr, *logits = nullptr;
     void *q8 = nullptr, *il = nullptr, *scratch = nullptr;
     int32_t* picks = nullptr;
+    int32_t* history = nullptr;
+    float* bias = nullptr;
     uint32_t* nf = nullptr;
     explicit SourceBuffers(int d) : device(d) {}
     ~SourceBuffers() {
@@ -44,6 +46,8 @@ struct SourceBuffers {
         if (il) cudaFree(il);
         if (scratch) cudaFree(scratch);
         if (picks) cudaFree(picks);
+        if (history) cudaFree(history);
+        if (bias) cudaFree(bias);
         if (nf) cudaFree(nf);
         if (ready) cudaEventDestroy(ready);
         if (stream) cudaStreamDestroy(stream);
@@ -148,6 +152,136 @@ size_t test_shards(const strata::core::NativeHead& original, const strata::core:
             require(have_nf == want_nf, "sharded nonfinite row guard differs");
         }
         current_is(b.device);
+        ++cases;
+    }
+    return cases;
+}
+
+size_t test_return_logits(const strata::core::NativeHead& original, const strata::core::NativeHead& first,
+                          const strata::core::NativeHead& second, SourceBuffers& b, int n, int vocab, int cycles) {
+    using namespace strata::kernels;
+    constexpr int max_t = 8, history_len = 8;
+    const int cut = vocab / 2 / 128 * 128;
+    const size_t row_bytes = native_q8_1_bytes(n, 1);
+    SourceBuffers got(b.device);   // no owned stream: all consumers below use b.stream, which outlives the helpers
+    gpu(cudaMalloc((void**) &got.logits, (size_t) max_t * vocab * sizeof(float)));
+    gpu(cudaMalloc((void**) &got.picks, max_t * sizeof(int32_t)));
+    gpu(cudaMalloc((void**) &got.nf, max_t * kNonfiniteBlocks * sizeof(uint32_t)));
+    gpu(cudaMalloc((void**) &got.history, max_t * history_len * sizeof(int32_t)));
+    gpu(cudaMalloc((void**) &got.bias, (size_t) vocab * sizeof(float)));
+    std::vector<int32_t> history(max_t * history_len);
+    for (size_t i = 0; i < history.size(); ++i) history[i] = (int32_t) ((i * 17 + i / history_len) % vocab);
+    std::vector<float> bias(vocab, 0.0f);
+    for (int i = 0; i < vocab; i += 131) bias[(size_t) i] = (float) (i % 7 - 3) * 0.1f;
+    gpu(cudaMemcpyAsync(got.history, history.data(), history.size() * sizeof(int32_t), cudaMemcpyHostToDevice, b.stream));
+    gpu(cudaMemcpyAsync(got.bias, bias.data(), bias.size() * sizeof(float), cudaMemcpyHostToDevice, b.stream));
+    gpu(cudaStreamSynchronize(b.stream));
+    size_t cases = 0;
+    for (bool il : {false, true}) {
+        std::string err;
+        strata::core::DecodeHeadWindow halves[2];
+        require(halves[0].init(first, b.device, n, vocab, max_t, il, false, false, err, 0, cut, true), err);
+        require(halves[1].init(second, b.device, n, vocab, max_t, il, false, false, err, cut, 0, true), err);
+        for (auto& half : halves) {
+            require(half.capture_all(err), err);
+            err.clear(); require(!half.launch(1, nullptr, 0, err) && !err.empty(), "return workspace accepted selecting launch");
+            err.clear(); require(!half.enqueue_return(b.stream, got.logits, vocab, err) && !err.empty(), "unlaunched return was accepted");
+            err.clear();
+        }
+        for (int t : {1, 2, 3, 8}) for (int cycle = 0; cycle < cycles; ++cycle) {
+            const bool inject_nf = cycle + 1 == cycles;
+            std::vector<float> mixed((size_t) t * n, 0.0f);
+            uint32_t state = 0x76a31240u + 997u * cycle + t;
+            if (cycle != 0) for (float& f : mixed) {
+                state = state * 1664525u + 1013904223u;
+                f = (float) ((int) (state >> 16) - 32768) / 8192.0f;
+            }
+            gpu(cudaMemcpyAsync(b.mixed, mixed.data(), mixed.size() * sizeof(float), cudaMemcpyHostToDevice, b.stream));
+            native_quantize_q8_1(b.mixed, b.q8, n, t, b.stream);
+            const uint16_t half_nan = 0x7e00;
+            if (inject_nf) gpu(cudaMemcpyAsync((uint8_t*) b.q8 + (size_t) (t - 1) * row_bytes,
+                                               &half_nan, sizeof half_nan, cudaMemcpyHostToDevice, b.stream));
+            if (il && native_mmvq_il_supported(original.type(), t, vocab)) {
+                if (t >= 2) native_q8_1_interleave(b.q8, b.il, n, t, b.stream);
+                native_mmvq_il(original.type(), original.weights(), b.q8, b.il, b.logits, n, vocab, t, b.stream);
+            } else native_mmvq(original.type(), original.weights(), b.q8, b.logits, n, vocab, t, b.stream);
+            gpu(cudaMemsetAsync(got.logits, 0xa5, (size_t) t * vocab * sizeof(float), b.stream));
+            for (auto& half : halves)
+                copy_from_mapped((float*) half.handoff(), (const float*) b.q8, (int64_t) t * row_bytes / sizeof(float), b.stream);
+            gpu(cudaEventRecord(b.ready, b.stream));
+            // No source wait is installed until both independent projections have been launched.
+            for (auto& half : halves) require(half.launch_logits(t, b.ready, err), err);
+            for (auto& half : halves) {
+                require(!half.done(err) && err.empty(), "return workspace finished before enqueue_return");
+                require(half.enqueue_return(b.stream, got.logits, vocab, err), err);
+                err.clear(); require(!half.enqueue_return(b.stream, got.logits, vocab, err) && !err.empty(), "duplicate return accepted");
+                err.clear();
+            }
+            auto tail = [&](float* logits, int32_t* out, uint32_t* nf) {
+                // Mirror the verifier: full-vocabulary greedy/NF first, then the same per-slot draw parameters.
+                if (cycle % 2 == 0) argmax_rows(logits, t, vocab, b.scratch, out, b.stream);
+                else { SamplerParams sp; sp.greedy = true; sp.temperature = 0.0f;
+                       sample_tokens(logits, t, vocab, nullptr, 0, sp, out, b.stream); }
+                logits_nonfinite_rows(logits, t, vocab, nf, b.stream);
+                if (inject_nf) return;
+                for (int r = 0; r < t; ++r) {
+                    const int kind = (r + cycle) % 4;
+                    if (kind == 0) continue;
+                    SamplerParams sp;
+                    sp.greedy = kind == 2; sp.temperature = sp.greedy ? 0.0f : 0.7f;
+                    sp.top_k = 20; sp.top_p = 0.9f; sp.min_p = 0.02f;
+                    sp.seed = 0x13864a7u + r; sp.counter = 100000 + cycle * 47 + r * 31;
+                    if (kind >= 2) {
+                        sp.penalty_last_n = history_len; sp.penalty_repeat = 1.1f;
+                        sp.penalty_freq = 0.07f; sp.penalty_present = 0.13f; sp.logit_bias = got.bias;
+                    }
+                    sample_tokens(logits + (size_t) r * vocab, 1, vocab,
+                                  kind >= 2 ? got.history + r * history_len : nullptr,
+                                  kind >= 2 ? history_len : 0, sp, out + r, b.stream);
+                }
+            };
+            tail(b.logits, b.picks, b.nf);
+            tail(got.logits, got.picks, got.nf);
+            std::vector<float> expected((size_t) t * vocab), actual(expected.size());
+            std::vector<int32_t> expected_picks(t), actual_picks(t);
+            std::vector<uint32_t> expected_nf(t * kNonfiniteBlocks), actual_nf(expected_nf.size());
+            gpu(cudaMemcpyAsync(expected.data(), b.logits, expected.size() * sizeof(float), cudaMemcpyDeviceToHost, b.stream));
+            gpu(cudaMemcpyAsync(actual.data(), got.logits, actual.size() * sizeof(float), cudaMemcpyDeviceToHost, b.stream));
+            gpu(cudaMemcpyAsync(expected_picks.data(), b.picks, t * sizeof(int32_t), cudaMemcpyDeviceToHost, b.stream));
+            gpu(cudaMemcpyAsync(actual_picks.data(), got.picks, t * sizeof(int32_t), cudaMemcpyDeviceToHost, b.stream));
+            gpu(cudaMemcpyAsync(expected_nf.data(), b.nf, expected_nf.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, b.stream));
+            gpu(cudaMemcpyAsync(actual_nf.data(), got.nf, actual_nf.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, b.stream));
+            gpu(cudaStreamSynchronize(b.stream));
+            for (auto& half : halves) require(half.done(err), err);
+            require(std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)) == 0,
+                    "returned full logits differ: IL=" + std::to_string(il) + " T=" + std::to_string(t));
+            require(expected_picks == actual_picks, "returned logits changed greedy/sampled/penalty/bias picks");
+            require(expected_nf == actual_nf, "returned logits changed full-vocabulary nonfinite flags");
+            current_is(b.device);
+            ++cases;
+        }
+    }
+    // An odd-length partial range catches copies that round to float4 or use the shard count as destination stride.
+    std::string err;
+    strata::core::DecodeHeadWindow odd;
+    require(vocab > cut + 127, "vocabulary too small for odd-range check");
+    require(odd.init(second, b.device, n, vocab, max_t, false, false, false, err, cut, 127, true), err);
+    require(odd.capture_all(err), err);
+    for (int t : {1, 2, 3, 8}) {
+        native_mmvq(original.type(), original.weights(), b.q8, b.logits, n, vocab, t, b.stream);
+        gpu(cudaMemsetAsync(got.logits, 0xa5, (size_t) t * vocab * sizeof(float), b.stream));
+        copy_from_mapped((float*) odd.handoff(), (const float*) b.q8, (int64_t) t * row_bytes / sizeof(float), b.stream);
+        gpu(cudaEventRecord(b.ready, b.stream));
+        require(odd.launch_logits(t, b.ready, err), err);
+        require(odd.enqueue_return(b.stream, got.logits, vocab, err), err);
+        std::vector<uint32_t> expected((size_t) t * vocab), actual(expected.size());
+        gpu(cudaMemcpyAsync(expected.data(), b.logits, expected.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, b.stream));
+        gpu(cudaMemcpyAsync(actual.data(), got.logits, actual.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, b.stream));
+        gpu(cudaStreamSynchronize(b.stream));
+        require(odd.done(err), err);
+        for (int r = 0; r < t; ++r) for (int c = 0; c < vocab; ++c)
+            require(actual[(size_t) r * vocab + c] == (c >= cut && c < cut + 127 ? expected[(size_t) r * vocab + c] : 0xa5a5a5a5u),
+                    "odd returned range overwrote its stride or lost logit words");
         ++cases;
     }
     return cases;
@@ -304,6 +438,11 @@ int main(int argc, char** argv) {
                                                b, n, vocab, cycles);
         std::printf("PASS: %zu sharded windows; bitwise full logits, gathered scores, merged greedy picks, row NF guards; "
                     "source=%d targets=%d,%d\n", shard_cases, source, target, target2);
+        const size_t returned_cases = test_return_logits(original.head, replica.head,
+                                                         target2 == target ? replica.head : replica2.head, b, n, vocab, cycles);
+        std::printf("PASS: %zu full-logit return windows; bitwise source logits; source greedy/sampled/penalty/bias tail; "
+                    "nonfinite flags; T=1,2,3,8; reuse; odd 127-row range; source=%d targets=%d,%d\n",
+                    returned_cases, source, target, target2);
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
