@@ -257,7 +257,7 @@ kernel void mm_combine(device const float* YE [[buffer(0)]], device const int* p
 #define MM_GU_SET(F) MMGU(F, 32, 64, 64, 4) MMGU(F, 64, 64, 64, 4) MMGU(F, 16, 64, 64, 2) MMGU(F, 32, 32, 64, 2)
 #define MM_DN_SET(F) MMDN(F, 32, 64, 64, 4) MMDN(F, 64, 64, 64, 4) MMDN(F, 16, 64, 64, 2) MMDN(F, 32, 32, 64, 2)
 MM_GU_SET(T_Q2_0) MM_GU_SET(T_IQ3_XXS) MM_GU_SET(T_IQ2_XXS) MM_GU_SET(T_IQ2_XS) MM_GU_SET(T_IQ2_S) MM_GU_SET(T_IQ3_S)
-MM_DN_SET(T_Q2_0) MM_DN_SET(T_IQ4_NL)
+MM_DN_SET(T_Q2_0) MM_DN_SET(T_IQ4_NL) MM_DN_SET(T_Q5_0)
 
 // ---- v2: activations gathered once per layer as fp16 rows, read by matmul2d from device memory ---------------------
 // mm_gather: XS[row][k] = half(x[srt_tok[row]][k]) (0 on padding rows).  grid (rows), 256 threads.
@@ -388,12 +388,14 @@ kernel void mm_down2(device const uchar* W [[buffer(0)]], device const half* HS 
     MMDN2(F, 16, 128, 32, 4) MMDN2(F, 32, 64, 32, 2) MMDN2(F, 64, 64, 32, 4)
 // K-quants: the staged K chunk must hold whole units as DW places them (128 wide): TK 128
 #define MM_GU2_KQ(F) MMGU2(F, 16, 32, 128, 2) MMGU2(F, 16, 16, 128, 2) MMGU2(F, 32, 32, 128, 2) MMGU2(F, 16, 32, 128, 4)
-MM_GU2_KQ(T_Q4_K) MM_GU2_KQ(T_Q5_K) MM_GU2_KQ(T_Q6_K) MM_GU2_U32(T_Q8_0) MM_DN2_U32(T_Q5_1) MM_DN2_U32(T_Q8_0)
+MM_GU2_KQ(T_Q4_K) MM_GU2_KQ(T_Q5_K) MM_GU2_KQ(T_Q6_K) MM_GU2_U32(T_Q8_0) MM_DN2_U32(T_Q5_1) MM_DN2_U32(T_Q5_0) MM_DN2_U32(T_Q8_0)
 // IQ4_XS (UNIT 32): the K chunk must be >= 32
 MMGU2(T_IQ4_XS, 16, 64, 32, 2) MMGU2(T_IQ4_XS, 16, 64, 64, 2) MMGU2(T_IQ4_XS, 32, 64, 32, 2) MMGU2(T_IQ4_XS, 16, 32, 32, 2)
 MMGU2(T_IQ4_XS, 64, 64, 32, 4)
 MM_GU2_SET(T_Q2_0) MM_GU2_SET(T_IQ3_XXS) MM_GU2_SET(T_IQ2_XXS) MM_GU2_SET(T_IQ2_XS) MM_GU2_SET(T_IQ2_S) MM_GU2_SET(T_IQ3_S)
+MM_GU2_SET(T_TQK6) MM_GU2_SET(T_TQ2T)   // Gyro: the trellis gate/up (units of 16 weights: TK 16 or a multiple)
 MM_DN2_SET(T_Q2_0)
+MM_DN2_SET(T_TQK7) MM_DN2_SET(T_TQ2T)
 MMDN2(T_IQ4_NL, 16, 64, 32, 2) MMDN2(T_IQ4_NL, 16, 64, 64, 2) MMDN2(T_IQ4_NL, 16, 32, 32, 2) MMDN2(T_IQ4_NL, 32, 32, 32, 2) MMDN2(T_IQ4_NL, 16, 128, 32, 4)
 
 // ---- v3: the weights decoded straight into matmul2d's right-input cooperative tensor (single-simdgroup scope),
@@ -548,6 +550,21 @@ template <> struct W4<T_Q5_1> {   // 32 a block: d, m, qh (32 bits), qs[16] (low
         return half4(w);
     }
 };
+template <> struct W4<T_Q5_0> {   // 32 a block: d, qh (32 bits), qs[16] (low nibbles 0..15, high 16..31); w = (code - 16) d
+    static inline half4 run(device const uchar* row, int k, threadgroup const uint*) {
+        device const uchar* b = row + (k >> 5) * 22;
+        const float d = rdh(b);
+        const uint hb = rd32(b + 2);
+        const int j = k & 31, o = j & 15, hi = j >> 4;
+        float4 w;
+        for (int c = 0; c < 4; ++c) {
+            const uint qv = b[6 + o + c];
+            const int x = int(hi ? (qv >> 4) : (qv & 15)) | int(((hb >> (j + c)) & 1) << 4);
+            w[c] = float(x - 16) * d;
+        }
+        return half4(w);
+    }
+};
 template <> struct W4<T_Q4_K> {   // 256 a block: d, dmin, scales[12], qs[128] (64-chunks: low nibbles then high)
     static inline half4 run(device const uchar* row, int k, threadgroup const uint*) {
         device const uchar* b = row + (k >> 8) * 144;
@@ -633,12 +650,13 @@ template <> struct W8<T_IQ2_XXS> {
         device const uchar* bl = row + (k >> 8) * 66;
         const int ib = (k & 255) >> 5, l = (k & 31) >> 3, hh = (k & 7) >> 2;
         const uint a0 = rd32(bl + 2 + 8 * ib), a1 = rd32(bl + 2 + 8 * ib + 4);
-        threadgroup const uchar* ks = (threadgroup const uchar*)(tab + 512);
         const float sc = rdh(bl) * (0.5f + float(a1 >> 28)) * 0.25f;
         const uint i0 = (a0 >> (8 * l)) & 255, i1 = (a0 >> (8 * (l + 2))) & 255;
-        const uint s0 = ks[(a1 >> (7 * l)) & 127], s1 = ks[(a1 >> (7 * (l + 2))) & 127];
-        a = w4_signed(tab[2 * i0 + hh], hh ? s0 >> 4 : s0, sc);
-        b = w4_signed(tab[2 * i1 + hh], hh ? s1 >> 4 : s1, sc);
+        // through the accessors, so QUANT_CTAB (the constant grids, no threadgroup copy) gives the same values: the
+        // direct tab[] reads below skipped the ctab branch and read an unfilled table
+        const uint s0 = ksg(tab, 512, (a1 >> (7 * l)) & 127), s1 = ksg(tab, 512, (a1 >> (7 * (l + 2))) & 127);
+        a = w4_signed(g_iq2xxs(tab, i0, hh), hh ? s0 >> 4 : s0, sc);
+        b = w4_signed(g_iq2xxs(tab, i1, hh), hh ? s1 >> 4 : s1, sc);
     }
 };
 template <> struct W8<T_IQ2_XS> {
@@ -647,14 +665,14 @@ template <> struct W8<T_IQ2_XS> {
         const int ib = (k & 255) >> 5, l = (k & 31) >> 3, hh = (k & 7) >> 2;
         device const ushort* q = (device const ushort*)(bl + 2) + 4 * ib;
         const uint v0 = q[l], v1 = q[l + 2];
-        threadgroup const uchar* ks = (threadgroup const uchar*)(tab + 1024);
         const uint scb = bl[66 + ib];
         const float d = rdh(bl);
         const float sc0 = d * (0.5f + float((scb >> (4 * (l >> 1))) & 15)) * 0.25f;
         const float sc1 = d * (0.5f + float((scb >> (4 * ((l + 2) >> 1))) & 15)) * 0.25f;
-        const uint s0 = ks[v0 >> 9], s1 = ks[v1 >> 9];
-        a = w4_signed(tab[2 * (v0 & 511) + hh], hh ? s0 >> 4 : s0, sc0);
-        b = w4_signed(tab[2 * (v1 & 511) + hh], hh ? s1 >> 4 : s1, sc1);
+        // through the accessors: the direct tab[]/ks[] reads ignored QUANT_CTAB, whose tables are then never filled
+        const uint s0 = ksg(tab, 1024, v0 >> 9), s1 = ksg(tab, 1024, v1 >> 9);
+        a = w4_signed(g_iq2xs(tab, v0 & 511, hh), hh ? s0 >> 4 : s0, sc0);
+        b = w4_signed(g_iq2xs(tab, v1 & 511, hh), hh ? s1 >> 4 : s1, sc1);
     }
 };
 template <> struct W8<T_IQ2_S> {
@@ -673,6 +691,71 @@ template <> struct W8<T_IQ2_S> {
         b = w4_signed(g_iq2s(tab, i1, hh), hh ? s1 >> 4 : s1, sc1);
     }
 };
+
+// IQ1_M (the 2.00 bpw pack's 1.75-bit type), ggml's dequantize_row_iq1_m: the block's F16 scale sits in the top
+// nibbles of its four u16 scales; a 32-value sub-block has two 3-bit scales (groups 0-1 and 2-3, eight values each),
+// and each eight-value group carries a +-0.125 delta picked by a bit of its qh byte.  The tile's two halves are the
+// four values at k and the four at k + 16, each decoded on its own (k + 16 crosses into the next sub-block at l >= 2).
+template <typename P>
+static inline half4 iq1m_w4(P row, int k) {
+    const P bl = row + (k >> 8) * 56;
+    const int ib = (k & 255) >> 5, g = (k & 31) >> 3, hh = (k & 7) >> 2;
+    const uint s0 = uint(bl[48]) | (uint(bl[49]) << 8), s1 = uint(bl[50]) | (uint(bl[51]) << 8);
+    const uint s2 = uint(bl[52]) | (uint(bl[53]) << 8), s3 = uint(bl[54]) | (uint(bl[55]) << 8);
+    const float d = float(as_type<half>(ushort((s0 >> 12) | ((s1 >> 8) & 0x00f0u) | ((s2 >> 4) & 0x0f00u) | (s3 & 0xf000u))));
+    const uint sc = uint(((const device ushort*) (bl + 48))[ib >> 1]);
+    const float dl = d * float(2u * ((sc >> (6u * uint(ib & 1) + (g < 2 ? 0u : 3u))) & 7u) + 1u);
+    const uint qh = (g < 2) ? uint(bl[32 + 2 * ib]) : uint(bl[33 + 2 * ib]);
+    const uint idx = uint(bl[4 * ib + g]) | (((g & 1) != 0) ? ((qh << 4u) & 0x700u) : ((qh << 8u) & 0x700u));
+    const bool neg = ((g & 1) != 0) ? ((qh & 0x80u) != 0u) : ((qh & 0x08u) != 0u);
+    const ulong gr = iq1s_grid[idx];
+    const float delta = neg ? -0.125f : 0.125f;
+    float v[4];
+    for (int j = 0; j < 4; ++j) {
+        const uint by = uint((gr >> (8u * uint(4 * hh + j))) & 0xffu);
+        const int c = (by & 0x80u) != 0u ? int(by) - 256 : int(by);
+        v[j] = dl * (float(c) + delta);
+    }
+    return half4(v[0], v[1], v[2], v[3]);
+}
+template <> struct W8<T_IQ1_M> {
+    template <typename P>
+    static inline void run(P row, int k, threadgroup const uint* tab, thread half4& a, thread half4& b) {
+        (void) tab;
+        a = iq1m_w4(row, k);
+        b = iq1m_w4(row, k + 16);
+    }
+};
+
+// IQ1_S (Unsloth's UD-IQ1_S / UD-IQ1_M experts), ggml's dequantize_row_iq1_s: f16 d, qs[32], qh[8] u16; a 32-value sub-block has
+// one scale dl = d (2 s + 1) (qh bits 12-14), a +-0.125 delta (qh bit 15) and four 8-value groups whose grid index is
+// qs[4 ib + g] | 3 bits of qh << 8.  Same float arithmetic as ggml (dl (grid + delta)), so the half4 is what the CPU reference rounds to.
+template <typename P>
+static inline half4 iq1s_w4(P row, int k) {
+    const P bl = row + (k >> 8) * 50;
+    const int ib = (k & 255) >> 5, g = (k & 31) >> 3, hh = (k & 7) >> 2;
+    const uint qh = uint(bl[34 + 2 * ib]) | (uint(bl[35 + 2 * ib]) << 8);
+    const float dl = float(as_type<half>(ushort(uint(bl[0]) | (uint(bl[1]) << 8)))) * float(2u * ((qh >> 12) & 7u) + 1u);
+    const float delta = (qh & 0x8000u) != 0u ? -0.125f : 0.125f;
+    const uint idx = uint(bl[2 + 4 * ib + g]) | (((qh >> (3u * uint(g))) & 7u) << 8);
+    const ulong gr = iq1s_grid[idx];
+    float v[4];
+    for (int j = 0; j < 4; ++j) {
+        const uint by = uint((gr >> (8u * uint(4 * hh + j))) & 0xffu);
+        const int c = (by & 0x80u) != 0u ? int(by) - 256 : int(by);
+        v[j] = dl * (float(c) + delta);
+    }
+    return half4(v[0], v[1], v[2], v[3]);
+}
+template <> struct W8<T_IQ1_S> {
+    template <typename P>
+    static inline void run(P row, int k, threadgroup const uint* tab, thread half4& a, thread half4& b) {
+        (void) tab;
+        a = iq1s_w4(row, k);
+        b = iq1s_w4(row, k + 16);
+    }
+};
+
 template <> struct W8<T_IQ3_S> {
     template <typename P>
     static inline void run(P row, int k, threadgroup const uint* tab, thread half4& a, thread half4& b) {
@@ -753,6 +836,24 @@ template <> struct W8<T_Q5_1> {
             const uint qv = (v >> (8 * c)) & 0xFFu;
             wa[c] = float(int(qv & 15) | int(((hb >> (j + c)) & 1) << 4)) * d + m;
             wb[c] = float(int(qv >> 4) | int(((hb >> (j + 16 + c)) & 1) << 4)) * d + m;
+        }
+        a = half4(wa);
+        b = half4(wb);
+    }
+};
+template <> struct W8<T_Q5_0> {   // 22-byte blocks (2-aligned): the code bytes as ushorts; one d and one qh a pair
+    static inline void run(device const uchar* row, int k, threadgroup const uint*, thread half4& a, thread half4& b) {
+        device const uchar* bl = row + (k >> 5) * 22;
+        const float d = rdh(bl);
+        const uint hb = rd32(bl + 2);
+        const int j = k & 15;   // runs at j and j + 16: the low nibbles of qs[j..j+3], then the high ones
+        device const ushort* p = (device const ushort*)(bl + 6 + j);
+        const uint v = uint(p[0]) | (uint(p[1]) << 16);
+        float4 wa, wb;
+        for (int c = 0; c < 4; ++c) {
+            const uint qv = (v >> (8 * c)) & 0xFFu;
+            wa[c] = float((int(qv & 15) | int(((hb >> (j + c)) & 1) << 4)) - 16) * d;
+            wb[c] = float((int(qv >> 4) | int(((hb >> (j + 16 + c)) & 1) << 4)) - 16) * d;
         }
         a = half4(wa);
         b = half4(wb);
@@ -924,7 +1025,7 @@ kernel void mm_down3(device const uchar* W [[buffer(0)]], device const half* HS 
 #define MM3_DN(F) MMDN3(F, 16, 64, 32, 2) MMDN3(F, 16, 32, 32, 4) MMDN3(F, 32, 64, 32, 2) MMDN3(F, 16, 64, 64, 2) \
     MMDN3(F, 16, 32, 16, 2) MMDN3(F, 32, 32, 32, 2) MMDN3(F, 16, 64, 32, 1) MMDN3(F, 16, 64, 32, 4)     MMDN3(F, 16, 64, 16, 2) MMDN3(F, 16, 32, 16, 4) MMDN3(F, 16, 64, 32, 5) MMDN3(F, 16, 64, 16, 4)
 MM3_GU(T_Q4_K) MM3_GU(T_Q5_K) MM3_GU(T_Q6_K) MM3_GU(T_Q8_0) MM3_GU(T_IQ4_XS) MM3_GU(T_Q2_0) MM3_GU(T_IQ3_XXS) MM3_GU(T_IQ2_XXS) MM3_GU(T_IQ2_XS) MM3_GU(T_IQ2_S) MM3_GU(T_IQ3_S)
-MM3_DN(T_Q2_0) MM3_DN(T_IQ4_NL) MM3_DN(T_Q5_1) MM3_DN(T_Q8_0)
+MM3_DN(T_Q2_0) MM3_DN(T_IQ4_NL) MM3_DN(T_Q5_1) MM3_DN(T_Q5_0) MM3_DN(T_Q8_0)
 
 // mm_gu4: mm_gu3 with each decoded right operand (TN x TK weights of gate and of up) applied to MS 16-row token
 // tiles (a tile of 16 * MS rows from the plan, tm = 16 * MS): the decode, which bounds mm_gu3, is shared by MS times

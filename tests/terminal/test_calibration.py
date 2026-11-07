@@ -326,6 +326,13 @@ class CalibrationFlowTests(unittest.TestCase):
                          ["engine.calibrate.rollback", "engine.calibrate.apply",
                           "engine.calibrate.measure"])
 
+    def test_missing_report_folder_is_refused_before_the_sweep(self):
+        # #3187: the sweep takes ~19 minutes; the folder check must not wait until after it
+        for output in (self.root / "no-such-dir" / "report.json", self.config / "report.json"):
+            with self.assertRaisesRegex(profiles.ProfileError, "report output directory does not exist"):
+                calibration.measure("local", output, exclusive_ack=True,
+                                    runner=lambda *_a, **_k: self.fail("the sweep must not start"))
+
     def test_calibration_rechecks_reviewed_digests_inside_operation_lock(self):
         report_path = self.root / "pinned-calibration.json"
         with self.assertRaisesRegex(profiles.ProfileError, "source changed after review"):
@@ -368,6 +375,35 @@ class CalibrationFlowTests(unittest.TestCase):
         settings = json.loads((self.settings_file).read_text())
         self.assertEqual(settings["calibration"]["test-gpu|24GB|test-cpu"]["settings"], report["settings"])
         self.assertFalse(calibration.review("local", report_path)["applicable"])
+
+    def test_applied_result_survives_the_next_launches_with_its_origin(self):
+        """#5132: `engine calibrate --apply-result` writes the profile's run config; a launch builds that file again from the installed config and
+        used to drop the calibrated values. They come back over Auto, as 'calibrated' (not as the person's overrides), launch after launch."""
+        from strata_cli.launch import settings as S
+        from strata_cli.launch.runner import derive_config
+        from strata_control import arg_layers, tune_knobs
+        base = json.loads(self.config.read_text())
+        base["args"] += ["--max-context", "65536"]
+        self.config.write_text(json.dumps(base), encoding="utf-8")
+
+        def launch(prev):
+            cfg = derive_config(json.loads(json.dumps(base)), S.LaunchSettings(drafting="off"), bool_flags=tune_knobs.BOOL_FLAGS, prev=prev)
+            arg_layers.stamp(cfg)
+            return json.loads(json.dumps(cfg))
+
+        first = launch(None)
+        self.config.write_text(json.dumps(first), encoding="utf-8")            # the profile points at the launch's file
+        report_path = self.root / "cal-launch.json"
+        calibration.measure("local", report_path, exclusive_ack=True, runner=self.fake_result, say=lambda _: None)
+        calibration.apply_result("local", report_path, exclusive_ack=True, smoke=lambda cfg: 2)
+        written = json.loads(self.config.read_text())
+        self.assertEqual(written["args"][written["args"].index("--pcie-frac") + 1], "0.20")
+        for prev in (written, launch(written)):
+            nxt = launch(prev)
+            self.assertEqual(nxt["args"][nxt["args"].index("--pcie-frac") + 1], "0.20")
+            self.assertEqual(nxt["args"].count("--pcie-frac"), 1)
+            self.assertEqual(nxt["calibrated"]["settings"], {"--pcie-frac": "0.20"})
+            self.assertNotIn("--pcie-frac", nxt.get("user_args") or [])
 
     def test_review_and_rollback_restore_config_and_absent_settings(self):
         before = self.config.read_bytes()

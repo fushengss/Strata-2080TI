@@ -37,6 +37,10 @@ EARLY_DROP = 0.05                  # a candidate this much slower than its own r
 STAGE_GAP_NOISY = 0.04             # an A/A gap above this: the machine is noisy (6.5)
 
 
+STAGNANT_WAIT_S = 60.0          # free memory that has not grown by STAGNANT_MIB after this long is not going to
+STAGNANT_MIB = 512
+
+
 class Cancelled(Exception):
     """The user stopped the tune; what was measured so far is kept in the result."""
 
@@ -103,6 +107,7 @@ class TuneResult:
     #: minutes, pairs, faster_pairs, preset_name
     values: dict[str, Any] = field(default_factory=dict)
     message: str = ""
+    not_tried: int = 0                 # candidates skipped for lack of free memory in a result that otherwise confirms the current settings (#5122)
     mode: str = "quick"
     seconds: float = 0.0
     waited_s: float = 0.0              # of those seconds, spent waiting (box lock, busy PC, memory)
@@ -193,6 +198,8 @@ class Tuner:
         self.progress = progress or (lambda p: None)
         self.cancel = cancel or threading.Event()
         self.history_bad = history_bad or set()
+        self._ram_gave_up: tuple[float, float] | None = None
+        self._base_start_avail: float | None = None     # free memory (MiB) the base run was allowed to start with: what a candidate that adds nothing needs again (#5122)
         self.clock = clock
         self.sleep = sleep
         self.system = system or session.system
@@ -261,8 +268,10 @@ class Tuner:
         return None
 
     def _ram_guard(self, delta_mib: int, label: str, wait_s: float | None = None) -> str | None:
-        """None when a start fits; otherwise the plain reason it does not."""
+        """None when a start fits; otherwise the plain reason it does not. Waiting ends early when the free memory does not
+        grow (a loaded model keeps it): ten minutes per candidate made a tuning run last for hours (#3490)."""
         waited = 0.0
+        first_avail: float | None = None
         while True:
             mem = self.system().get("memory", {})
             avail = mem.get("available_mib")
@@ -274,12 +283,27 @@ class Tuner:
                 need += base_rss
             elif self.total_ram:
                 need = max(need, self.o.min_free_ram_mib)
+            if self.base_runs and self._base_start_avail and self.base_runs[0].status == "PASS":
+                # like for like (#5122): the base run started with this much free and ran; its peak RSS counts file pages the kernel can take back, so
+                # "peak + floor" can ask for more than the PC had at the base start. A candidate needs what the base had plus what it adds.
+                need = min(need, max(self._base_start_avail + delta_mib, self.o.min_free_ram_mib + delta_mib))
             if avail >= need:
+                if not self.base_runs:
+                    self._base_start_avail = float(avail)
                 return None
-            if waited >= (self.o.wait_ram_s if wait_s is None else wait_s):
-                return (f"not enough free memory to start it safely ({avail / 1024:.1f} GiB free, "
-                        f"{need / 1024:.1f} GiB needed)")
-            self._say("waiting", f"Waiting for memory to be freed before trying {label}")
+            reason = (f"not enough free memory to start it safely ({avail / 1024:.1f} GiB free, "
+                      f"{need / 1024:.1f} GiB needed)")
+            prior = self._ram_gave_up
+            if prior is not None and avail <= prior[1] + STAGNANT_MIB:
+                return reason                     # an earlier wait found nothing freed: waiting again for a candidate that needs less, but still more than is free, repeats it (#4895)
+            if first_avail is None:
+                first_avail = avail
+            stagnant = waited >= STAGNANT_WAIT_S and avail <= first_avail + STAGNANT_MIB
+            if stagnant or waited >= (self.o.wait_ram_s if wait_s is None else wait_s):
+                self._ram_gave_up = (need, avail)
+                return reason
+            self._say("waiting", f"Waiting for memory to be freed before trying {label} "
+                                 f"({avail / 1024:.1f} GiB free, {need / 1024:.1f} GiB needed)")
             self._check_cancel()
             self.sleep(10.0)
             waited += 10.0
@@ -348,7 +372,8 @@ class Tuner:
         r.values = {"gain_pct": r.gain_pct, "gain_decode_pct": r.gain_decode_pct, "base_tok_s": base, "tuned_tok_s": tuned,
                     "noise_pct": round(100 * (r.noise or {}).get("spread", 0.0), 1) if r.noise else None,
                     "drift_pct": round(100 * (r.noise or {}).get("drift", 0.0), 1) if r.noise else None,
-                    "minutes": round(r.seconds / 60.0 - r.waited_s / 60.0, 1), "pairs": r.pairs, "faster_pairs": r.faster_pairs}
+                    "minutes": round(r.seconds / 60.0 - r.waited_s / 60.0, 1), "pairs": r.pairs, "faster_pairs": r.faster_pairs,
+                    "not_tried": r.not_tried}
 
     def _spec(self) -> RequestSet:
         long_tokens = 0
@@ -626,8 +651,13 @@ class Tuner:
                              "changed. Try again when the PC is quiet.")
             else:
                 r.outcome = "default_confirmed"
-                r.message = "Your current settings are already the fastest we found. Nothing was changed."
-                if r.noise.get("noisy"):
+                r.not_tried = sum(1 for a in arms if a.status == "skipped" and "memory" in (a.reason or ""))
+                if r.not_tried:                  # "already the fastest" would claim a comparison that never happened (#5122)
+                    r.reason_code = r.reason_code or "some_not_tried"
+                    r.message = f"{r.not_tried} setting{'s' if r.not_tried != 1 else ''} could not be tried: not enough free memory"
+                else:
+                    r.message = "Your current settings are already the fastest we found. Nothing was changed."
+                if r.noise.get("noisy") and not r.not_tried:
                     r.message += " (The PC was busy while measuring, so a small gain could be hidden.)"
         r.settings = {"args": chosen_args, "env": chosen_env, "per_request": per_request_chosen}
         cls, fields = "exact", []

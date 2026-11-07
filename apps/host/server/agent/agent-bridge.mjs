@@ -22,13 +22,20 @@ import { randomUUID } from 'node:crypto';
 import { GatewayClient } from './gateway-client.mjs';
 import { HarnessProcess, resolveHarness, redact, stopStaleAgent } from './harness-runtime.mjs';
 import { StatusReporter } from './status.mjs';
-import { buildProfile, routeFor, MODE_PRESETS, modeOf, effortOf } from './profile.mjs';
+import { buildProfile, routeFor, MODE_PRESETS, modeOf, effortOf, localOutputBudget, compactionHeadroom } from './profile.mjs';
 import { TurnProjector, parseArguments as parseArgs } from './events.mjs';
 import { ChildProjector } from './children.mjs';
 import { nearestBudget } from './llm-shape.mjs';
-import { DeliverableTracker, ActivityGroups } from './deliverables.mjs';
+import { DeliverableTracker, ActivityGroups, FolderClaims } from './deliverables.mjs';
 import { SkillsUsed, skillInfoFrom } from './skills-used.mjs';
+import { turnEngineSpeed } from './engine-speed.mjs';
 import { TurnGuard, guardNote, GUARD_NOTES } from './turn-guard.mjs';
+import { cutNotice, cutNudge } from './reply-cut.mjs';
+
+/** How often one turn asks the agent to carry on after a reply the length limit cut (each time in smaller pieces). */
+export const MAX_CUT_RETRIES = 2;
+import { buildAnswer, parseQuestions } from './user-questions.mjs';
+import { BASE_TOKENS, COUNT_ABOVE_CHARS, FIT_TEXT, countTokens, decideFit, fill, grouped } from './context-fit.mjs';
 import { PlanStore, planPrompt, parsePlan, parsePoints, stepObjective, stepLine, firstSentence, stepSummary, planAsPrompt, editedSteps, planView, researchPrompt, researchWritePrompt, RESEARCH_NUDGE, parseSources } from './plan.mjs';
 
 /**
@@ -110,15 +117,18 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
  * @param {string|null} [options.componentsDir]         where installed components live
  * @param {() => Array} options.localInstances          ready local instances (see profile.mjs)
  * @param {() => Array} options.connections             saved API connections WITH their keys (host-internal)
+ * @param {() => (string|null)} [options.defaultLocalId]  the local instance the chat runs on: its tool servers are the agent's (T5)
  * @param {NodeJS.ProcessEnv} [options.env]
  * @param {string} [options.nodePath]                   the Node runtime that runs the Harness
  * @param {(line:string)=>void} [options.log]
  */
-export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500 }) {
+export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, defaultLocalId = () => null, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, engineProgress = () => null, engineGraceMs = 30 * 60_000, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500 }) {
   const root = join(dataDir, 'agent');
   const home = join(root, 'home');
   const sessionsFile = join(root, 'sessions.json');
   mkdirSync(root, { recursive: true });
+  /** Which chat's file tools wrote which file, for chats that share a folder (#5008). */
+  const folderClaims = new FolderClaims();
 
   /**
    * Where the turn's file tracker must never look (deliverables.mjs): the app, the engine and its components, Strata's own data, AppData
@@ -154,6 +164,8 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   const queues = new Map();
   const queueView = chatId => (queues.get(chatId) ?? []).map(({ id, text, at, deliverAt }) => ({ id, text, at, deliverAt }));
   const pending = new Map();       // `${sessionId}:${callId}` -> { eventId, sessionId, callId, at }
+  const questions = new Map();     // `${sessionId}:${callId}` -> the agent's own question waiting for the person: { eventId, sessionId, callId, items, at, clientId } (#4244)
+  const chatOfSession = sessionId => Object.keys(sessionMap).find(id => sessionMap[id]?.sessionId === sessionId) ?? null;
   const idleWaiters = new Set();
 
   const chat = id => { let c = chats.get(id); if (!c) { c = { id, turn: null, route: null, routeGeneration: -1 }; chats.set(id, c); } return c; };
@@ -170,7 +182,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   /** The agent's profile now, plus where its shaped routes really lead (read by the forwarding endpoint). */
   let shapeTargets = {};
   function buildProfileNow() {
-    const profile = buildProfile({ local: localInstances(), connections: connections(), gate, tools: tools(), skillsDir: skillsDir(), proxyBase, searchMock });
+    const profile = buildProfile({ local: localInstances(), connections: connections(), gate, tools: tools(), skillsDir: skillsDir(), proxyBase, searchMock, defaultLocalId: defaultLocalId() });
     shapeTargets = profile.shapeTargets ?? {};
     return profile;
   }
@@ -192,6 +204,8 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       harness: { version: h.version },
       runtime: rt?.hp.running ? { pid: rt.hp.pid, generation: rt.generation } : null,
       routes: profile.routes.map(({ route, kind, modelId, name, contextWindow }) => ({ route, kind, modelId, name, contextWindow })),
+      // tool servers that could not be wired (a name the rule does not allow, no program or address): the chat says so
+      skippedServers: profile.mcpSkipped ?? [],
       activeTurns: activeTurns(),
       pendingApprovals: pending.size,
     };
@@ -226,6 +240,13 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     lastError = null;
     log(`agent · Harness ${h.version ?? ''} ready (pid ${hp.pid}, ${profile.routes.length} route(s))`);
     return next;
+  }
+
+  /** The local engine's own speed for this turn's requests (null when it cannot be read: the stream's estimate stays). */
+  async function engineSpeedOf(route, projector) {
+    const inst = localInstances().find(i => i.id === route.instanceId);
+    if (!inst) return null;
+    return turnEngineSpeed({ baseUrl: inst.baseUrl, key: inst.key, since: projector.startedAt, attempts: projector.streams.size, timeoutMs: 800 });
   }
 
   /** Make sure a runtime exists that knows the route this turn needs. */
@@ -263,10 +284,23 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       if (!r.callId) return;
       pending.set(`${value.agentId}:${r.callId}`, { eventId: value.eventId, sessionId: value.agentId, callId: r.callId, tool: r.toolName, reason: r.reason ?? null, at: Date.now(), clientId: runtime.clientId });
     } else if (value.type === 'waterfall' && value.event === 'user-questions/request') {
-      // The app has no surface for the agent's own questions yet. Declaring that nobody can answer makes
-      // the tool return an error the model reads and carries on from, instead of a turn that waits forever.
-      void runtime.gw.answerEvent({ clientId: runtime.clientId, eventId: value.eventId, outcome: 'next' }).catch(() => {});
+      // The agent of a chat that is running in front of the person asks the person: the question goes to the page (the question card above the message box) and the
+      // Harness waits for the answer. Anything else (a helper's question, a chat that is stopping, a request with nothing to show) is declared
+      // unanswerable, which makes the tool return an error the model reads and carries on from, instead of a turn that waits forever.
+      const r = value.request ?? {};
+      const chatId = chatOfSession(value.agentId);
+      const turn = chatId ? chats.get(chatId)?.turn : null;
+      const items = parseQuestions(r.questions);
+      // A goal or a plan step runs without anyone there: a question would stall it, so it is declined at once (the model reads "could not be answered" and goes on).
+      if (!turn || turn.finished || turn.stopping || turn.goalRun || turn.plan || !turn.announceQuestion || !items.length) {
+        void runtime.gw.answerEvent({ clientId: runtime.clientId, eventId: value.eventId, outcome: 'next' }).catch(() => {});
+      } else {
+        const callId = String(r.wait?.callId ?? value.eventId);
+        questions.set(`${value.agentId}:${callId}`, { eventId: value.eventId, sessionId: value.agentId, callId, items, at: Date.now(), clientId: runtime.clientId });
+        turn.announceQuestion({ type: 'agent-question', callId, questions: items });
+      }
     } else if (value.type === 'cancel') {
+      for (const [k, v] of questions) if (v.eventId === value.eventId) { questions.delete(k); chats.get(chatOfSession(v.sessionId))?.turn?.announceQuestion?.({ type: 'agent-question-end', callId: v.callId }); }
       for (const [k, v] of pending) if (v.eventId === value.eventId) pending.delete(k);
     }
   }
@@ -335,24 +369,27 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     let hideDeltas = !!researchTopic;
     signal?.addEventListener('abort', () => { send = () => {}; attached = false; }, { once: true });
     // What the assistant itself wrote in this run (not our own step lines): a plan turn reads its plan from it, a step reads its summary.
-    const written = { all: '', step: '' };
+    const written = { all: '', step: '', reasoning: '' };
+    // The frame that closed the turn, kept with the turn's text for a page that comes back after it ended (attach).
+    let terminal = null;
     // The turn guard (turn-guard.mjs): counts failing searches, searches, plan rewrites and a nearly full context. Set up once the route is known.
     let guard = null;
-    const raw = frame => { try { send(frame); } catch { send = () => {}; attached = false; } };
+    const raw = frame => { if (frame.type === 'done' || frame.type === 'error') terminal = frame; try { send(frame); } catch { send = () => {}; attached = false; } };
     // What the turn made (files) and compact activity lines (notes-split-agent8.md): derived from the cards the turn already sends.
-    const tracker = new DeliverableTracker(workspacePath, trackerFolders());
+    const tracker = new DeliverableTracker(workspacePath, { ...trackerFolders(), claims: folderClaims, owner: chatId });
     let toolsRan = false;   // a turn that ran no tool wrote nothing, so there is nothing to look for at its end
     try { tracker.snapshot(); } catch { /* a folder that cannot be read has no deliverables */ }
     const groups = new ActivityGroups({ emit: raw });
     const skills = new SkillsUsed({ emit: raw, info: skillInfoFrom(skillsDir()) });
     const emit = frame => {
+      if (frame.type === 'reasoning' && frame.text && written.reasoning.length < 2_000_000) written.reasoning += frame.text;
       if (frame.type === 'delta' && !frame.own) { written.all += frame.text; written.step += frame.text; if (guard) trip(guard.text(frame.text)); if (hideDeltas) return; }
       if (frame.own) { const { own, ...rest } = frame; frame = rest; }
       if (frame.type === 'delta' && frame.text) groups.text();
       if (frame.type === 'agent-tool' && frame.tool) {
         if (['done', 'error'].includes(frame.tool.state) && !['read', 'read_image', 'glob', 'grep', 'web_fetch', 'web_search'].includes(frame.tool.name)) toolsRan = true;
         let made = null;
-        if (frame.tool.state === 'done' && (frame.tool.name === 'write' || frame.tool.name === 'edit')) { try { made = tracker.check(frame.tool.args?.file_path ?? frame.tool.args?.path); } catch { made = null; } }
+        if (frame.tool.state === 'done' && (frame.tool.name === 'write' || frame.tool.name === 'edit')) { try { made = tracker.check(frame.tool.args?.file_path ?? frame.tool.args?.path, { explicit: true }); } catch { made = null; } }
         raw(frame);
         if (made) raw(made);
         if (guard) trip(guard.card(frame.tool));
@@ -398,7 +435,27 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     const appliedMode = planTask ? 'plan' : modeOf(mode);
     await applyMode(runtime, sessionId, appliedMode);
 
-    const projector = new TurnProjector({ policy: MODE_PRESETS[appliedMode].approval });
+    // Does the message fit the model's window? Asked before anything is sent, with the model server's own count (context-fit.mjs). A message
+    // that fits once the older messages are a summary is sent after a summary; one that can never fit is not sent, and the person is told
+    // plainly and offered the two ways out. Whatever cannot be counted goes through: the Harness recovers from a refusal by itself.
+    if (!goal && route.kind === 'local') {
+      const fit = await fitCheck({ runtime, route, sessionId, fresh, history, message }).catch(() => null);
+      if (fit?.action === 'too-large') {
+        reporter.clear();
+        const values = [grouped(fit.tokens), grouped(fit.window)];
+        const text = fill(FIT_TEXT.tooLarge, values);
+        emit({ type: 'error', message: text, key: FIT_TEXT.tooLarge, values, code: 'CONTEXT_MESSAGE_TOO_LARGE', tokens: fit.tokens, window: fit.window });
+        return { error: text };
+      }
+      if (fit?.action === 'summarize') {
+        reporter.set({ phase: 'compacting', code: 'compacting', text: FIT_TEXT.summarizing, key: FIT_TEXT.summarizing, values: [] });
+        const done = await compactChat(runtime, sessionId);
+        reporter.clear();
+        if (done.ok) emit(summarizedNote(done.before, done.after, fit.window));
+      }
+    }
+
+    const projector = new TurnProjector({ policy: MODE_PRESETS[appliedMode].approval, window: route.contextWindow });
     if (!goal) guard = new TurnGuard({ plan: !!planTask, contextMax: route.kind === 'local' ? route.contextWindow : 0 });   // a saved connection's window is often only assumed: never judged by a guess
     projector.onStatus = update => { if (!turn?.parentOpen && turn?.children.size && [...turn.children.values()].some(h => !h.done) && update.phase === 'waiting') return; reporter.set(update); };
     const turn = {
@@ -407,10 +464,24 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       abortFromRuntime: reason => finishTurn(reason), finish: failure => finishTurn(failure),
       // Helper agents (subagents) the Harness started for this chat, and the state of the run around them.
       children: new Map(), subagentCalls: new Map(), parentOpen: false, stopping: false, settleTimer: null, mode: appliedMode,
-      plan: null, advancing: false, goalRun: false, lastActivity: Date.now(), watchdog: null,
+      plan: null, advancing: false, goalRun: false, lastActivity: Date.now(), heard: Date.now(), engineMark: null, watchdog: null,
       research: researchTopic ? { phase: 'gather', nudged: false, waitingStart: false } : null,
     };
     c.turn = turn;
+    if (workspacePath) folderClaims.begin(workspacePath, chatId);
+    /**
+     * A page that comes back (a reload, a new window) takes the running turn over again. Everything that was said while no page was there is
+     * sent as one catch-up: the start, the text and thinking so far (a `resync`), every tool card as it is now (the ones waiting for a yes
+     * included) and the questions waiting for an answer. After that the turn's frames flow to the new page as they did to the old one.
+     */
+    turn.reattach = ({ onFrame, signal: again }) => {
+      send = onFrame; attached = true;
+      again?.addEventListener('abort', () => { send = () => {}; attached = false; }, { once: true });
+      raw({ type: 'start', model: route.name, contextMax: route.contextWindow, demo: false, remoteModel: route.kind === 'api', agent: true, mode: appliedMode, sessionId, requestId, skills: [], resumed: true, ...(planTask ? { planning: true } : {}) });
+      raw({ type: 'resync', content: hideDeltas ? '' : written.all, reasoning: written.reasoning });
+      for (const t of projector.tools.values()) if (t.card) raw({ type: 'agent-tool', tool: t.card });
+      for (const q of questions.values()) if (q.sessionId === sessionId) raw({ type: 'agent-question', callId: q.callId, questions: q.items });
+    };
     /**
      * A turn must always end. If the Harness sends nothing at all for a while (a tool that never returns, a model server that went
      * quiet, a lost event) the turn is stopped and ended with a plain message instead of showing "thinking" forever. A running tool gets
@@ -420,6 +491,13 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       if (turn.finished || turn.stopping) return;
       const toolRunning = [...projector.tools.values()].some(x => x.card?.state === 'running' || x.card?.state === 'proposed') || pending.size > 0 && pendingFor(chatId).length > 0;
       const limit = toolRunning ? stallToolMs : stallMs;
+      // A local engine reading a long prompt sends the Harness nothing for minutes (#3623). Its /metrics progress counts as activity,
+      // for at most engineGraceMs after the Harness last spoke: progress for another chat cannot keep a lost turn alive forever.
+      if (turn.route?.kind === 'local' && Date.now() - turn.heard < engineGraceMs) {
+        let mark = null;
+        try { mark = engineProgress(turn.route.instanceId); } catch { /* no progress known: the Harness alone decides */ }
+        if (mark != null && mark !== turn.engineMark) { turn.engineMark = mark; turn.lastActivity = Date.now(); return; }
+      }
       if (Date.now() - turn.lastActivity < limit) return;
       turn.stalledFor = Math.round((Date.now() - turn.lastActivity) / 1000);
       turn.stopping = true;
@@ -429,9 +507,10 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       turn.finish(`The assistant stopped answering for ${mins > 1 ? mins + ' minutes' : 'a minute'}, so I ended this turn. Anything it already finished is kept. Send your message again to go on.`);
     }, Math.min(15_000, Math.max(200, Math.floor(stallMs / 4))));
     turn.watchdog.unref?.();
-    function finishTurn(failure) {
+    async function finishTurn(failure) {
       if (turn.finished) return;
       turn.finished = true;
+      for (const [k, v] of questions) if (v.sessionId === turn.sessionId) questions.delete(k);
       clearTimeout(turn.settleTimer);
       clearInterval(turn.watchdog);
       turn.follow?.close();
@@ -440,17 +519,28 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       reporter.clear();
       const extra = [];
       try { if (toolsRan) for (const d of tracker.sweep()) { emit(d); groups.addFile(d); } } catch { /* never blocks the end of a turn */ }
+      if (workspacePath) folderClaims.end(workspacePath, chatId);
       groups.end();
       if (researchTopic && !failure && !turn.stopping) { const sources = parseSources(written.all); if (sources.length) extra.push({ type: 'research', topic: researchTopic, sources }); }
       try { extra.push(...settlePlan(failure)); } catch { /* a plan frame must never break the end of a turn */ }
       // The turn guard: a turn the app stopped, or one that ended with no words, always ends with one plain message (a plan card carries it itself).
       let noteReason = turn.guard ?? null;
-      if (!noteReason && guard && !failure && !turn.stopping && !turn.goalRun) {
+      // A reply the length limit cut ends with a sentence that says so (and what was lost), never with silence (AGENT-LOST).
+      const cutEnd = !failure && !turn.stopping && projector.ended?.kind === 'max-tokens';
+      if (cutEnd && !noteReason) {
+        const note = cutNotice({ ...projector.cut(), retrying: false });
+        extra.push({ type: 'delta', own: true, text: `
+
+${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
+      }
+      if (!noteReason && !cutEnd && guard && !failure && !turn.stopping && !turn.goalRun) {
         noteReason = guard.silent({ ended: projector.ended, wrote: projector.emittedAny === true, acted: projector.tools.size > 0, contextTokens: projector.contextTokens });
       }
       if (noteReason && !extra.some(f => f.type === 'plan' && f.event === 'proposed')) { const note = guardNote(noteReason); if (note) extra.push(note); }
       for (const f of extra) emit(f);
-      const frames = failure ? [{ type: 'error', message: plainAgentFailure(failure), details: failure, code: 'AGENT_STOPPED' }] : projector.finish({ model: route.name, contextMax: route.contextWindow });
+      // The answer speed of a turn on this computer is the engine's own (tokens it produced over its decode time, as the Monitor shows it).
+      const engine = !failure && route.kind === 'local' ? await engineSpeedOf(route, projector) : null;
+      const frames = failure ? [{ type: 'error', message: plainAgentFailure(failure), details: failure, code: 'AGENT_STOPPED' }] : projector.finish({ model: route.name, contextMax: route.contextWindow, engine });
       for (const f of frames.slice(0, -1)) emit(f);
       // Messages typed while the goal ran and not delivered between steps go back to the page now, to be sent as ordinary messages.
       if (turn.goalRun && attached) {
@@ -459,6 +549,8 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       }
       for (const f of frames.slice(-1)) emit(f);
       c.turn = null;
+      // What a page that was away needs to show the end of this turn (attach, below).
+      c.last = { requestId, sessionId, mode: appliedMode, model: route.name, contextMax: route.contextWindow, remoteModel: route.kind === 'api', content: hideDeltas ? '' : written.all.slice(0, 4_000_000), reasoning: written.reasoning, cards: [...projector.tools.values()].filter(t => t.card).map(t => t.card), terminal };
       turn.ended.resolve({ reason: projector.ended, failure: failure ?? null });
       notifyIdle();
       // A turn that filled the context, or that the guard stopped, leaves a long history behind: summarise the older part now so the next message has room.
@@ -491,6 +583,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     function handle(item) {
       if (turn.finished) return;
       turn.lastActivity = Date.now();
+      turn.heard = turn.lastActivity;
       if (item.type === 'event') {
         const e = item.event;
         if (e.seq <= turn.lastSeq) return;
@@ -528,7 +621,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       emitRow(child, true);
       const fold = item => {
         if (turn.finished) return;
-        turn.lastActivity = Date.now();
+        turn.lastActivity = turn.heard = Date.now();
         // A helper that finishes before its throttled "working" row went out would show queued -> completed and never "working": send the held row first.
         if (item.type === 'event' && item.event.type === 'turn/end' && child.rowPending) emitRow(child, true);
         const { frames, row } = cp.consume(item);
@@ -559,6 +652,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
         case 'turn/start':
           turn.parentOpen = true;
           if (turn.research) turn.research.waitingStart = false;
+          turn.cutWaiting = false;
           clearTimeout(turn.settleTimer);
           // After Stop, a helper's report would start a new turn that nobody asked for.
           if (turn.stopping) void runtime.gw.rpc('session/cancel', { request: { sessionId } }).catch(() => {});
@@ -710,6 +804,24 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
           const current = await goalGet();
           if (turn.finished || turn.parentOpen) return;
           if (current && current.phase === 'active' && current.activation === 'armed') { turn.settleTimer = after(700, armSettle); return; }
+          // A reply the length limit cut (AGENT-LOST): the agent lost what it was writing. Say so in the chat and ask it to carry on in smaller pieces, twice at most.
+          if (turn.cutWaiting) { turn.settleTimer = after(300, armSettle); return; }
+          if (projector.ended?.kind === 'max-tokens' && !turn.goalRun && !turn.stopping && (turn.cuts ?? 0) < MAX_CUT_RETRIES) {
+            const cut = projector.cut();
+            turn.cuts = (turn.cuts ?? 0) + 1;
+            const note = cutNotice({ ...cut, retrying: true });
+            emit({ type: 'delta', own: true, text: `
+
+${note.text}
+
+`, key: note.key, values: note.values, noteReason: 'cut' });
+            for (const f of projector.clearCut()) emit(f);
+            turn.cutWaiting = true;
+            try { await runtime.gw.rpc('session/prompt', { request: { requestId: `cut-${randomUUID()}`, sessionId, mode: 'queue', content: [{ type: 'text', text: cutNudge(cut) }] } }); }
+            catch { turn.cutWaiting = false; finishTurn(null); return; }
+            turn.settleTimer = after(500, armSettle);
+            return;
+          }
           // Research: gather (search and read pages), then write the answer in the fixed shape. A step that did not open pages is sent back once.
           if (turn.research && !turn.stopping) {
             const r = turn.research;
@@ -752,6 +864,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     }
     turn.announceGoal = announceGoal;
     turn.announceQueue = frame => emit(frame);
+    turn.announceQuestion = frame => emit(frame);
 
     const snapshotTimer = {};
     await Promise.race([turn.snapshot.promise, new Promise((_, rej) => { snapshotTimer.t = after(20_000, () => rej(new Error('the session stream did not open'))); })])
@@ -941,6 +1054,16 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
 
   // -- /plan -----------------------------------------------------------------------------------------------
 
+  /** A short answer in the chat that the page translates (the sentence is in the interface catalog, "values" fill its slots). */
+  function sayKey(options, template, values = []) {
+    const { onFrame } = options;
+    onFrame({ type: 'queued', requestId: 'compact-' + randomUUID() });
+    onFrame({ type: 'start', model: '', contextMax: 0, demo: false, remoteModel: false, agent: true, mode: modeOf(options.mode), skills: [] });
+    onFrame({ type: 'delta', text: fill(template, values), key: template, values });
+    onFrame({ type: 'done', finishReason: 'stop', tokensIn: null, tokensOut: null, usageSource: 'unavailable', durationMs: 0 });
+    return { compact: true };
+  }
+
   /** A short answer in the chat (no model): the same frames a turn sends. */
   function sayOnce(options, reply) {
     const { onFrame } = options;
@@ -1044,6 +1167,47 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     delete sessionMap[chatId]; persist();
   }
 
+  // -- the agent's own questions ------------------------------------------------------------------------------
+
+  /**
+   * The person's answer to a question the agent asked (#4244), or a skip. The answer is checked against the questions that were asked, then sent
+   * to the Harness as the result of the waiting `user-questions/request`; a skip declares the question unanswerable, as before, and the model
+   * carries on.
+   */
+  async function answerQuestion({ chatId, callId, answers, skip = false }) {
+    const sessionId = sessionMap[chatId]?.sessionId;
+    const key = `${sessionId}:${callId}`;
+    const entry = questions.get(key);
+    if (!entry || !rt?.hp.running) throw new AgentUnavailable('That question was already answered, or the assistant has gone on.', 'question-gone');
+    const outcome = skip ? 'next' : buildAnswer(entry.items, answers);
+    await rt.gw.answerEvent({ clientId: entry.clientId ?? rt.clientId, eventId: entry.eventId, outcome });
+    questions.delete(key);
+    return { ok: true, skipped: !!skip };
+  }
+
+  // -- a message for a helper ---------------------------------------------------------------------------------
+
+  /**
+   * The person's own words for one helper (#4749), through the Harness's `subagents/prompt`: it delivers one browser-authored message to a
+   * continuable child through its live parent. "steer" reaches a working helper at its next step; "queue" gives a helper that has finished
+   * (or is between steps) a new turn. The Harness refuses a helper that cannot take messages (a one-shot one) and a parent that is not live;
+   * either comes back as a plain sentence.
+   */
+  async function messageHelper({ chatId, helperId, text, delivery = 'queue' }) {
+    const clean = String(text ?? '').trim().slice(0, 8000);
+    if (!clean) throw new AgentUnavailable('Type a few words for the helper.', 'helper-empty');
+    if (!/^[\w.:@-]{1,160}$/.test(String(helperId ?? ''))) throw new AgentUnavailable('That helper is not known.', 'helper-unknown');
+    const parent = sessionMap[chatId]?.sessionId;
+    if (!parent || !rt?.hp.running) throw new AgentUnavailable('The assistant is not running in this chat, so it cannot pass a message on. Send a message in the chat first.', 'helper-idle');
+    try {
+      const receipt = await rt.gw.rpc('subagents/prompt', { request: { requestId: `helper-${randomUUID()}`, parentSessionId: parent, childSessionId: String(helperId), mode: 'continuable', delivery: delivery === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: clean }] } });
+      return { ok: true, messageId: receipt?.messageId ?? null, delivery: delivery === 'steer' ? 'steer' : 'queue' };
+    } catch (e) {
+      log(`agent · message for a helper refused: ${String(e?.message ?? e).slice(0, 200)}`);
+      throw new AgentUnavailable(/continuable|one-shot|not.*(found|live|open)|unavailable|closed|ended/i.test(String(e?.message ?? '')) ? 'This helper cannot take a message any more. Ask the assistant in the chat to start a new one.' : 'The message could not be delivered right now. Try again in a moment.', 'helper-refused');
+    }
+  }
+
   // -- messages typed while a goal runs ----------------------------------------------------------------------
 
   /** Queue a message for the running goal. It is delivered between steps, or handed back to the page when the goal ends or pauses. */
@@ -1140,6 +1304,93 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
    * Stop one chat's turn. Resolves only once the turn has ended (or the wait times out), because the
    * Harness acknowledges a cancel as admitted, not as done.
    */
+  /** What the chat holds now and the model's window, as the context plugin measures them (null when it cannot be read). */
+  async function contextOf(runtime, sessionId) {
+    try {
+      const r = await runtime.gw.rpc('commands/execute', { agentId: sessionId, line: '/strata-context', submittedAttachments: [] });
+      if (r?.result?.kind !== 'success') return null;
+      const v = JSON.parse(String(r.result.text));
+      return Number.isFinite(v.tokens) ? { tokens: Math.round(v.tokens), window: Number(v.window) > 0 ? Math.round(v.window) : 0 } : null;
+    } catch { return null; }
+  }
+
+  /** The decision of context-fit.mjs for the message about to be sent, or null when the model server cannot count it. */
+  async function fitCheck({ runtime, route, sessionId, fresh, history, message }) {
+    const inst = localInstances().find(i => i.id === route.instanceId);
+    if (!inst || !(route.contextWindow > 0)) return null;
+    const carried = fresh && history.length ? withEarlierConversation(history, message) : message;
+    if (carried.length < COUNT_ABOVE_CHARS) return null;
+    const count = text => countTokens({ baseUrl: inst.baseUrl, key: inst.key, model: inst.modelId, text });
+    let tokens = await count(carried);
+    if (tokens == null) return null;
+    const now = fresh ? null : await contextOf(runtime, sessionId);
+    const window = now?.window || route.contextWindow;
+    const pressure = now?.tokens ?? 0;
+    // Where the Harness starts summarising by itself on this window (profile.mjs: the reply keeps its room, then the headroom).
+    const reply = localOutputBudget(window);
+    const threshold = Math.floor(Math.min(window * 0.8, window - reply - compactionHeadroom(window, reply)));
+    let verdict = decideFit({ window, pressure, messageTokens: tokens, threshold });
+    // The earlier conversation carried into a fresh session is what pushed it over: send the message alone instead.
+    if (verdict.action === 'too-large' && carried !== message) {
+      const alone = await count(message);
+      if (alone != null) { tokens = alone; verdict = decideFit({ window, pressure, messageTokens: alone, threshold }); }
+    }
+    return { ...verdict, tokens, window, pressure };
+  }
+
+  /**
+   * Summarise the older part of a chat with the Harness's /compact and say what happened. Never throws.
+   * ok:true carries the figures before and after; ok:false says why (nothing to summarise, busy, failed).
+   */
+  async function compactChat(runtime, sessionId) {
+    const before = await contextOf(runtime, sessionId);
+    let result;
+    try { result = (await runtime.gw.rpc('commands/execute', { agentId: sessionId, line: '/compact', submittedAttachments: [] }))?.result; }
+    catch (e) { return { ok: false, reason: /not.found|no such/i.test(String(e.message)) ? 'nothing' : 'failed', before, text: String(e.message ?? e) }; }
+    const text = String(result?.text ?? '');
+    log('agent · compact: ' + (result?.kind ?? 'none') + ' ' + text.slice(0, 140));
+    if (result?.kind === 'success' && /^Compacted/i.test(text)) return { ok: true, before, after: await contextOf(runtime, sessionId) };
+    if (result?.kind === 'success') return { ok: false, reason: 'nothing', before, text };
+    if (/active compaction|not idle/i.test(text)) return { ok: false, reason: 'busy', before, text };
+    // The Harness cannot make a summary smaller than what is left when the chat holds little beyond its first prompt: that is nothing to summarise, not a failure.
+    const little = before && before.window > 0 && before.tokens - BASE_TOKENS < before.window * 0.25;
+    return { ok: false, reason: little && /useful summary|not smaller/i.test(text) ? 'nothing' : 'failed', before, text };
+  }
+
+  /** The line in the chat that explains why the context meter fell: how full it was and how full it is. */
+  function summarizedNote(before, after, window) {
+    const w = after?.window || before?.window || window || 0;
+    const pct = v => Math.max(0, Math.min(100, Math.round(100 * v.tokens / w)));
+    const known = w > 0 && before && after;
+    const template = known ? FIT_TEXT.summarized : FIT_TEXT.summarizedShort;
+    const values = known ? [pct(before), pct(after)] : [];
+    return { type: 'delta', own: true, text: '\n\n' + fill(template, values), key: template, values, noteReason: 'compacted' };
+  }
+
+  /** "/compact": summarise the older messages of this chat now, and say in plain words what happened. */
+  async function compactCommand(options) {
+    const { chatId, choice, signal } = options;
+    const c = chat(chatId);
+    const say = (template, values = []) => sayKey(options, template, values);
+    if (c.turn || c.starting) return say(FIT_TEXT.compactBusy);
+    const known = sessionMap[chatId]?.sessionId;
+    if (!known) return say(FIT_TEXT.noChatYet);
+    let runtime;
+    try { ({ rt: runtime } = await ensureRuntime(choice, signal)); } catch { return say(FIT_TEXT.compactFailed); }
+    const done = await compactChat(runtime, known);
+    if (done.ok) {
+      const note = summarizedNote(done.before, done.after, 0);
+      return say(note.key, note.values);
+    }
+    if (done.reason === 'busy') return say(FIT_TEXT.compactBusy);
+    if (done.reason === 'nothing') {
+      const w = done.before?.window || 0;
+      const pct = w > 0 && done.before ? Math.round(100 * done.before.tokens / w) : 0;
+      return say(pct >= 60 ? FIT_TEXT.nothingFull : FIT_TEXT.nothingToSummarize, pct >= 60 ? [pct] : []);
+    }
+    return say(FIT_TEXT.compactFailed);
+  }
+
   /** Summarise the older part of a session with the Harness's own /compact. Best effort: the next message compacts again by itself when it must. */
   async function compactSession(runtime, sessionId) {
     try {
@@ -1173,6 +1424,34 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     return { stopped: true, ended: result.reason?.kind ?? 'unknown', ms: Date.now() - t0 };
   }
 
+  /** The turn running for a chat now, for a page that has just loaded; null when none. */
+  function turnOf(chatId) {
+    const t = chats.get(chatId)?.turn;
+    if (!t || t.finished) return null;
+    return { chatId, sessionId: t.sessionId, requestId: t.requestId, mode: t.mode, stopping: !!t.stopping, pending: pendingFor(chatId) };
+  }
+  /** Every chat with a turn running. */
+  function runningTurns() { return [...chats.keys()].map(turnOf).filter(Boolean); }
+  /**
+   * Take a turn over from a new page. A running turn: the catch-up, then the live frames until it ends or the page leaves again. A turn that
+   * ended while no page was there (`requestId` names it): its text, tool cards and closing frame once. null when there is nothing to take over.
+   */
+  function attach({ chatId, requestId = null, onFrame, signal }) {
+    const c = chats.get(chatId);
+    const turn = c?.turn;
+    if (turn && !turn.finished && typeof turn.reattach === 'function') {
+      if (requestId && turn.requestId !== requestId) return null;
+      turn.reattach({ onFrame, signal });
+      return { ended: turn.ended.promise.then(() => undefined), live: true };
+    }
+    const last = c?.last;
+    if (!last || !requestId || last.requestId !== requestId) return null;
+    onFrame({ type: 'start', model: last.model, contextMax: last.contextMax, demo: false, remoteModel: last.remoteModel, agent: true, mode: last.mode, sessionId: last.sessionId, requestId: last.requestId, skills: [], resumed: true });
+    onFrame({ type: 'resync', content: last.content, reasoning: last.reasoning });
+    for (const card of last.cards) onFrame({ type: 'agent-tool', tool: card });
+    if (last.terminal) onFrame(last.terminal);
+    return { ended: Promise.resolve(), live: false };
+  }
   function pendingFor(chatId) {
     const sessionId = sessionMap[chatId]?.sessionId;
     const helpers = chats.get(chatId)?.turn?.children;
@@ -1194,7 +1473,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   /** Let go of a chat's Harness session mapping (a task starts every run in a session of its own). */
   function forget(chatId) { if (chats.get(chatId)?.turn) return; delete sessionMap[chatId]; chats.delete(chatId); persist(); }
 
-  return { goalState, goalControl, harnessDir, status, runTurn, goalCommand, planCommand, researchCommand, llmTarget, setPlanBriefing, resetSession, reopenPlan, skipStep, planGoal, planControl, planState, queueMessage, cancelQueued, takeQueue, forget, approve, setMode, stop, pendingFor, pendingAll, close, sessionOf: chatId => sessionMap[chatId]?.sessionId ?? null, workingFolder: chatId => sessionMap[chatId]?.cwd ?? null, isRunning: chatId => !!chats.get(chatId)?.turn, _debug: () => ({ rt, sessionMap }) };
+  return { compactCommand, messageHelper, answerQuestion, goalState, goalControl, harnessDir, status, turnOf, runningTurns, attach, runTurn, goalCommand, planCommand, researchCommand, llmTarget, setPlanBriefing, resetSession, reopenPlan, skipStep, planGoal, planControl, planState, queueMessage, cancelQueued, takeQueue, forget, approve, setMode, stop, pendingFor, pendingAll, close, sessionOf: chatId => sessionMap[chatId]?.sessionId ?? null, workingFolder: chatId => sessionMap[chatId]?.cwd ?? null, isRunning: chatId => !!chats.get(chatId)?.turn, _debug: () => ({ rt, sessionMap }) };
 }
 
 /** A goal that stopped by itself, in words. */

@@ -6,7 +6,7 @@ What it does, each step skipped when it is already done:
 
   1. checks the Mac: Apple Silicon, the chip, unified memory, macOS version, the Command Line Tools, free disk
   2. recommends a model by memory (recommend, never force: an explicit --model is kept, with what it risks)
-  3. installs the Python packages into .venv (cmake and ninja come from pip: no Homebrew, no sudo)
+  3. installs the Python packages into .venv (cmake and ninja come from pip, just before step 4: no Homebrew, no sudo)
   4. builds the Metal engine from source: metal-cpp (Apple's headers) and llama.cpp's ggml at the pinned commit
   5. downloads the model (setup.py's downloader: resumable, the pinned revision)
   6. prepares the model: the native pack (tools/iq_pack.py) and the MTP draft layer (tools/mtp_fetch.py, mtp_pack.py)
@@ -66,13 +66,15 @@ UD_SHARDS = {
 def model_shard_names(model: str) -> list[str]:
     """The model's files in order (shard 1 first)."""
     n = MAC_MODELS[model].get("shards", 2)
-    if MAC_MODELS[model].get("family") == "unsloth":
-        return [f"Qwen3.8-Flash-Next-{model}-{i:05d}-of-{n:05d}.gguf" for i in range(1, n + 1)]
+    if MAC_MODELS[model].get("family") == "gyro":          # agentionai's one file (the n-gram table is inside it)
+        return [S.model_file(S.FAMILIES["gyro"], model, 1)]
+    if MAC_MODELS[model].get("family") == "unsloth":      # (setup.py's model_file: the v3.1 UD-IQ4_XS is named UD-IQ4_XS on the Hub)
+        return [S.model_file(S.FAMILIES["unsloth"], model, i) for i in range(1, n + 1)]
     return [S.model_file(S.FAMILIES["qwen"], model, i) for i in range(1, n + 1)]
 
 
 def shard_sha(name: str):
-    return UD_SHARDS.get(name) or getattr(S, "UNSLOTH_SHARDS", {}).get(name)
+    return UD_SHARDS.get(name) or getattr(S, "UNSLOTH_SHARDS", {}).get(name) or getattr(S, "UNSLOTH_V31_SHARDS", {}).get(name)
 
 
 # ------------------------------------------------------------------------------------------------ the Mac
@@ -127,6 +129,7 @@ def build_engine(llama: Path, jobs: int | None = None) -> Path:
         S.ok(f"Metal engine: {EXE} (built for this source)")
         return EXE
     mcpp = metal_cpp()
+    S.ensure_build_tools()                                # cmake and ninja are in requirements-build.txt, not requirements.txt (#3403)
     S.say("  Building the Metal engine from source (5-15 minutes the first time) ...")
     BUILD_DIR.mkdir(exist_ok=True)
     log = BUILD_DIR / "build.log"
@@ -148,9 +151,10 @@ def build_engine(llama: Path, jobs: int | None = None) -> Path:
 
 
 # ------------------------------------------------------------------------------------------------ the config
-def engine_args(pack: Path, shards: list, rt: Path, ctx: int, stream: bool = False, ram_gb: float = 0.0) -> list[str]:
+def engine_args(pack: Path, shards: list, rt: Path, ctx: int, stream: bool = False, ram_gb: float = 0.0,
+                model: str = "") -> list[str]:
     """The Metal defaults (strata_control/mac_fit.py), with this checkout's expert profile."""
-    return _fit.engine_args(pack, shards, rt, ctx, stream, ram_gb, ROOT / "data" / "expert-profile.bin")
+    return _fit.engine_args(pack, shards, rt, ctx, stream, ram_gb, ROOT / "data" / "expert-profile.bin", model)
 
 
 # the image encoder's projector (setup.py's pinned revision): name -> (bytes, SHA-256)
@@ -170,6 +174,7 @@ def build_vision(llama: Path) -> Path:
             return VISION_EXE
     except (OSError, ValueError):
         pass
+    S.ensure_build_tools()
     S.say("  Building the image encoder (1-3 minutes) ...")
     env = dict(os.environ, PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""))
     log = ROOT / "build-vision.log"
@@ -287,9 +292,14 @@ def repack_running(folder: Path) -> list[int]:
 
 
 def engine_pids(run=subprocess.run) -> list[int]:
-    """Pids of the running Metal engines (`strata`, the executable setup builds)."""
+    """Pids of the running Metal engines (`strata`, the executable setup builds) that belong to THIS user.  On a shared Mac
+    another person's engine is theirs to stop: `pgrep -x strata` alone saw it and sent setup away with "stop the server" for a
+    window the person could not close (M5 Max, 2026-10-31)."""
+    cmd = ["pgrep", "-x", "strata"]
+    if hasattr(os, "getuid"):
+        cmd[1:1] = ["-u", str(os.getuid())]
     try:
-        out = run(["pgrep", "-x", "strata"], capture_output=True, text=True, timeout=10).stdout
+        out = run(cmd, capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
         return []
     return [int(x) for x in out.split() if x.isdigit() and int(x) != os.getpid()]
@@ -322,8 +332,9 @@ def start(cfg_path: Path, port: int | None, open_browser: bool = True) -> int:
 # ------------------------------------------------------------------------------------------------ main
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--family", choices=["qwen", "unsloth"], default=None,
-                    help="qwen = Qwen3.8-Flash-Next (GSQ-RCO), unsloth = Unsloth's UD-*_K_XL (follows --model)")
+    ap.add_argument("--family", choices=["qwen", "unsloth", "gyro"], default=None,
+                    help="qwen = Qwen3.8-Flash-Next (GSQ-RCO), unsloth = Unsloth's UD-*_K_XL, gyro = agentionai's Gyro-S / Gyro-M "
+                         "(follows --model)")
     ap.add_argument("--model", choices=list(MAC_MODELS))
     ap.add_argument("--context", type=int)
     ap.add_argument("--port", type=int)
@@ -416,9 +427,9 @@ def main(argv=None) -> int:
     if free < need:
         S.warn(f"about {need:.0f} GB are needed on the disk ({free:.0f} GB free): kept as you chose; it may run out")
 
-    # ---- 3. Python packages (cmake and ninja among them: the engine build's tools)
+    # ---- 3. Python packages (cmake and ninja come with the build in step 4, from requirements-build.txt)
     S.step(3, "Python packages")
-    S.pip_install(S.requirement_lines() if S.REQUIREMENTS.exists() else S.PY_PACKAGES, "numpy, jinja2, ..., cmake, ninja")
+    S.pip_install(S.requirement_lines() if S.REQUIREMENTS.exists() else S.PY_PACKAGES, "numpy, jinja2, ...")
 
     # ---- 4. the engine
     S.step(4, "the Strata engine (Metal)")
@@ -428,6 +439,18 @@ def main(argv=None) -> int:
         (BUILD_DIR / "BUILD.json").unlink(missing_ok=True)
     exe = build_engine(llama)
     if a.update:
+        # update.sh's own text: "The model files are not touched".  The questions are asked anyway, so when the
+        # answers name a model (or an image encoder) that is not here, say it: a silent exit reads like a broken
+        # download (an M1 Max chose IQ3_S in update.sh and got no model and no message).
+        files = [Path(a.gguf_dir) / n if a.gguf_dir else models_root / tag / n for n in model_shard_names(model)]
+        pack = S.find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
+        pack_done = (pack / "native_experts.txt").exists() and (pack / "tokenizer" / "vocab.json").exists()
+        if not (all(f.exists() and S.done(f) for f in files) and pack_done):
+            S.warn(f"{model} is not installed here, and an update does not download model files: nothing was installed")
+            S.say(f"  to download and prepare {model}: ./setup.sh --setup")
+        elif vision == "yes" and not (models_root / fam["mmproj"]).exists():
+            S.warn("the image encoder is not downloaded here, and an update does not download model files")
+            S.say("  to add image support: ./setup.sh --setup")
         return 0
 
     # ---- 5. the model
@@ -439,10 +462,12 @@ def main(argv=None) -> int:
         if s.exists() and S.done(s):
             S.ok(f"{s.name} already downloaded")
             continue
-        S.download(fam["hf"].format(q=model) + s.name, s)
+        S.download(S.model_hf(fam, model) + s.name, s)
     S.check_shards(files)
     for s in files:                                    # the Unsloth files: pinned sizes and SHA-256
-        if shard_sha(s.name):
+        if family == "unsloth" and s.name in fam.get("sha256", {}):       # the family's pins, and UD-Q4_K_XL's second layout by the size on the disk
+            S.verify_sha256(s, *S.fam_pin(fam, s), own=bool(a.gguf_dir))
+        elif shard_sha(s.name):
             S.verify_sha256(s, *shard_sha(s.name))
     S.ok("model files present")
 
@@ -489,6 +514,8 @@ def main(argv=None) -> int:
             S.mark(native)
         ple = ple_shard(files)
         shards = [native, ple]
+    elif family == "gyro":
+        shards = [files[0], files[0]]                  # one file: the model and its n-gram table (--native, --ple-gguf)
     else:
         shards = files
     if not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
@@ -523,8 +550,9 @@ def main(argv=None) -> int:
     # ---- 7. the config, the start script
     S.step(7, "writing the start script")
     port = a.port or 8080
-    cfg = mac_config(exe, engine_args(pack, shards, rt, ctx, stream, info["ram_gb"]), pack, f"{fam['name']}-{model.lower()}", tag, port)
-    cfg["env"] = {"STRATA_METAL_STREAM": "1" if stream else "0"}   # the engine follows setup's measured choice
+    cfg = mac_config(exe, engine_args(pack, shards, rt, ctx, stream, info["ram_gb"], model), pack, f"{fam['name']}-{model.lower()}", tag, port)
+    cfg["env"] = {"STRATA_METAL_STREAM": "1" if stream else "0",   # the engine follows setup's measured choice
+                  **_fit.engine_env(model, stream)}                # STRATA_METAL_F16=1 for a resident IQ3_S / Q2_0 (mac_fit.F16_MODELS)
     if vision == "yes":
         cfg["args"] += ["--vision"]
         cfg["vision"] = {"exe": str(vexe), "mmproj": str(mmproj), "model": str(files[0]), "gpu": vision_gpu,

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -96,13 +97,26 @@ def _read_json(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def in_trash(path: str | os.PathLike) -> bool:
+    """#3410: True when ``path`` is inside a Trash / Recycle Bin folder (a Strata folder that was deleted with the file manager
+    is still a folder there, and was remembered as an install): ~/.local/share/Trash/files/.., /.Trash-1000/.., ~/.Trash/..,
+    $RECYCLE.BIN\\.."""
+    parts = [x.lower() for p in Path(path).parts for x in str(p).split("\\")]   # a Windows-shaped path read on Linux has no separators for Path
+    for i, x in enumerate(parts):
+        if x in (".trash", "$recycle.bin", "recycler", "$recycle.bin.old") or x.startswith(".trash-"):
+            return True
+        if x == "trash" and i + 1 < len(parts) and parts[i + 1] in ("files", "info", "expunged"):
+            return True                                  # the XDG Trash: ~/.local/share/Trash/files
+    return False
+
+
 def _installs_in(settings: dict) -> list[Path]:
     items = settings.get("installs")
     found: list[Path] = []
     for raw in (items if isinstance(items, list) else [])[:20]:
         if isinstance(raw, str) and raw:
             p = Path(raw).expanduser()
-            if p.is_absolute() and p not in found:
+            if p.is_absolute() and p not in found and not in_trash(p):
                 found.append(p)
     return found
 
@@ -153,6 +167,9 @@ def places(*, here: Path | None = None, explicit: str | os.PathLike | None = Non
         p = Path(raw).expanduser()
         return [Place(p, "explicit", len(config_files(p)))]
     cands: list[tuple[Path, str]] = []
+    data_root = environ.get("STRATA_DATA_DIR")
+    if data_root:                                    # the installer's own folder (install.sh / install.ps1): an install kept inside it comes first
+        cands.append((Path(data_root).expanduser() / "install", "datadir"))
     if here is not None:
         cands.append((Path(here), "here"))
     own = own_settings_file(environ, windows=windows, home=home)
@@ -189,25 +206,79 @@ def find_install(*, here: Path | None = None, explicit: str | os.PathLike | None
 
 # ----------------------------------------------------------------------------------------------- the data folder
 
+def _data_dir_entry(file: Path) -> tuple[str, float] | None:
+    """(the data folder a settings file names, when it was last changed): ``data_dir_at`` (seconds), else the file's own time."""
+    data = _read_json(file)
+    folder = data.get("data_dir")
+    if not isinstance(folder, str) or not folder:
+        return None
+    at = data.get("data_dir_at")
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or at <= 0:
+        try:
+            at = file.stat().st_mtime
+        except OSError:
+            at = 0.0
+    return folder, float(at)
+
+
+def _same(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _write_data_dir(file: Path, folder: str, at: float) -> bool:
+    """Merge the data folder and its time into a settings file (atomic). False when the disk refuses; never raises."""
+    try:
+        current = _read_json(file)
+        current["data_dir"], current["data_dir_at"] = folder, at
+        file.parent.mkdir(parents=True, exist_ok=True)
+        temp = file.with_name(f"{file.name}.{os.getpid()}.tmp")
+        temp.write_text(json.dumps(current, indent=1), encoding="utf-8")
+        os.replace(temp, file)
+        return True
+    except OSError:
+        return False
+
+
+def sync_data_dir(*, environ=None, windows: bool | None = None, home: Path | None = None) -> tuple[Path, str] | None:
+    """One models folder for the Terminal and the desktop app. The Terminal's settings file and the app's (``app-settings.json``) each name
+    a data folder; when they disagree the one changed last wins and the other file is updated. Nothing is moved. Returns (folder, source of
+    the winner) or None when neither names one. The app's own processes never call this (the app syncs from its host)."""
+    environ = os.environ if environ is None else environ
+    if in_app_mode(environ):
+        return None
+    mine_file = own_settings_file(environ, windows=windows, home=home)
+    app_file = app_settings_file(environ, windows=windows, home=home)
+    mine, app = _data_dir_entry(mine_file), _data_dir_entry(app_file)
+    if mine and app and not _same(mine[0], app[0]):
+        newer, older_file, source = (mine, app_file, "settings") if mine[1] >= app[1] else (app, mine_file, "app")
+        if source == "app" and not Path(app[0]).is_dir():          # a disk that is not connected is never adopted
+            return Path(mine[0]), "settings"
+        _write_data_dir(older_file, newer[0], newer[1])
+        return Path(newer[0]), source
+    if mine:
+        return Path(mine[0]), "settings"
+    return (Path(app[0]), "app") if app else None
+
+
 def data_dir_choices(*, environ=None, windows: bool | None = None, home: Path | None = None) -> list[tuple[Path, str]]:
     """Candidate data folders with their source, best first (not checked for existence)."""
     environ = os.environ if environ is None else environ
     out: list[tuple[Path, str]] = []
-    own = _read_json(own_settings_file(environ, windows=windows, home=home)).get("data_dir")
-    if isinstance(own, str) and own:
-        out.append((Path(own), "settings"))
+    own = _data_dir_entry(own_settings_file(environ, windows=windows, home=home))
+    app = None if in_app_mode(environ) else _data_dir_entry(app_settings_file(environ, windows=windows, home=home))
+    entries = [(Path(e[0]), src, e[1]) for e, src in ((own, "settings"), (app, "app")) if e]
+    entries.sort(key=lambda x: -x[2])                              # the folder changed last first, whichever file it is in
+    out.extend((p, src) for p, src, _ in entries)
     if not in_app_mode(environ):
-        app = _read_json(app_settings_file(environ, windows=windows, home=home)).get("data_dir")
-        if isinstance(app, str) and app:
-            out.append((Path(app), "app"))
         for d in documents_dirs(environ, windows=windows, home=home):
             out.append((d / "Strata", "documents"))
     return out
 
 
 def data_dir(default: Path, *, environ=None, windows: bool | None = None, home: Path | None = None) -> tuple[Path, str]:
-    """(the data folder, source). The person's own setting wins; then the app's folder, then a ``Documents/Strata`` that holds models;
-    else `default`."""
+    """(the data folder, source). Of the Terminal's own setting and the app's folder the one changed last wins (the other file is brought up
+    to date); then a ``Documents/Strata`` that holds models; else `default`."""
+    sync_data_dir(environ=environ, windows=windows, home=home)
     choices = data_dir_choices(environ=environ, windows=windows, home=home)
     for path, source in choices:
         if source == "settings":
@@ -311,9 +382,36 @@ def data_dir_of(fp: Footprint) -> Path | None:
     return None
 
 
-def prepared_beside(gguf: Path) -> dict:
+def remembered_data_dirs(*, environ=None, windows: bool | None = None, home: Path | None = None) -> list[Path]:
+    """The data folders the Terminal's settings and the desktop app name (best first), read only: for a look at what is prepared where setup would put new files.
+    Unlike ``data_dir`` this writes nothing (no settings sync)."""
+    try:
+        return [p for p, source in data_dir_choices(environ=environ, windows=windows, home=home) if source in ("settings", "app") and p.is_dir()]
+    except OSError:
+        return []
+
+
+def mtp_layer_in(*folders: "str | os.PathLike[str] | None") -> Path | None:
+    """The ``mtp/rt`` folder of the first data folder that holds the draft layer (``<data>/mtp/rt/experts.bin``), the place setup writes it to. None when none does."""
+    for folder in folders:
+        if not folder:
+            continue
+        try:
+            rt = Path(folder) / "mtp" / "rt"
+            if (rt / "experts.bin").is_file():
+                return rt
+        except OSError:
+            continue
+    return None
+
+
+def prepared_beside(gguf: Path, data_dirs: Iterable[str | os.PathLike[str] | None] = ()) -> dict:
     """What was already prepared for a model file that sits in ``<data>/Models/<tag>/`` (or ``<data>/models/<tag>/``): its pack, the draft
-    layer and the picture reader, found by the layout setup and the desktop app both use. Reads only; absent items are None."""
+    layer and the picture reader, found by the layout setup and the desktop app both use. Reads only; absent items are None.
+
+    ``data_dirs`` are the data folders the launch names besides that layout (``--data-dir``, the remembered one): setup writes the draft layer to
+    ``<data-dir>/mtp/rt`` and the pack to ``<data-dir>/packs/<tag>``, and a model folder outside the data folder must not hide them (a second 5.2 GB fetch).
+    The folder next to the model is looked at first."""
     gguf = Path(gguf)
     folder = gguf.parent
     out: dict = {"data_dir": None, "pack": None, "mtp": None, "mmproj": None}
@@ -330,6 +428,27 @@ def prepared_beside(gguf: Path) -> dict:
                 out["mmproj"] = cand
                 break
             break
+    others = [Path(d) for d in data_dirs if d]
+    if out["mtp"] is None:
+        out["mtp"] = mtp_layer_in(*others)
+    if out["pack"] is None and folder.name:
+        tag = folder.name.lower()
+        for d in others:
+            try:
+                if (d / "packs" / tag).is_dir():
+                    out["pack"] = d / "packs" / tag
+                    break
+            except OSError:
+                continue
+    if out["mmproj"] is None:
+        for d in others:                                         # setup keeps the picture reader in <data>/models
+            try:
+                found = next(iter(sorted(p for sub in ("models", "Models") for p in (d / sub).glob("mmproj*.gguf"))), None)
+            except OSError:
+                found = None
+            if found is not None:
+                out["mmproj"] = found
+                break
     return out
 
 

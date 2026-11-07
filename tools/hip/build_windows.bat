@@ -13,12 +13,15 @@ rem
 rem Settings (environment variables, all optional):
 rem   STRATA_HIP_ARCHS     gfx1100;gfx1101;gfx1102;gfx1200;gfx1201;gfx1030;gfx1031;gfx1151 (the cards setup supports, + gfx1102; gfx1151 = Strix Halo;
 rem                        gfx1031 = RX 6700 XT / 6800M, #915 #1078; drop it from the list to build the zip without it)
+rem                        The release packages are built one per card family: rx9070 = gfx1200;gfx1201, rdna3 = gfx1100;gfx1101;gfx1102;gfx1151,
+rem                        rdna2 (0.2.2, RX 6000: built, not tested on a real card) = gfx1030;gfx1031; each then goes through package_engine.py --variant <name>
 rem   STRATA_ROCM_VERSION  10.2.0a20260930        STRATA_ROCM_INDEX  https://nightly.repo.amd.com/rocm/whl-next/
 rem   ROCM_VENV            <repo>\.rocm-win       BUILD_DIR          <repo>\build-hip-win     DIST_DIR  <repo>\dist
 rem   STRATA_GGML_DIR      a llama.cpp checkout at the pinned commit (default: CMake fetches it)
 rem   STRATA_ROCM_KEEP      1 = use the ROCM_VENV as it is (no pip install, even when its archs differ from STRATA_HIP_ARCHS)
 rem   STRATA_VISION_HIP_ARCHS  the GPU reader's archs (default: STRATA_HIP_ARCHS; about 70 MB of the zip per arch)
 rem   STRATA_NO_VISION     1 = skip the two picture readers (strata-vision.exe for the CPU, strata-vision-hip.exe for the GPU)
+rem   STRATA_CMAKE_EXTRA   extra cmake configure arguments (for example -DSTRATA_WINDOW_MAX_T=8)
 setlocal EnableDelayedExpansion
 for %%I in ("%~dp0..\..") do set "SRC=%%~fI"
 if not defined STRATA_HIP_ARCHS set "STRATA_HIP_ARCHS=gfx1100;gfx1101;gfx1102;gfx1200;gfx1201;gfx1030;gfx1031;gfx1151"
@@ -74,7 +77,7 @@ if not exist "%BUILD_DIR%\build.ninja" (
     "-DCMAKE_C_COMPILER=%ROCM_F%/lib/llvm/bin/clang.exe" "-DCMAKE_CXX_COMPILER=%ROCM_F%/lib/llvm/bin/clang++.exe" ^
     "-DCMAKE_HIP_COMPILER=%ROCM_F%/lib/llvm/bin/clang++.exe" "-DCMAKE_HIP_COMPILER_ROCM_ROOT=%ROCM_F%" ^
     "-DCMAKE_PREFIX_PATH=%ROCM_F%" "-DCMAKE_HIP_FLAGS=--rocm-path=%ROCM_F% --rocm-device-lib-path=%BITCODE%" ^
-    %GGML% || exit /b 1
+    %GGML% %STRATA_CMAKE_EXTRA% || exit /b 1
 )
 if "%TESTS%"=="ON" (
   cmake --build "%BUILD_DIR%" || exit /b 1

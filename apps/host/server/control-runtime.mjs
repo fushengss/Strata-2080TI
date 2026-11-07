@@ -74,6 +74,17 @@ export function findControl({ env = process.env, platform = process.platform, ex
   return control;
 }
 
+/**
+ * The environment of the server the host starts from a source checkout (#3851): the key travels in the run configuration, so a
+ * STRATA_API_KEY the host itself was started with is removed. Setting it to an empty string made serve/server.py stop with
+ * "an API key was given but it is empty".
+ */
+export function sourceServerEnvironment(env = process.env) {
+  const next = { ...env, PYTHONUNBUFFERED: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' };
+  delete next.STRATA_API_KEY;
+  return next;
+}
+
 /** The environment Control runs in: nothing from the user's Python, and acquiring forbidden. */
 export function controlEnvironment(control, { env = process.env, components = componentsDirectory({ env }), acquire = false } = {}) {
   const next = { ...env };
@@ -110,10 +121,18 @@ export class ControlError extends Error {
   }
 }
 
-/** Run one CLI command of Control. Resolves { code, json, text, stderr }; rejects only if it cannot start or times out. */
-export function runCli(control, args, { env = process.env, timeoutMs = 60_000, spawnProcess = spawn, components, acquire = false, onLine = null, signal = null } = {}) {
+/**
+ * Small Control programs that are a module of strata_control and not a `strata` command. They run on Control's interpreter with Control's folder first on the
+ * path (the folder is the working directory), so they work whatever the interpreter does with the script folder.
+ */
+const BOOT = {
+  pictures: 'import os,sys;sys.path.insert(0,os.getcwd());from strata_control import pictures;sys.exit(pictures.main(sys.argv[1:]))',
+};
+
+/** Run one CLI command of Control (or, with `boot`, one of its modules). Resolves { code, json, text, stderr }; rejects only if it cannot start or times out. */
+export function runCli(control, args, { env = process.env, timeoutMs = 60_000, spawnProcess = spawn, components, acquire = false, onLine = null, signal = null, boot = null } = {}) {
   return new Promise((resolveRun, reject) => {
-    const child = spawnProcess(control.python, [control.cli, ...args], {
+    const child = spawnProcess(control.python, boot ? ['-c', BOOT[boot], ...args] : [control.cli, ...args], {
       cwd: control.dir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
       env: controlEnvironment(control, { env, acquire, ...(components ? { components } : {}) }),
     });
@@ -174,19 +193,43 @@ export function createControl({ control = findControl(), env = process.env, run 
       if (result.json?.ok) return result.json;
       throw failure(result, 'The update check failed.');
     },
-    async update({ feed = env.STRATA_UPDATE_FEED ?? null, engine = true, control: withControl = true, appVersion = env.STRATA_APP_VERSION ?? null, force = false, onEvent = null, signal = null } = {}) {
+    async update({ feed = env.STRATA_UPDATE_FEED ?? null, engine = true, control: withControl = true, appVersion = env.STRATA_APP_VERSION ?? null, force = false, stopModel = false, onEvent = null, signal = null } = {}) {
       const args = ['update', '--output', 'jsonl', ...feedArgs(feed), ...(engine ? [] : ['--no-engine']), ...(withControl ? [] : ['--no-control']),
-        ...(appVersion ? ['--app-version', appVersion] : []), ...(force ? ['--force'] : [])];
+        ...(appVersion ? ['--app-version', appVersion] : []), ...(force ? ['--force'] : []), ...(stopModel ? ['--stop-model'] : [])];
       const result = await call(args, { timeoutMs: 3 * 3600_000, acquire: true, onLine: onEvent ?? (() => {}), signal });
       if (result.json?.ok) return result.json;
       const failed = result.json?.results?.find?.(r => r.status === 'failed');
       if (failed) throw Object.assign(new ControlError(failed.error, { exitCode: failed.exit_code ?? result.code, output: result.json }), { code: result.code === 7 ? 'engine_serving' : 'update_failed' });
       throw failure(result, 'The update failed.');
     },
+    /** Install an engine package the person downloaded and chose (the offline path): no network; Control checks the package's own signature. */
+    async installEngineFile(path, { onEvent = null, signal = null } = {}) {
+      const result = await call(['components', 'install-file', path, '--output', 'jsonl'], { timeoutMs: 3600_000, onLine: onEvent ?? (() => {}), signal });
+      if (result.json?.ok) return { ok: true, results: [result.json] };
+      throw failure(result, 'This file could not be installed.');
+    },
     async rollbackEngine() {
       const result = await call(['components', 'rollback', '--output', 'json'], { timeoutMs: 120_000 });
       if (result.json?.ok) return result.json;
       throw failure(result, 'The engine could not be rolled back.');
+    },
+    /** The engines installed on this computer, by family (`strata components engines`): the one list the Terminal prints too. Reads files only. */
+    async engines() {
+      const result = await call(['components', 'engines', '--output', 'json'], { timeoutMs: 60_000 });
+      if (result.json?.ok) return result.json;
+      throw failure(result, 'The installed engines could not be read.');
+    },
+    /** Switch to an installed engine (`strata components use`): nothing is downloaded. `root` is only for a DeepSeek engine that lives in more than one place. */
+    async useEngine({ family, folder }) {
+      const result = await call(['components', 'use', folder, '--family', family, '--output', 'json'], { timeoutMs: 600_000 });
+      if (result.json?.ok) return result.json;
+      throw failure(result, 'The engine could not be switched.');
+    },
+    /** Delete an installed engine (`strata components remove`); Control refuses the one in use. */
+    async removeEngine({ family, folder }) {
+      const result = await call(['components', 'remove', folder, '--family', family, '--output', 'json'], { timeoutMs: 600_000 });
+      if (result.json?.ok) return result.json;
+      throw failure(result, 'The engine could not be deleted.');
     },
     async engine({ backend = null } = {}) {
       const result = await call(['components', 'engine', '--output', 'json', ...(backend ? ['--backend', backend] : [])], { timeoutMs: 30_000 });
@@ -206,6 +249,83 @@ export function createControl({ control = findControl(), env = process.env, run 
       // words ("Strata can't run these files yet"). Only a check that could not run at all is a failure.
       if (result.json?.plan && Array.isArray(result.json.plan.issues)) return result.json.plan;
       throw failure(result, 'The files could not be checked.');
+    },
+    /** What picking `to` as the models folder means (sizes, free space, which choices are possible, why not): nothing is changed. */
+    async planModelsMove(from, to) {
+      const result = await call(['models', 'move', to, ...(from ? ['--from', from] : []), '--plan', '--output', 'json'], { timeoutMs: 120_000 });
+      if (result.json?.plan) return result.json.plan;
+      throw failure(result, 'The folder could not be checked.');
+    },
+    /**
+     * Move the model files to `to` (copied, checked, then the old copies removed). `onEvent` gets the progress lines; a file at `cancelFile` stops it
+     * safely. Resolves with the summary (done / stopped, what moved, what is left); a failure is a ControlError whose `output` carries the details.
+     */
+    async moveModels(from, to, { installDir = null, cancelFile = null, onEvent = null } = {}) {
+      const args = ['models', 'move', to, ...(from ? ['--from', from] : []), ...(installDir ? ['--install-dir', installDir] : []), ...(cancelFile ? ['--cancel-file', cancelFile] : []), '--output', 'jsonl'];
+      const result = await call(args, { timeoutMs: 24 * 3600_000, onLine: onEvent ?? (() => {}) });
+      if (result.json?.ok && result.json.event === 'result') return result.json;
+      const error = result.json?.error;
+      throw Object.assign(new ControlError(error?.message ?? (result.stderr.split(/\r?\n/).filter(Boolean).pop() || 'The models could not be moved.'), { exitCode: result.code, output: result.json }), { code: error?.code ?? 'move_failed', details: error?.details ?? '' });
+    },
+    /** A move of the models folder that the last run left unfinished (`strata models move --status`): null, or {state, from, to, bytes}. */
+    async interruptedModelsMove(dataFolder) {
+      const result = await call(['models', 'move', '--status', ...(dataFolder ? ['--from', dataFolder] : []), '--output', 'json'], { timeoutMs: 30_000 });
+      if (result.json?.ok) return result.json.interrupted ?? null;
+      throw failure(result, 'The models folder could not be checked.');
+    },
+    /** "Finish it": the same move again, from where it stopped. Same events and result as moveModels. */
+    async resumeModelsMove(dataFolder, { installDir = null, cancelFile = null, onEvent = null } = {}) {
+      const args = ['models', 'move', '--resume', ...(dataFolder ? ['--from', dataFolder] : []), ...(installDir ? ['--install-dir', installDir] : []), ...(cancelFile ? ['--cancel-file', cancelFile] : []), '--output', 'jsonl'];
+      const result = await call(args, { timeoutMs: 24 * 3600_000, onLine: onEvent ?? (() => {}) });
+      if (result.json?.ok && result.json.event === 'result') return result.json;
+      const error = result.json?.error;
+      throw Object.assign(new ControlError(error?.message ?? (result.stderr.split(/\r?\n/).filter(Boolean).pop() || 'The models could not be moved.'), { exitCode: result.code, output: result.json }), { code: error?.code ?? 'move_failed', details: error?.details ?? '' });
+    },
+    /** "Leave it": keep the old folder, remove the partial copies in the new one. */
+    async leaveModelsMove(dataFolder, { installDir = null } = {}) {
+      const result = await call(['models', 'move', '--leave', ...(dataFolder ? ['--from', dataFolder] : []), ...(installDir ? ['--install-dir', installDir] : []), '--output', 'json'], { timeoutMs: 24 * 3600_000 });
+      if (result.json?.ok) return result.json;
+      throw Object.assign(failure(result, 'The partial copies could not be removed.'), { code: result.json?.error?.code ?? 'leave_failed', details: result.json?.error?.details ?? '' });
+    },
+    /**
+     * The drafter for a model's run config and the drafting choice (`strata drafting plan`): { needed, gb, line, note, drafter, split, mtp_needed, mtp_gb }. Control decides
+     * (the table of strata_control/drafting.py and the all-cards split engine's rule, strata_control/split_engine.py: the same answer as the Terminal's); the app never reads
+     * it. Nothing is downloaded. `noSplit` asks as if the split engine will not take the start (only after the draft layer for the split could not be downloaded).
+     */
+    async draftingPlan({ configPath = null, mode = null, family = null, dataDir = null, noSplit = false, unloading = false } = {}) {
+      const result = await call(['drafting', 'plan', ...(configPath ? ['--config', configPath] : []), ...(mode ? ['--mode', mode] : []), ...(family ? ['--family', family] : []), ...(dataDir ? ['--data-dir', dataDir] : []), ...(noSplit ? ['--no-split'] : []), ...(unloading ? ['--engines-unloading'] : []), '--output', 'json'], { timeoutMs: 30_000 });
+      if (result.json?.ok) return result.json;
+      throw failure(result, 'The drafter could not be checked.');
+    },
+    /** Fetch and pack the drafter when the choice would use it and it is not here (`strata drafting fetch --if-needed`); `onEvent` gets {step, done, total}. */
+    async draftingFetch({ configPath, mode = null, noSplit = false, unloading = false, onEvent = null, signal = null } = {}) {
+      const args = ['drafting', 'fetch', '--config', configPath, ...(mode ? ['--mode', mode] : []), ...(noSplit ? ['--no-split'] : []), ...(unloading ? ['--engines-unloading'] : []), '--if-needed', '--output', 'jsonl'];
+      const result = await call(args, { timeoutMs: 3 * 3600_000, acquire: true, onLine: onEvent ?? (() => {}), signal });
+      if (result.json?.ok) return result.json;
+      throw Object.assign(new ControlError(result.json?.error?.message ?? (result.stderr.split(/\r?\n/).filter(Boolean).pop() || 'The DFlash2 drafter could not be downloaded.'), { exitCode: result.code, output: result.json }), { code: 'drafting_failed' });
+    },
+    /**
+     * The all-cards split engine for the run config the app is about to start (`strata split-engine apply`, the step `strata launch` does itself): Control checks the rule, the
+     * engine package and the draft layer on this computer and writes the split engine's run config to `outPath` when the answer is yes. Resolves { split, line, warn, reasons, cards, written };
+     * `configPath` is never changed, nothing is downloaded.
+     */
+    async splitEngine({ configPath, outPath } = {}) {
+      const result = await call(['split-engine', 'apply', '--config', configPath, '--out', outPath, '--output', 'json'], { timeoutMs: 60_000 });
+      if (result.json?.ok) return result.json;
+      throw failure(result, 'The all-cards split engine could not be checked.');
+    },
+    /**
+     * The picture files of an installed model that has none (strata_control/pictures.py): found or downloaded once (about 0.9 GB, shared), and the run
+     * config's `vision` section worked out for this engine. Nothing else of the model is touched and nothing is written to its run config: the caller does.
+     * Resolves { mmproj, vision, fetched, note, data_dir }; a failure is a ControlError whose `code` is offline | disk | failed | checksum | unsupported | no_reader.
+     * `onEvent` gets {step, done, total}. This is an explicit step that may reach the network (`acquire`), only for the Load the person pressed.
+     */
+    async picturesFetch({ configPath, engineDir, vision = 'yes', dataDir = null, family = null, hardware = null, onEvent = null, signal = null } = {}) {
+      const args = ['fetch', '--config', configPath, '--engine-dir', engineDir, '--vision', vision, ...(dataDir ? ['--data-dir', dataDir] : []), ...(family ? ['--family', family] : []),
+        ...(hardware?.vram_gb != null ? ['--vram-gb', String(hardware.vram_gb)] : []), ...(hardware?.make ? ['--make', String(hardware.make)] : []), ...(hardware?.arch != null ? ['--arch', String(hardware.arch)] : [])];
+      const result = await call(args, { timeoutMs: 3 * 3600_000, acquire: true, boot: 'pictures', onLine: onEvent ?? (() => {}), signal });
+      if (result.json?.ok) return result.json;
+      throw Object.assign(new ControlError(result.json?.error?.message ?? (result.stderr.split(/\r?\n/).filter(Boolean).pop() || 'The picture files could not be downloaded.'), { exitCode: result.code, output: result.json }), { code: result.json?.error?.code ?? 'failed' });
     },
     async saveProfile(name, configPath) {
       const listed = await call(['profile', 'list', '--output', 'json'], { timeoutMs: 20_000 });

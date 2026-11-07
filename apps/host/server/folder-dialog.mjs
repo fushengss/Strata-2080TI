@@ -25,7 +25,12 @@ export function windowsFolderScript(prompt) {
     '$dialog.ShowNewFolderButton = $true',
     // READY tells the host the window is about to open; a host that never sees it gives up and asks for the path in words (QA F06).
     '[Console]::Out.WriteLine("READY"); [Console]::Out.Flush()',
-    'if ($dialog.ShowDialog($owner) -eq "OK") { [Console]::Out.Write($dialog.SelectedPath) }',
+    // The dialog starts at the Desktop folder. Where that folder does not exist (it was deleted, a OneDrive move left a dead path, the profile was
+    // redirected) ShowDialog throws "Unable to retrieve the root folder" and no folder could be chosen at all: start at This PC instead, and when even
+    // that fails say NODIALOG so the app asks for the path.
+    '$answer = $null',
+    'try { $answer = $dialog.ShowDialog($owner) } catch { try { $dialog.RootFolder = [System.Environment+SpecialFolder]::MyComputer; $answer = $dialog.ShowDialog($owner) } catch { [Console]::Out.WriteLine("NODIALOG"); [Console]::Out.Flush() } }',
+    'if ($answer -eq "OK") { [Console]::Out.Write($dialog.SelectedPath) }',
     '$owner.Close()',
   ].join('; ');
 }
@@ -62,7 +67,10 @@ export function watchedWindowsDialog(shell, args, { readyMs = 30_000, openMs = 2
     const later = () => { clearTimeout(timer); ready = true; setTimeout(() => end(resolve, { stdout: '' }), openMs).unref?.(); };
     child.stdout?.on('data', chunk => { stdout += chunk; if (!ready && /^READY\s*$/m.test(stdout)) { clearTimeout(timer); later(); } });
     child.on('error', error => end(reject, error));
-    child.on('close', code => { if (settled) return; settled = true; clearTimeout(timer); code === 0 ? resolve({ stdout }) : reject(Object.assign(new Error('exit ' + code), { code })); });
+    child.on('close', code => { if (settled) return; settled = true; clearTimeout(timer);
+      // PowerShell ended before its window opened (security software ended it, #3831): the person types the path instead.
+      if (!ready) return resolve({ noDialog: true });
+      code === 0 ? resolve({ stdout }) : reject(Object.assign(new Error('exit ' + code), { code })); });
   });
 }
 
@@ -85,11 +93,13 @@ export async function chooseFolder(prompt, options = {}) {
     try {
       const done = windowsDialog ? await windowsDialog(shell, windowsFolderArgs(prompt)) : await run(shell, windowsFolderArgs(prompt));
       if (done.noDialog) return { unavailable: true, failed: true, reason: 'The folder window did not open. Type the folder path instead.' };
+      if (/^NODIALOG\s*$/m.test(String(done.stdout ?? ''))) return { unavailable: true, failed: true, reason: 'The folder window could not open. Type the folder path instead.' };
       const answer = answerOf(done.stdout).trim();
       return answer ? { path: cleanChosenPath(answer) } : { cancelled: true };
     } catch (error) {
       if (missing(error)) return { unavailable: true, reason: 'Windows PowerShell was not found.' };
-      throw new Error('The folder chooser could not open.');
+      // The window opened or tried to and ended with an error: the person is asked for the path instead of being left with an error and no way on.
+      return { unavailable: true, failed: true, reason: 'The folder window could not open. Type the folder path instead.', detail: `exit ${error?.code ?? '?'}` };
     }
   }
   return chooseLinuxFolder(prompt, { run, portal });
@@ -182,13 +192,16 @@ export function chooserUnavailable(picked) {
   return { message: picked.reason, code: 'folder-chooser-unavailable', details: picked.detail };
 }
 
-/** A typed path stands in for the dialog: it must be an absolute directory that exists. */
-export async function typedFolder(value, { isAbsolute }) {
-  const text = typeof value === 'string' ? value.trim() : '';
+/** A typed path stands in for the dialog: it must be an absolute directory that exists. `fileType` (a RegExp on the name) also lets a
+ *  file of that kind through (the model page takes a folder or one .gguf file). Quotes around the path (Windows "Copy as path") go. */
+export async function typedFolder(value, { isAbsolute, fileType = null }) {
+  let text = typeof value === 'string' ? value.trim() : '';
+  if (text.length > 1 && /^(["'])[\s\S]*\1$/.test(text)) text = text.slice(1, -1).trim();
   if (!text || text.includes('\0')) return null;
-  if (!isAbsolute(text)) throw new Error('Enter the full path of the folder.');
+  if (!isAbsolute(text)) throw new Error(fileType ? 'Enter the full path of the folder or the file.' : 'Enter the full path of the folder.');
   let info;
-  try { info = await stat(text); } catch { throw new Error('That folder does not exist.'); }
-  if (!info.isDirectory()) throw new Error('Choose a folder, not a file.');
+  try { info = await stat(text); } catch { throw new Error(fileType ? 'That folder or file does not exist.' : 'That folder does not exist.'); }
+  if (info.isFile() && fileType?.test(text)) return text;
+  if (!info.isDirectory()) throw new Error(fileType ? 'Choose a folder, or a .gguf file.' : 'Choose a folder, not a file.');
   return cleanChosenPath(text);
 }

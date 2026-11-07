@@ -580,7 +580,9 @@ class RunTests(StandardBase):
         self.server.script["performance-prompt-4k-r2"] = {"cached": spec["input_tokens_frozen"] - 10}
         # the shared template prefix alone is allowed
         self.server.script["performance-prompt-4k-r1"] = {"cached": 40}
-        doc, _ = self.run_standard()
+        # whatever the login of the machine running the test is: "user" is an ordinary word of the report, not a name here
+        with mock.patch.object(bench_facts.getpass, "getuser", return_value="no-such-login"):
+            doc, _ = self.run_standard()
         self.assertEqual(doc["run"]["status"], "nonconforming")
         row = self.summary(doc, "prompt-4k", "prompt_tps")
         self.assertEqual(row["n"], 2)
@@ -705,6 +707,24 @@ class RunTests(StandardBase):
         self.assertIn("Prompt tok/s", text)
         self.assertIn("1000.0 (1000.0-1000.0) n=3", text)
 
+    def test_the_summary_says_what_the_short_prompt_and_the_cap_mean(self):
+        doc, _ = self.run_standard()
+        for text in (bs.format_plain(doc), bs.report_markdown(doc)):
+            self.assertIn("Capped", text)
+            self.assertIn("not shown; read prompt speed from prompt-4k and prompt-16k", text)
+            self.assertIn("time to the cap, not to an answer", text)
+        short_row = next(line for line in bs.format_plain(doc).splitlines() if line.strip().startswith("short "))
+        self.assertIn("n/a", short_row)
+        self.assertNotIn("1000.0", short_row)
+        self.assertIn("0/3", short_row)
+        # the data keeps the short case's prompt rate: only the readable summaries leave it out
+        self.assertIsNotNone(self.summary(doc, "short", "prompt_tps"))
+        # a request that stopped at the cap is counted
+        record = next(r for r in doc["requests"] if r["id"] == "performance-prompt-4k-r1")
+        record["status"] = "truncated"
+        row = next(line for line in bs.format_plain(doc).splitlines() if line.strip().startswith("prompt-4k "))
+        self.assertTrue(row.rstrip().endswith("1/3"))
+
     def test_the_server_is_not_asked_for_anything_outside_the_protocol(self):
         self.run_standard()
         self.assertTrue(all(body["messages"] == corpus_specs()[rid]["messages"] for body, rid in zip(self.server.bodies, self.server.order)))
@@ -823,6 +843,55 @@ class CommandLineTests(StandardBase):
         self.assertIn("--track default", doc["run"]["command"])
         self.assertTrue(doc["run"]["command"].startswith("strata bench run"))
 
+    def test_results_json_is_redacted_like_the_other_files(self):
+        """#4484: free text from the operator reached results.json as typed while the README and the other files were redacted."""
+        out = self.root / "redacted"
+        home = str(Path.home())
+        notes = f"models in {home}/m, server 192.168.7.9"
+        code, _, errors = self.invoke("--url", self.server.url, "--out", str(out), "--track", "custom", "--track-notes", notes,
+                                      "--background", f"indexer in {home}/idx")
+        self.assertEqual(code, 0, errors)
+        for name in ("results.json", "README.md", "config.json", "outputs.jsonl"):
+            text = (out / name).read_text(encoding="utf-8")
+            self.assertNotIn(home, text, name)
+            self.assertNotIn(home.replace("\\", "\\\\"), text, name)       # the way JSON spells a Windows path
+            self.assertNotIn("192.168.7.9", text, name)
+        doc = bs.load(out)
+        self.assertRegex(doc["configuration"]["track_notes"], "<home>|<user>")
+        self.assertIn("<ip>", doc["configuration"]["track_notes"])
+        self.assertEqual(doc["request_counts"]["performance"]["planned"] > 0, True)       # counters are untouched
+
+    def test_a_login_that_is_an_ordinary_word_does_not_rewrite_the_reports_own_words(self):
+        """INT3 on l620, where the login is exactly "user": the report's fixed text (status reasons, enum values, field names) came out as
+        "<user>", while the operator's own text still loses the name."""
+        spec = corpus_specs()["performance-prompt-4k-r2"]
+        out = self.root / "wordlogin"
+        with mock.patch.object(bench_facts.getpass, "getuser", return_value="user"), \
+                mock.patch.object(bench_facts.socket, "gethostname", return_value="summaries"), \
+                mock.patch.object(bench_facts.platform, "node", return_value="summaries"):
+            self.server.script["performance-prompt-4k-r2"] = {"cached": spec["input_tokens_frozen"] - 10}
+            code, _, errors = self.invoke("--url", self.server.url, "--out", str(out), "--track", "custom",
+                                          "--track-notes", "ask the user at summaries time")
+        self.assertEqual(code, 6, errors)
+        doc = bs.load(out)
+        self.assertEqual(bs.validate(doc), [])
+        self.assertTrue(any("unexpected reuse of the user payload in performance-prompt-4k-r2" in r
+                            for r in doc["extensions"]["status_reasons"]), doc["extensions"]["status_reasons"])
+        self.assertEqual(doc["configuration"]["track_notes"], "ask the <user> at <host> time")
+        text = (out / "results.json").read_text(encoding="utf-8")
+        self.assertIn('"summaries"', text)                      # a field name that equals the host name stays a field name
+
+    def test_a_credential_of_none_is_no_key_and_the_word_is_left_alone(self):
+        """#4483: STRATA_KEY=none was sent as "Bearer none" and the word was replaced wherever it occurred."""
+        out = self.root / "nonekey"
+        code, _, errors = self.invoke("--url", self.server.url, "--out", str(out), "--credential-env", "STRATA_TEST_KEY",
+                                      "--track-notes", "nonempty reasoning, none of the nodes", env={"STRATA_TEST_KEY": " None "})
+        self.assertEqual(code, 0, errors)
+        doc = bs.load(out)
+        self.assertFalse(doc["extensions"]["api_key_sent"])
+        self.assertEqual(doc["configuration"]["track_notes"], "nonempty reasoning, none of the nodes")
+        self.assertNotIn("<key>", (out / "README.md").read_text(encoding="utf-8"))
+
     def test_report_reads_a_standard_result_in_three_forms(self):
         out = self.root / "rep"
         self.assertEqual(self.invoke("--url", self.server.url, "--out", str(out))[0], 0)
@@ -918,6 +987,97 @@ class EngineProcessTests(unittest.TestCase):
             else:
                 killpg.assert_called()
 
+    # #3438: the stop used to ignore taskkill's result and the wait timeout, so a stop that failed still ended as a normal finish
+    def _stuck_proc(self):
+        class Stuck:
+            pid = 777
+
+            def poll(self):
+                return None          # never exits
+
+            def wait(self, timeout=None):
+                raise bs.subprocess.TimeoutExpired("x", timeout)
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+        return Stuck()
+
+    def test_stop_engine_says_so_when_the_process_survives(self):
+        proc = self._stuck_proc()
+        done = bs.subprocess.CompletedProcess([], 1, b"", b"ERROR: Access is denied.")
+        with mock.patch("subprocess.run", return_value=done), mock.patch("os.killpg", create=True):
+            problem = bs.stop_engine(proc)
+        self.assertIsNotNone(problem)
+        self.assertIn("777", problem)
+        self.assertIn("still running", problem)
+        if os.name == "nt":
+            self.assertIn("taskkill", problem)
+            self.assertIn("Access is denied", problem)
+
+    @unittest.skipUnless(os.name == "nt", "taskkill is the Windows stop")
+    def test_stop_engine_reports_a_taskkill_that_times_out(self):
+        proc = self._stuck_proc()
+        with mock.patch("subprocess.run", side_effect=bs.subprocess.TimeoutExpired("taskkill", 60)):
+            problem = bs.stop_engine(proc)
+        self.assertIn("did not finish in 60 s", problem)
+
+    def test_stop_engine_is_quiet_when_the_process_ends(self):
+        class Ends:
+            pid = 5
+            alive = True
+
+            def poll(self):
+                return None if self.alive else 0
+
+            def wait(self, timeout=None):
+                self.alive = False
+                return 0
+
+            def terminate(self):
+                self.alive = False
+        proc = Ends()
+        done = bs.subprocess.CompletedProcess([], 0, b"", b"")
+
+        def kill(*args, **kwargs):
+            proc.alive = False
+            return done
+        with mock.patch("subprocess.run", side_effect=kill), mock.patch("os.killpg", create=True, side_effect=lambda *a: setattr(proc, "alive", False)):
+            self.assertIsNone(bs.stop_engine(proc))
+        self.assertIsNone(bs.stop_engine(None))
+        # a process that exited by itself needs no kill at all
+        gone = mock.Mock()
+        gone.poll.return_value = 0
+        self.assertIsNone(bs.stop_engine(gone))
+
+    def test_a_run_whose_engine_cannot_be_stopped_is_marked_failed_and_loud(self):
+        # cli: the run finished, the stop failed -> exit code 6, an ERROR line on stderr, a note in the folder, ok false in the json
+        plan = {"effective": {"host": "127.0.0.1", "port": 1}, "engine_argv": [], "config": {}}
+        fake_doc = {"run": {"status": "complete"}, "quality": {}, "summaries": []}
+        out_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, out_dir, True)
+        (out_dir / "results.json").write_text("{}", encoding="utf-8")
+        (out_dir / "README.md").write_text("x", encoding="utf-8")
+        with mock.patch("strata_cli.cli._source", return_value=(Path("p.json"), None, None, {})), \
+                mock.patch("strata_cli.cli._launch_plan", return_value=(plan, [])), \
+                mock.patch.object(bs, "start_engine", return_value=object()), \
+                mock.patch.object(bs, "run", return_value=(fake_doc, out_dir)), \
+                mock.patch.object(bs, "stop_engine", return_value="process 9 is still running 30 s after it was told to stop"), \
+                mock.patch("strata_cli.client.server_url", side_effect=lambda u: u):
+            err = io.StringIO()
+            out = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                try:
+                    code = main(["bench", "run", "--suite", "standard-v1", "--profile", "p.json", "--out", str(out_dir), "--output", "json"])
+                except SystemExit as stop:
+                    code = stop.code
+        self.assertEqual(code, 6)
+        self.assertIn("could not be stopped", err.getvalue())
+        self.assertIn("FAILED", err.getvalue())
+        self.assertTrue((out_dir / "ENGINE-NOT-STOPPED.txt").is_file())
+
     def test_an_engine_that_exits_before_it_is_ready_is_an_error(self):
         class Dead:
             pid = 1
@@ -966,6 +1126,125 @@ class RealServerTests(unittest.TestCase):
         self.assertIsNotNone(record["tokens"]["input_tokens"])
         self.assertIsNotNone(record["timings"]["ttft_s"])
         self.assertEqual(doc["run"]["status"], "nonconforming")          # no model file to hash, so the identity is incomplete
+
+
+class RealRunFindingsTests(StandardBase):
+    """What the first run on release engines (RTX 3060, 2x RTX A4000, 0.1.46) got wrong."""
+
+    LVM = {"blockdevices": [{"name": "ubuntu--vg-data", "type": "lvm", "rota": False, "model": None, "tran": None, "children": [
+        {"name": "nvme0n1p3", "type": "part", "rota": False, "model": None, "tran": "nvme", "children": [
+            {"name": "nvme0n1", "type": "disk", "rota": False, "model": "Lexar SSD NM620 512GB", "tran": "nvme"}]}]}]}
+
+    def test_the_drive_under_an_lvm_volume_is_found(self):
+        self.assertEqual(bench_facts.lsblk_disk(self.LVM), [{"kind": "nvme", "model": "Lexar SSD NM620 512GB", "bus": "nvme"}])
+
+    def test_a_partition_on_a_disk_and_a_missing_disk(self):
+        plain = {"blockdevices": [{"name": "sda1", "type": "part", "children": [
+            {"name": "sda", "type": "disk", "rota": True, "model": "Spinner", "tran": "sata"}]}]}
+        self.assertEqual(bench_facts.lsblk_disk(plain), [{"kind": "hdd", "model": "Spinner", "bus": "sata"}])
+        self.assertIsNone(bench_facts.lsblk_disk({"blockdevices": [{"name": "loop0", "type": "loop"}]}))
+
+    def test_the_runtime_is_the_one_the_engine_was_built_with(self):
+        engine = self.root / "engine"
+        engine.mkdir()
+        exe = engine / "strata"
+        exe.write_bytes(b"")
+        self.assertIsNone(bench_facts.engine_build_runtime(str(exe)))
+        (engine / "engine-component.json").write_text(json.dumps({"build_id": "a7bdbfdabc9a+cuda12.9"}), encoding="utf-8")
+        self.assertEqual(bench_facts.engine_build_runtime(str(exe)), {"name": "cuda", "version": "12.9"})
+        (engine / "engine-component.json").write_text(json.dumps({"build_id": "abc+hip6.4"}), encoding="utf-8")
+        self.assertEqual(bench_facts.engine_build_runtime(str(exe)), {"name": "rocm", "version": "6.4"})
+        why = bench_facts.Why()
+        block = bench_facts.software(why, {"driver": "580.1", "cuda": "13.0"}, engine_version="0.1.46", build_options=None,
+                                     engine_build={"name": "cuda", "version": "12.9"})
+        self.assertEqual(block["runtime"], [{"name": "cuda", "version": "12.9"}, {"name": "cuda-driver-supports", "version": "13.0"}])
+
+    def test_the_engine_log_comes_from_the_run_configs_log_file(self):
+        console = self.root / "engine.log"
+        console.write_bytes(b"")
+        run_log = self.root / "strata-model.log"
+        run_log.write_bytes(b"old line from an earlier start\n")
+        offset = run_log.stat().st_size
+        with run_log.open("ab") as stream:
+            stream.write(b"strata serve: expert cache 1500 slots\n")
+        kept = bs.engine_log_since(console, run_log, offset)
+        self.assertEqual(kept.read_bytes(), b"strata serve: expert cache 1500 slots\n")
+        self.assertEqual(bs.engine_log_since(console, None, 0), console)
+        self.assertEqual(bs.engine_log_since(console, self.root / "missing.log", 0), console)
+        self.assertEqual(bs.engine_log_since(console, run_log, run_log.stat().st_size), console)
+
+    def test_a_freshly_loaded_server_is_reported_as_fresh(self):
+        doc, out = self.run_standard()
+        doc["extensions"]["server_requests_before_run"] = 0
+        self.assertIn("freshly loaded engine", bs.report_markdown(doc))
+        self.assertNotIn("could not tell", bs.report_markdown(doc))
+        doc["extensions"]["server_requests_before_run"] = None
+        self.assertIn("could not tell", bs.report_markdown(doc))
+        doc["extensions"]["server_requests_before_run"] = 3
+        self.assertIn("answered 3 request(s)", bs.report_markdown(doc))
+
+
+class NvidiaBannerTests(unittest.TestCase):
+    def test_the_cuda_version_is_read_from_old_and_new_driver_banners(self):
+        query = "0, NVIDIA GeForce RTX 3060, 12288, 170.00, 615.71.09"
+        for banner, version in (("| NVIDIA-SMI 580.1  Driver Version: 580.1     CUDA Version: 13.0 |", "13.0"),
+                                ("| NVIDIA-SMI 615.71  KMD Version: 615.71.09     CUDA UMD Version: 13.4 |", "13.4")):
+            def fake(cmd, banner=banner):
+                return query if any(a.startswith("--query-gpu") for a in cmd) else banner
+            with mock.patch.object(bench_facts, "run_cmd", side_effect=fake):
+                cards, driver, cuda = bench_facts.nvidia_gpus()
+            self.assertEqual((driver, cuda), ("615.71.09", version))
+
+
+class ArchiveCommitTests(unittest.TestCase):
+    """The release archive carried no COMMIT file, so every run on it was nonconforming."""
+
+    ROOT = Path(__file__).resolve().parents[2]
+
+    def setUp(self):
+        import sys
+        sys.path.insert(0, str(self.ROOT / "packaging"))
+        import package_terminal
+        self.pt = package_terminal
+
+    def test_an_explicit_commit_or_the_variable_wins_over_git(self):
+        sha = "ab" * 20
+        self.assertEqual(self.pt.build_commit(sha.upper()), sha)
+        with mock.patch.dict(os.environ, {"STRATA_COMMIT": "cd" * 20}):
+            self.assertEqual(self.pt.build_commit(None), "cd" * 20)
+
+    def test_a_tree_copy_without_git_has_no_commit(self):
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(self.pt.subprocess, "run") as run:
+            os.environ.pop("STRATA_COMMIT", None)
+            run.return_value = mock.Mock(stdout="fatal: not a git repository\n")
+            self.assertIsNone(self.pt.build_commit("not a sha"))
+
+    def test_a_distributable_build_refuses_to_run_without_a_commit(self):
+        with tempfile.TemporaryDirectory() as out, mock.patch.object(self.pt, "build_commit", return_value=None), mock.patch("sys.argv", ["package_terminal.py", "--out", out]):
+            with self.assertRaises(SystemExit) as raised:
+                self.pt.main()
+        self.assertIn("COMMIT", str(raised.exception))
+
+
+class RedactorKeyTests(unittest.TestCase):
+    """#4483: the API key is replaced as a whole word in its own case; "none" is no key."""
+
+    def test_none_is_not_a_key(self):
+        for value in ("none", "None", " NONE ", "", None, "   "):
+            self.assertIsNone(bench_facts.usable_key(value), value)
+        self.assertEqual(bench_facts.usable_key(" sk-realkey "), "sk-realkey")
+        clean = bench_facts.redactor("none")
+        self.assertEqual(clean("nonempty, none, None"), "nonempty, none, None")
+
+    def test_the_key_is_replaced_as_a_word_in_its_case(self):
+        key = "a1b2c3d4"
+        clean = bench_facts.redactor(key)
+        self.assertEqual(clean(f"token={key} and {key}"), "token=<key> and <key>")
+        self.assertEqual(clean(f"sha {key}ff and {key.upper()}"), f"sha {key}ff and {key.upper()}")
+        self.assertEqual(clean("Authorization: Bearer abcdefgh12345"), "Authorization: Bearer <key>")
+
+    def test_a_short_key_is_still_removed_where_it_stands_alone(self):
+        self.assertEqual(bench_facts.redactor("pw12")("the password is pw12."), "the password is <key>.")
 
 
 if __name__ == "__main__":

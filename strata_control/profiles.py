@@ -17,6 +17,7 @@ import shlex
 import stat
 import subprocess
 import tempfile
+from strata_control import atomic as _atomic_mod
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -136,6 +137,9 @@ def read_run_config(path: Path) -> dict:
         cfg = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise ProfileError(f"cannot read run config ({type(exc).__name__})", 5) from None
+    if isinstance(cfg, dict):                                # paths into a version folder of Strata's own that an update removed: the current one
+        from strata_control import cfg_paths
+        cfg = cfg_paths.resolve_config(cfg)[0]
     if not isinstance(cfg, dict) or not isinstance(cfg.get("args"), list) or not all(
         isinstance(arg, str) for arg in cfg["args"]
     ):
@@ -216,7 +220,7 @@ def _atomic(path: Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temp_name, path)
+        _atomic_mod.replace(temp_name, path)
         if os.name != "nt":
             try:
                 parent_fd = os.open(path.parent, os.O_RDONLY)

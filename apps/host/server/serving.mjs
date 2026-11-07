@@ -2,7 +2,7 @@
 import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import { get as getStore, update } from './store.mjs';
-import { nowIso, round, uid } from './util.mjs';
+import { nowIso, round, sameSecret, uid } from './util.mjs';
 
 const requests = [];
 const MAX_REQUESTS = 60;
@@ -39,6 +39,8 @@ export function state() {
     revision,
     running,
     baseUrl: sharing.active ? sharing.url : baseUrl(),
+    // The address on this computer, the one the app's own port serves, kept apart from the sharing address (#4798).
+    localUrl: baseUrl(),
     sharing,
     tunnel,
     port,
@@ -70,7 +72,7 @@ export function patch(body) {
   const s = getStore();
   const serving = { ...(s.serving ?? {}) };
   if (typeof body.otherDevices === 'boolean' && body.otherDevices !== !isLocal()) throw new Error('Change the host listen address and restart to update network access.');
-  if (body.apiKey === null && (!isLocal() || sharing.active || tunnelActive())) throw new Error('Stop local sharing and Cloudflare before removing the API key.');
+  // The key is optional (owner decision, 0.2.2): removing it while sharing or the tunnel runs is allowed; the app warns in plain words (local-share.mjs, cloudflare.mjs).
   if (body.apiKey === null) serving.apiKey = null;
   else if (typeof body.apiKey === 'string' && body.apiKey.trim()) serving.apiKey = body.apiKey.trim();
   else if (body.generateKey) serving.apiKey = `sk-strata-${randomBytes(12).toString('hex')}`;
@@ -83,10 +85,13 @@ export function patch(body) {
 export function authorized(req) {
   const key = getStore().serving?.apiKey;
   if (!key) return true;
-  const header = req.headers.authorization ?? '';
-  const bearer = header.startsWith('Bearer ') ? header.slice(7) : '';
-  const alt = req.headers['x-api-key'];
-  return bearer === key || alt === key;
+  const header = req.headers?.authorization;
+  const bearer = typeof header === 'string' && header.startsWith('Bearer ') ? header.slice(7) : '';
+  const alt = req.headers?.['x-api-key'];
+  // #4535: constant time over fixed-length digests, and both headers are always compared so the time does not show which one was sent.
+  const viaBearer = sameSecret(bearer, key);
+  const viaHeader = sameSecret(alt, key);
+  return viaBearer || viaHeader;
 }
 
 export function open({ client, endpoint, tokensIn = null, model, instanceId, gpuIds, cancel }) {
@@ -149,7 +154,8 @@ export function cancel(id) {
 export function rateSample() {
   const done = requests.filter((r) => r.state === 'done' && r.tokensOut > 0);
   if (!done.length) return 0;
-  const tps = done.map((r) => r.tokensOut / Math.max(0.001, r.durationMs / 1000));
+  const tps = done.filter((r) => r.tps > 0).map((r) => r.tps);     // answer speeds (decode time), not tokens over the whole request
+  if (!tps.length) return 0;
   return round(tps.reduce((a, b) => a + b, 0) / tps.length, 1);
 }
 

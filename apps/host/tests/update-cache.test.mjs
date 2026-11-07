@@ -27,6 +27,14 @@ test('a check made for other versions is ignored, so an old "Update available" d
   assert.equal(readUpdateCache({ appVersion: '0.2.1', engineVersion: '0.1.45' }), null);
 });
 
+test('a new Control version, or a version that is not known yet, hides the old result', () => {
+  saveUpdateCache(result(), { appVersion: '0.2.0', engineVersion: '0.1.45', controlVersion: '0.1.45' });
+  assert.equal(readUpdateCache({ appVersion: '0.2.0', engineVersion: '0.1.45', controlVersion: '0.1.45' }).engine.status, 'available');
+  assert.equal(readUpdateCache({ appVersion: '0.2.0', engineVersion: '0.1.45', controlVersion: '0.1.46' }), null, 'Control changed');
+  assert.equal(readUpdateCache({ appVersion: null, engineVersion: '0.1.45', controlVersion: '0.1.45' }), null, 'app version still loading');
+  assert.equal(readUpdateCache({ appVersion: '0.2.0', engineVersion: '0.1.45' }), null, 'Control version not known');
+});
+
 test('unreadable or blocked storage is harmless', () => {
   store.set('strata.update-check.v1', '{not json');
   assert.equal(readUpdateCache({}), null);
@@ -45,7 +53,9 @@ test('opening the Engine and Update settings makes no update call: only a button
   assert.doesNotMatch(upd, /\/api\/updates\/check/);
   assert.equal(lib.match(/\/api\/updates\/check/g).length, 1, 'one place asks the host');
   // every caller of the check sits inside a function that only a click starts
-  for (const [name, text] of [['NativeOperations', ops], ['SettingsUpdates', upd]]) {
+  // Settings > Engine no longer checks or updates at all (it lists, switches and deletes installed engines); About does
+  assert.doesNotMatch(ops, /fetchUpdateCheck|checkForUpdates/, 'the Engine tab has no update check');
+  for (const [name, text] of [['SettingsUpdates', upd]]) {
     const body = text.replace(/async function (checkForUpdates|check)\(\) \{[\s\S]*?\n    \}\n/, '');
     assert.doesNotMatch(body, /fetchUpdateCheck\(/, `${name}: the check runs only inside the button handler`);
     assert.match(text, /void (checkForUpdates|check)\(\)/, `${name}: a button starts it`);

@@ -31,6 +31,10 @@
 #include <random>
 #include <string>
 #include <vector>
+#if defined(_MSC_VER)   // MSVC has no __builtin_popcount
+#include <intrin.h>
+#define __builtin_popcount(x) __popcnt((unsigned) (x))
+#endif
 
 using namespace strata::kernels::cpu;
 
@@ -303,7 +307,7 @@ int main(int argc, char** argv) {
         return rc;
     }
     // ggml type ids of the agention fork: 144 TQ2_T, 145 TQK6, 146 TQK7
-    if (GGML_TYPE_COUNT <= 146) { std::fprintf(stderr, "this ggml has no trellis types (build with STRATA_GGML_DIR = the agention fork)\n"); return 1; }
+    if (GGML_TYPE_COUNT <= 146) { std::fprintf(stderr, "this ggml has no trellis types (build with STRATA_GGML_DIR = the agention fork): skipped\n"); return 77; }   // 77: ctest SKIP_RETURN_CODE (#3358)
     rc |= synthetic(8, 8);       // Q8_0: the fold's convention, against the unrotated float expert
     rc |= synthetic(145, 146);   // Gyro-S
     rc |= synthetic(144, 144);   // Gyro-M

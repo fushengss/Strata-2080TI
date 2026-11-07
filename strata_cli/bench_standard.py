@@ -13,6 +13,7 @@ timings are saved without home folders, host names, private addresses or keys.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import json
@@ -682,26 +683,113 @@ def start_engine(ref: str, target: Target, log_path: Path, log, timeout_s: float
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(command, cwd=str(root), stdout=handle, stderr=subprocess.STDOUT, **kwargs)
     proc._strata_log = handle                              # closed by stop_engine
+    if os.name == "nt":
+        # Windows has no process group to signal: the engine tree is put in a job object this run owns, which ends every process in it in one call
+        # and cannot be refused for a single member (a per-process taskkill was "Access is denied" on a tree this very user started, #4260)
+        from serve import winjob
+        proc._strata_job = winjob.contain(proc)
     log("starting the engine (the model load is not part of the benchmark time) ...")
-    if not _start_wait(target, proc, timeout_s, log, log_path):
+    try:
+        ready = _start_wait(target, proc, timeout_s, log, log_path)
+    except BaseException:                                  # Ctrl+C (or a SIGTERM turned into one) while the model loads: the caller never gets `proc`, so end it here
         stop_engine(proc)
+        raise
+    if not ready:
+        stuck = stop_engine(proc)
         tail = ""
         try:
             tail = log_path.read_text(encoding="utf-8", errors="replace")[-600:]
         except OSError:
             pass
-        raise ProfileError("the engine did not become ready" + (": " + tail.strip().splitlines()[-1] if tail.strip() else ""), 6)
+        raise ProfileError("the engine did not become ready" + (": " + tail.strip().splitlines()[-1] if tail.strip() else "") +
+                           ("; and it could not be stopped (" + stuck + "): it may still hold the port" if stuck else ""), 6)
     return proc
 
 
-def stop_engine(proc) -> None:
-    """Stop only the process this run started."""
-    if proc is None:
+def engine_log_since(console_log: Path, run_log: Path | None, offset: int) -> Path:
+    """The log to keep with a result when the runner started the engine. `strata serve --quiet` prints nothing, so the
+    console capture is empty; the engine's own lines are in the run config's `log` file, from `offset` (its size before
+    the start). Falls back to the console capture when there is no such file or nothing new in it."""
+    try:
+        if run_log is not None and run_log.is_file() and run_log.stat().st_size > offset:
+            with run_log.open("rb") as stream:
+                stream.seek(offset)
+                data = stream.read()
+            if data.strip():
+                merged = console_log.with_name("engine-run.log")
+                merged.write_bytes(data)
+                return merged
+    except OSError:
+        pass
+    return console_log
+
+
+@contextlib.contextmanager
+def term_is_interrupt():
+    """While a run owns an engine it started, SIGTERM (and Ctrl+Break on Windows) end the run the way Ctrl+C does: the `finally` that stops the engine
+    runs. Without this a plain `kill` (a service stop, a script's timeout, the app's Stop) ended only the runner and left the server and the engine
+    holding the port and the GPU. Main thread only; the earlier handlers come back afterwards."""
+    import signal
+    if threading.current_thread() is not threading.main_thread():
+        yield
         return
+
+    def handler(signum, frame):
+        raise KeyboardInterrupt
+
+    saved = []
+    for name in ("SIGTERM", "SIGBREAK"):
+        number = getattr(signal, name, None)
+        if number is None:
+            continue
+        try:
+            saved.append((number, signal.signal(number, handler)))
+        except (ValueError, OSError):
+            pass
+    try:
+        yield
+    finally:
+        for number, old in saved:
+            try:
+                signal.signal(number, old)
+            except (ValueError, OSError, TypeError):
+                pass
+
+
+def stop_engine(proc) -> str | None:
+    """Stop only the process this run started. -> None when it is gone, else a plain sentence on why it may still be running
+    (a failed taskkill / signal, or a process that outlives the wait): the caller must not report a normal finish then, because
+    a process that is still alive can hold the server's port and the GPU (#3438)."""
+    if proc is None:
+        return None
+    problem = None
     try:
         if proc.poll() is None:
             if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=60)
+                # 1. the job this run put the engine in (ends the whole tree at once); 2. taskkill of the tree; 3. the process itself.
+                # The next step runs only when the one before left the process running, and a refusal is reported only if all of them fail.
+                if getattr(proc, "_strata_job", False):
+                    from serve import winjob
+                    winjob.terminate()
+                    try:
+                        proc.wait(10)
+                    except subprocess.TimeoutExpired:
+                        pass
+                if proc.poll() is None:
+                    try:
+                        done = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=60)
+                        if done.returncode != 0 and proc.poll() is None:
+                            said = (done.stderr or done.stdout or b"").decode("utf-8", errors="replace").strip()
+                            problem = f"taskkill for process {proc.pid} failed (exit {done.returncode}){': ' + said[:200] if said else ''}"
+                    except subprocess.TimeoutExpired:
+                        problem = f"taskkill for process {proc.pid} did not finish in 60 s"
+                    except OSError as error:
+                        problem = f"taskkill could not run for process {proc.pid}: {error}"
+                if proc.poll() is None:
+                    try:
+                        proc.kill()                          # this run's own child, by the handle it holds
+                    except OSError:
+                        pass
             else:
                 import signal
                 try:
@@ -719,10 +807,15 @@ def stop_engine(proc) -> None:
                 proc.wait(30)
             except subprocess.TimeoutExpired:
                 pass
+            if proc.poll() is None:
+                problem = (problem + "; " if problem else "") + f"process {proc.pid} is still running 30 s after it was told to stop"
+            else:
+                problem = None                               # it is gone: an earlier refusal that a later step got around is not news
     finally:
         handle = getattr(proc, "_strata_log", None)
         if handle is not None:
             handle.close()
+    return problem
 
 
 def slug(text: str, limit: int = 40) -> str:
@@ -732,7 +825,7 @@ def slug(text: str, limit: int = 40) -> str:
 
 def run(target: Target, out: Path | None, *, out_root: Path | None = None, optional_concurrency: bool = False,
         corpus: Corpus | None = None, declared: dict | None = None, plan: dict | None = None,
-        engine_log: Path | None = None, command: str = "strata bench run --suite standard-v1",
+        engine_log: Path | None = None, engine_run_log: tuple[Path | None, int] | None = None, command: str = "strata bench run --suite standard-v1",
         log=lambda message: None, timeout_s: float = REQUEST_TIMEOUT_S, started_engine: bool = False,
         hash_model: bool = True) -> tuple[dict, Path]:
     """Run the protocol against `target` and write the report into the new directory `out` (or a new folder named
@@ -780,7 +873,8 @@ def run(target: Target, out: Path | None, *, out_root: Path | None = None, optio
     hardware_block, machine_facts = facts.hardware(why, selected=selected, served_gpu=served_gpu, model_dir=model_dir,
                                                    declared_background=list(declared.get("background") or []))
     software_block = facts.software(why, machine_facts, engine_version=engine_version,
-                                    build_options=declared.get("build_options"))
+                                    build_options=declared.get("build_options"),
+                                    engine_build=facts.engine_build_runtime(plan.get("engine_exe")))
     model_block = facts.model(why, props=props, status=status, files=files, declared=declared, log=log)
     template_ref = {"path": "provenance/chat_template.jinja", "sha256": facts.sha256_text(template_text)} if template_text else None
     configuration_block, other_options = facts.configuration(
@@ -878,6 +972,8 @@ def run(target: Target, out: Path | None, *, out_root: Path | None = None, optio
                                       "source": "effective engine arguments of the profile" if options is not None
                                       else "the server was already running; its engine options are not exposed"}, redact)
     put("config", "config.json", (json.dumps(config_doc, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8"))
+    if engine_log is not None and engine_run_log is not None:
+        engine_log = engine_log_since(engine_log, *engine_run_log)
     if engine_log is not None and engine_log.is_file():
         text = engine_log.read_text(encoding="utf-8", errors="replace")[-2_000_000:]
         put("engine_log", "engine.log", redact(text).encode("utf-8"))
@@ -911,6 +1007,7 @@ def run(target: Target, out: Path | None, *, out_root: Path | None = None, optio
                        "request_checks": {rid: v for rid, v in extras.items()},
                        "optional_stage_skipped": skipped_optional,
                        "api_key_sent": bool(target.key)}}
+    doc = facts.redact_document(doc, redact)      # results.json gets what the README and the other files get (#4484)
     if doc["run"]["optional_duration_s"] is None:
         why.add("/run/optional_duration_s", "the optional concurrency stage was not selected" if not optional_concurrency
                 else "the optional concurrency stage did not run")
@@ -1055,14 +1152,32 @@ def _minutes(seconds: float | None) -> str:
     return f"{int(seconds // 60)} min {int(seconds % 60)} s"
 
 
+SHORT_PROMPT_NOTE = ("short is a prompt of about 80 tokens: its prompt rate is dominated by the fixed cost of a request, so it is not "
+                     "shown; read prompt speed from prompt-4k and prompt-16k")
+CAP_NOTE = ("Capped = requests that reached the 512-token cap, reasoning and answer together. A capped request's total time is the "
+            "time to the cap, not to an answer, and it has no first-answer time when it was still reasoning")
+
+
+def capped(doc: dict, phase: str, case: str) -> str:
+    """'k/n': how many of the case's measured requests stopped at the output cap."""
+    rows = [r for r in doc["requests"] if r["phase"] == phase and r["case_id"] == case]
+    return f"{sum(1 for r in rows if r['status'] == 'truncated')}/{len(rows)}"
+
+
+def prompt_cell(doc: dict, phase: str, case: str, digits: int = 1) -> str:
+    return "n/a" if case == "short" else _span(_find(doc, phase, case, "prompt_tps"), digits)
+
+
 def table_lines(doc: dict, phase: str, cases: tuple[str, ...]) -> list[str]:
-    head = ["Case", "Prompt tok/s", "Decode tok/s", "TTFT s", "Total s"]
+    head = ["Case", "Prompt tok/s", "Decode tok/s", "TTFT s", "Total s", "Capped"]
     rows = [head]
     for case in cases:
-        rows.append([case, _span(_find(doc, phase, case, "prompt_tps")), _span(_find(doc, phase, case, "decode_tps")),
-                     _span(_find(doc, phase, case, "ttft_s"), 2), _span(_find(doc, phase, case, "total_s"), 1)])
+        rows.append([case, prompt_cell(doc, phase, case), _span(_find(doc, phase, case, "decode_tps")),
+                     _span(_find(doc, phase, case, "ttft_s"), 2), _span(_find(doc, phase, case, "total_s"), 1),
+                     capped(doc, phase, case)])
     widths = [max(len(r[i]) for r in rows) for i in range(len(head))]
-    return ["  " + "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip() for row in rows]
+    return (["  " + "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip() for row in rows]
+            + ["  " + SHORT_PROMPT_NOTE + ".", "  " + CAP_NOTE + "."])
 
 
 def format_plain(doc: dict) -> str:
@@ -1146,12 +1261,13 @@ def report_markdown(doc: dict, redact=lambda text: text) -> str:
         "monotonic clock from dispatch to the first nonempty reasoning, answer or tool-call delta. No request was retried. "
         f"Time after the model loaded: {_minutes(run_block['required_duration_s'])}.", "",
         "## Results", ""]
-    lines += ["| Case | Prompt tok/s | Decode tok/s | TTFT s | First answer s | Total s |", "| --- | --- | --- | --- | --- | --- |"]
+    lines += ["| Case | Prompt tok/s | Decode tok/s | TTFT s | First answer s | Total s | Capped |", "| --- | --- | --- | --- | --- | --- | --- |"]
     for case in PERFORMANCE_CASES:
-        lines.append(f"| {case} | " + " | ".join(
-            _span(_find(doc, "performance", case, m), d) for m, d in (("prompt_tps", 1), ("decode_tps", 1), ("ttft_s", 2),
-                                                                      ("first_answer_s", 2), ("total_s", 1))) + " |")
-    lines += ["", "Cells are median (min-max) n=samples.", "",
+        lines.append(f"| {case} | " + prompt_cell(doc, "performance", case) + " | " + " | ".join(
+            _span(_find(doc, "performance", case, m), d) for m, d in (("decode_tps", 1), ("ttft_s", 2),
+                                                                      ("first_answer_s", 2), ("total_s", 1)))
+            + f" | {capped(doc, 'performance', case)} |")
+    lines += ["", "Cells are median (min-max) n=samples. " + SHORT_PROMPT_NOTE[0].upper() + SHORT_PROMPT_NOTE[1:] + ". " + CAP_NOTE + ".", "",
               "| Phase | Planned | Completed | Truncated | Failed | Skipped |", "| --- | ---: | ---: | ---: | ---: | ---: |"]
     for phase in PHASES:
         c = counts[phase]
@@ -1177,7 +1293,9 @@ def report_markdown(doc: dict, redact=lambda text: text) -> str:
               "the quantization repository's revision; see `missing` in results.json for every value it could not read.",
               f"- The server had answered {doc['extensions']['server_requests_before_run']} request(s) before this run."
               if doc["extensions"]["server_requests_before_run"] else
-              "- The runner could not tell whether the server was freshly loaded.", ""]
+              ("- The server had answered no request before this run (a freshly loaded engine)."
+               if doc["extensions"]["server_requests_before_run"] == 0 else
+               "- The runner could not tell whether the server was freshly loaded."), ""]
     return redact("\n".join(lines))
 
 

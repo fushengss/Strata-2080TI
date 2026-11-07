@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Protocol
 
-from strata_control import tune_machine
+from strata_control import loopback, tune_machine
 
 # --------------------------------------------------------------------------- the contract
 
@@ -126,15 +126,37 @@ def parse_facts(text: str) -> dict[str, Any]:
     return facts
 
 
+_CUDA_BUSY = re.compile(r"failed to initialize cuda|no cuda-capable device|cuda-capable device\(s\) is/are busy|"
+                        r"cuda driver version is insufficient|hipinit.{0,40}(?:fail|error)|no hip-capable device", re.I)
+
+
+_NATIVE_ERROR = re.compile(r"out of memory|cuda(?:malloc|error)|hip(?:malloc|error)|cublas|ze_result|std::bad_alloc|terminate called|assert|abort|"
+                           r"segmentation|fatal|failed|error", re.I)
+_NATIVE_OOM = re.compile(r"out of memory|cudamalloc|hipmalloc|bad_alloc|cannot allocate", re.I)
+
+
+def native_failure(text: str) -> str:
+    """The engine's own last error line(s) from its log (the first native failure is what a person needs; a generic 503 from the worker hides it, #5078).
+    The engine's informational `memory guard: limit ... available ...` line is not an error. Empty when the log says nothing."""
+    lines = [ln.strip() for ln in text.splitlines()
+             if _NATIVE_ERROR.search(ln) and not re.search(r"memory guard: (?:limit|the available)", ln, re.I)]
+    return " | ".join(lines[-2:])[:300]
+
+
 def failure_kind(text: str, returncode: int | None) -> tuple[str, str]:
-    """Classify an engine that ended before it was ready: (status, one plain line)."""
+    """Classify an engine that ended before it was ready: (status, one plain line). The engine's informational
+    `memory guard: limit ... available ...` line is not a failure and never decides the status (#3502)."""
     low = text.lower()
-    lines = [ln.strip() for ln in text.splitlines() if re.search(
-        r"unknown argument|unrecognized|invalid value|out of memory|memory guard|cannot|failed|error|refus|killed", ln, re.I)]
+    lines = [ln.strip() for ln in text.splitlines()
+             if re.search(r"unknown argument|unrecognized|invalid value|out of memory|cannot|failed|error|refus|killed", ln, re.I)
+             and not re.search(r"memory guard: (?:limit|the available)", ln, re.I)]
     reason = " | ".join(lines[:3])[:300]
     if re.search(r"unknown argument|unrecognized (argument|option)", low):
         return "UNSUPPORTED", reason or "the engine does not accept one of the settings"
-    if re.search(r"out of memory|memory guard|cannot allocate|std::bad_alloc|\boom\b|(?:^|\n)killed(?:\r?\n|$)", low) or returncode in (-9, 137, 3221226505):
+    if _CUDA_BUSY.search(text):
+        return "FAIL_BOOT", ("the graphics card could not be opened by the measuring engine; it is probably in use by the "
+                             "loaded model. Unload the model and tune again (" + reason + ")")[:400]
+    if re.search(r"out of memory|memory guard: (?:refus|not enough|too)|cannot allocate|std::bad_alloc|\boom\b|(?:^|\n)killed(?:\r?\n|$)", low) or returncode in (-9, 137, 3221226505):
         return "OOM", reason or "the engine ran out of memory"
     return "FAIL_BOOT", reason or f"the engine stopped while starting (exit {returncode})"
 
@@ -304,7 +326,7 @@ class WorkerEngine:
     def _model_id(self) -> None:
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/models", headers=self._h())
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with loopback.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read())
             self.model = ((data.get("data") or [{}])[0]).get("id") or self.model
         except Exception:  # noqa: BLE001
@@ -326,10 +348,18 @@ class WorkerEngine:
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions",
                                      data=json.dumps(body).encode(), headers=self._h(), method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with loopback.urlopen(req, timeout=timeout) as r:
                 data = json.loads(r.read())
         except urllib.error.HTTPError as e:
-            raise StartFailed("NO_TOKENS", f"the worker refused the request ({e.code}): {e.read()[:200]!r}") from None
+            reason = f"the worker refused the request ({e.code}): {e.read()[:200]!r}"
+            status = "NO_TOKENS"
+            if e.code >= 500:                    # the engine stopped under this request: its own last error line is the cause, and an allocation failure is an OOM (#5078)
+                native = native_failure(self.log_text()[-8000:])
+                if native:
+                    reason += f" | engine: {native}"
+                    if _NATIVE_OOM.search(native):
+                        status = "OOM"
+            raise StartFailed(status, reason) from None
         except (urllib.error.URLError, OSError, ValueError) as e:
             code = self.proc.poll()
             status, why = failure_kind(self.log_text()[-4000:], code) if code is not None else ("TIMEOUT", str(e))
@@ -459,6 +489,7 @@ class WorkerSession:
             cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
             spawn_env = dict(os.environ)
             spawn_env.update(self.extra_env)
+            spawn_env.pop("STRATA_API_KEY", None)        # the server reads this variable before the config's "api_key": the worker answers only to the key made for it (#5056)
             for k, v in env.items():
                 if v is None:
                     spawn_env.pop(k, None)
@@ -488,7 +519,7 @@ class WorkerSession:
                     try:
                         req = urllib.request.Request(f"http://127.0.0.1:{port}/health",
                                                      headers={"authorization": f"Bearer {key}"})
-                        with urllib.request.urlopen(req, timeout=2) as r:
+                        with loopback.urlopen(req, timeout=2) as r:
                             if r.status == 200:
                                 ready = True
                                 break

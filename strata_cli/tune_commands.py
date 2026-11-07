@@ -4,12 +4,15 @@ and a status file, for the desktop app. The same code and the same store serve b
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
 import time
+from strata_control import atomic as _atomic_mod
 from pathlib import Path
 from typing import Any
 
@@ -151,7 +154,7 @@ def _write_status(path: str | None, payload: dict[str, Any]) -> None:
     try:
         tmp = path + ".tmp"
         Path(tmp).write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
-        os.replace(tmp, path)
+        _atomic_mod.replace(tmp, path)
     except OSError:
         pass
 
@@ -214,6 +217,8 @@ def auto(a: argparse.Namespace) -> int:
         say(f"[{p.get('elapsed_s', 0) // 60:>3d}m] {p['message']}" + (f"  ({minutes_text(p['eta_s'])})" if p.get("eta_s") else ""))
 
     workdir = Path(a.work_dir) if a.work_dir else Path(tempfile.mkdtemp(prefix="strata-tune-"))
+    if not a.work_dir:
+        atexit.register(shutil.rmtree, workdir, True)       # its own scratch folder goes with the run (--work-dir keeps the logs)
     session = WorkerSession(base_config=cfg, python=sys.executable, serve_dir=_serve_dir(a), workdir=workdir,
                             boot_timeout_s=a.boot_timeout, lock=_lock_factory(a, say), log=say)
     base_args = [str(x) for x in cfg.get("args") or []]
@@ -371,7 +376,8 @@ def _effective(a: argparse.Namespace, machine: bool) -> int:
         if was != now:
             changed.append({"flag": flag, "was": was, "now": now})
     payload = {"applied": bool(info.get("applied")), "preset": info.get("preset"), "state": info.get("state"), "reasons": info.get("reasons", []),
-               "why_not": info.get("why_not"), "notice": info.get("notice"), "args": merged.get("args"), "env": merged.get("env") or {},
+               "why_not": info.get("why_not"), "warnings": info.get("warnings") or [], "notice": info.get("notice"),
+               "args": merged.get("args"), "env": merged.get("env") or {},
                "sampling": merged.get("sampling") or {}, "changed": changed, "per_request": info.get("per_request") or {}}
     human = (f"Using your tuning '{info['preset']['name']}'" if info.get("applied") else "No saved tuning is applied; the standard settings run.")
     return _print(payload, machine, human)
@@ -424,6 +430,8 @@ def _recheck(a: argparse.Namespace, machine: bool) -> int:
                                        engine_flags=tuning.engine_flag_inventory(Path(exe)))
     say = (lambda s: None) if machine else (lambda s: print(s, file=sys.stderr, flush=True))
     workdir = Path(a.work_dir) if a.work_dir else Path(tempfile.mkdtemp(prefix="strata-recheck-"))
+    if not a.work_dir:
+        atexit.register(shutil.rmtree, workdir, True)       # its own scratch folder goes with the run (--work-dir keeps the logs)
     session = WorkerSession(base_config=cfg, python=sys.executable, serve_dir=_serve_dir(a), workdir=workdir,
                             boot_timeout_s=a.boot_timeout, lock=_lock_factory(a, say), log=say)
     state: dict[str, Any] = {"state": "running"}
