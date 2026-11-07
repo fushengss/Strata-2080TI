@@ -47,17 +47,17 @@ chunk rounding and lead-in history at early exits. It does not test CUDA schedul
 ## Bound native generation at a known thinking budget
 
 `reasoning_budget_engine_cap` is a separate, default-off server option. It does not enable the prompt-read policy
-above or change the batch/piped MTP switches. As of 2026-11-07, its CPU tests pass; the independent GPU candidate is
-running budget-specific checks, prefill checks and concurrency comparisons with the option enabled in both arms.
-Those GPU checks are not yet complete, and this option has not been deployed to the normal service. The frozen
-candidate `serve/server.py` SHA256 is `40c5e9dfc96ab208b6514bd2f5f48986afb3e01b3927f873cff8d358d62528c9`.
+above or change the batch/piped MTP switches. As of 2026-11-07, its CPU tests and the GPU budget-boundary checks below
+have passed. The concurrency comparisons enabled this option in both arms. It has not been deployed to the normal
+service. The frozen candidate `serve/server.py` SHA256 is
+`40c5e9dfc96ab208b6514bd2f5f48986afb3e01b3927f873cff8d358d62528c9`.
 
 The triggering observation was a thinking-budget continuation during sampled C4: two requests with batch MTP
 enabled reused only their initial 8793-token prompt and read 1554 tokens again. The control reused 10329 tokens and
 read 18. Reasoning text hashes matched; those two answer text hashes differed. Speculative tokens emitted before
 the frontend's asynchronous `BSTOP` can leave the slot beyond the prefix that the frontend retains. The next
 prompt inserts a thinking wrap-up at that earlier boundary, so the longer recurrent state cannot simply be
-truncated. This is the motivating diagnosis, not proof that the candidate fixes GPU output or latency.
+truncated. The GPU checks below exercise this observed boundary with fixed synthetic requests.
 
 Enable it in the run config for a new server process:
 
@@ -122,3 +122,71 @@ repository dependency files were changed. The resolved environment was Python 3.
 path. The existing-regression log is `/tmp/strata-reasoning-budget-regression.log` (74 tests, 27.826 seconds).
 The independent new-suite runtime was 0.402 seconds. For a fresh machine, prepare those dependency versions before
 using `--offline`, or use the interpreter of an existing environment containing them.
+
+## GPU comparisons on eight RTX 2080 Ti cards
+
+These 2026-11-07 measurements used Qwen3.8-Flash-Next-Uncensored Q5_K_M on eight RTX 2080 Ti cards, six layers per
+card, eight slots and eight pipeline groups. All experts remained resident, and each card retained its original
+3.80 GiB prompt buffers. Main-head shards stayed on GPUs 2/4 and the solo MTP-head shards on GPUs 3/5. These are
+isolated synthetic tests, with one sequential off/on pair per comparison; they do not establish a production tail
+latency guarantee. The prompt-read guard described above remains unmeasured and undeployed.
+
+The v4 budget comparison used engine SHA256
+`113a4ea9bf2101a9ad9a3449ae611f8a21f892cc62293fa9a779d302dc2df96f` and the server candidate identified above.
+Both arms had `reasoning_budget_engine_cap=true`. The on arm enabled `STRATA_BATCH_MTP=1` and `STRATA_PIPED_MTP=1`
+and disabled `STRATA_BATCH_SELF_COMMIT`; the off arm used 0, 0 and 1 respectively. All three values are part of the
+tested piped route.
+
+Nine complete budget-specific requests had identical output/reasoning hashes and complete usage across arms.
+The cancelled stream passed a shared-prefix comparison and the subsequent recovery matched; its full output
+length and hash were not required to match. All four budget continuations in both arms read 19 tokens. In the C4
+performance workload, each thinking continuation reused 10328 tokens and read 19; none repeated the earlier
+1554-token read. All six performance requests had identical complete output/channel hashes and usage.
+
+| Batch/piped MTP comparison | Off | On | Throughput change |
+|---|---:|---:|---:|
+| C4, 8320 completed API tokens | 82.044 s / 101.409 tokens/s | 78.936 s / 105.402 tokens/s | +3.94% |
+| C8, 8192 completed API tokens | 33.495 s / 244.572 tokens/s | 30.497 s / 268.619 tokens/s | +9.83% |
+
+C4 used four 8793-token resident requests and two cold joins of 8793 and 52080 tokens. C8 used eight short prompts
+of 66 or 68 tokens, four sampled and four greedy, with thinking disabled and 1024 output tokens each. Its eight full
+outputs and usage also matched. These API rates include admission, prefill and final drain; they are not pure
+decode rates, and neither workload measures four simultaneous 100K contexts.
+
+The C4 mixed-read stall remained: maximum nonempty SSE gap was 10.111 s off and 10.527 s on; p99 was 5.778 s and
+6.120 s. The sampled fraction of the mixed phase with at least one resident silent for more than one second rose
+from 69.5% to 72.3%. Improved whole-run throughput therefore did not resolve the long prompt-read pause. SSE gaps
+include reasoning, content and tool deltas; no per-token timestamps were collected, so these are not token TBT.
+
+The v4 solo prefill guard had three cold and three warm pairs, each with 101139 prompt tokens and 256 output tokens.
+All six request/output hashes and usage matched. Cold cached tokens were zero; warm requests reused 101132 tokens
+and read seven. Cold read-time median was 16491 ms off versus 16433 ms on; warm was 2225 ms versus 2181 ms. There was
+no median regression in this sample, but three observations do not establish a stable prefill guarantee.
+
+The subsequent shared piped-slot head candidate used engine SHA256
+`c9305b08b24e6ff85e363147063827760c54c8243eeec6b2362587159cda5ca6`. Both arms kept batch/piped MTP and the budget cap
+enabled; only `STRATA_PIPED_MTP_HEAD` changed from 0 to 1. The on arm used one shared read-only weight bank on GPUs
+3/5 with eight independent workspaces sourced from GPU 7. Actual process, mapped library, frozen scripts, full
+residency and original prompt-buffer allocation were checked in both arms.
+
+| Shared piped-slot head comparison | Off | On | Change |
+|---|---:|---:|---:|
+| C8 complete API throughput | 248.752 tokens/s | 264.296 tokens/s | +6.25% |
+| C4 complete API throughput | 106.426 tokens/s | 106.153 tokens/s | -0.26% |
+| Cold 100K read-time median | 16012 ms | 16294 ms | +1.76% |
+| Warm 100K read-time median | 2186 ms | 2056 ms | -5.95% |
+
+The head candidate passed the same nine complete budget requests plus cancellation-prefix check, six prefill
+pairs, eight C8 requests and six C4 requests, with full output and usage agreement. The on-arm logs recorded 2097,
+4672 and 5219 head steps for the budget, C8 and C4 suites respectively, and zero during solo prefill. C4 maximum
+mixed gap remained 10.433 versus 10.441 s. The cold prefill median increased in this pair; further repetitions are
+required before accepting a prefill-preservation claim or deploying this option.
+With the new head disabled, its fixed-request outputs and usage also matched the older v4/v5 MTP-on engine; suite
+order differed, so that compatibility check makes no cross-run performance comparison.
+
+Reproducible local records are under
+`bench/results/2026-11-07-8x2080ti-q5-100k/concurrency-stability/` in the benchmark checkout:
+`budget-v4-analysis/` and `budget-v4-c4-sampled/` for v4, `c8-v5/` for the eight-stream batch comparison, and
+`head-pilot-analysis/` plus `head-pilot/` for the shared-head pilot. The analysis directories include input SHA256
+manifests and per-request checks. None of these candidate switches has been deployed to the normal service as of
+this report. Long-context concurrency and additional prefill/head repetitions remain separate deployment gates.
