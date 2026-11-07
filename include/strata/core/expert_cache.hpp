@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -132,8 +133,17 @@ public:
     /// The guard the open slots were laid out with: what `open_sized` applied (0 for uniform slots, when closed, and
     /// on SYCL, whose open_sized applies none).
     int64_t slot_guard() const { return guard_; }
-    /// A sized slot's arena bytes: the blob plus the guard, 256-byte aligned.
-    static int64_t slot_stride(int64_t blob, int64_t guard = 0) { return (blob + guard + 255) / 256 * 256; }
+    /// A sized slot's arena bytes: the blob plus the guard, 256-byte aligned.  STRATA_SLOT_ALIGN=N (a multiple of 256,
+    /// read once) rounds to N instead: STRATA_PREFILL_ZC reads a K-quant expert in its slot only when the slot stride is a
+    /// whole number of the type's blocks (Q5_K 176 B, Q5_1 24 B, Q6_K 210 B per 256 values), 8448 B for Q5_K / Q5_1.
+    static int64_t slot_stride(int64_t blob, int64_t guard = 0) {
+        static const int64_t align = [] {
+            const char* v = std::getenv("STRATA_SLOT_ALIGN");
+            const int64_t n = v != nullptr ? (int64_t) std::atoll(v) : 0;
+            return n >= 256 && n % 256 == 0 ? n : (int64_t) 256;
+        }();
+        return (blob + guard + align - 1) / align * align;
+    }
     bool segmented() const { return !segs_.empty(); }
     int64_t segment_bytes() const { return seg_; }
     /// Bytes of the arena backed by VRAM now (a whole number of segments; the arena when not segmented).
