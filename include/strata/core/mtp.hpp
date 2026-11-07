@@ -20,6 +20,7 @@
 #pragma once
 
 #include "strata/core/layer.hpp"
+#include "strata/core/mtp_head.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -177,6 +178,13 @@ public:
     void set_source_R(const float* rows) { src_R_ = rows; }
     /// Capture the round graphs for T = 1..max_t and every step graph now (a capture syncs the drafter's stream).
     bool prepare_chain(std::string& err);
+    /// Opt-in solo PW2 draft-head row sharding. Call after bind and before prepare_chain, with no work in flight.
+    /// Only plain Q6_K subset rows are supported; unsupported layouts return a clear error. The caller enables
+    /// this per request only for supported greedy solo PW2 work. Ordinary draft/prefill/batch graphs stay intact.
+    bool prepare_head_shards(int target0, int target1, std::string& err);
+    void set_head_shards_active(bool on) { head_shards_active_ = on && head_shards_.initialized(); }
+    bool head_shards_enabled() const { return head_shards_.initialized(); }
+    uint64_t head_shard_steps() const { return head_shard_steps_; }
     /// The catch-up over T cells from `p` (as draft()), then `n_out` outputs from row `a`: output j is the chain's
     /// own pick, and step j (1 <= j <= n_force) takes force[j - 1] as its input token instead of output j - 1.
     /// `n_early`: an event after each of the first `n_early` outputs (chain_outputs_ready).
@@ -229,7 +237,7 @@ public:
     }
 
 private:
-    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
+    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, bool head_body_only = false);
     /// False (with `err`) while the experts are lent to a prompt: the prompt path's ring is pointed at their bytes
     /// (STRATA_MTP_ROOM_MIN), so a decode pass would read the prompt's staged blobs as experts.  Every decode entry
     /// checks this before it launches anything.
@@ -242,12 +250,14 @@ private:
     bool record_front(int T, int row0, cudaStream_t cs, std::string& err);
     /// The rest for row 0 at step row `step_row`: the attention from the q projection, the MLP, the final mixer,
     /// the head, the draft and its probability.  Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
-    bool record_rest(int step_row, cudaStream_t cs, std::string& err);
+    bool record_rest(int step_row, cudaStream_t cs, std::string& err, bool head_body_only = false);
+    bool record_head_pick(int step_row, cudaStream_t cs, std::string& err);
     void norm_rope(float* data, const float* gamma, int rows, int cols, const int32_t* p, cudaStream_t cs);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
-    bool capture_round(int T, bool coupled, std::string& err);
-    bool capture_step(int j, bool coupled, std::string& err);
+    bool capture_round(int T, bool coupled, std::string& err, bool head_body_only = false);
+    bool capture_step(int j, bool coupled, std::string& err, bool head_body_only = false);
+    bool capture_head_tail(int j, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
@@ -291,6 +301,10 @@ private:
     // --pipeline-windows 2 (chain_launch)
     bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
     bool force_on_ = false, chain_live_ = false;
+    MtpHeadShards head_shards_;
+    bool head_shards_active_ = false;
+    uint64_t head_shard_steps_ = 0;
+    cudaGraphExec_t head_round_body_[9] = {}, head_step_body_[9] = {}, head_tail_[9] = {};
     const float* src_R_ = nullptr;
     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
     cudaEvent_t ev_chain_ = nullptr;

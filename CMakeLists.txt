@@ -708,7 +708,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/remote_expert_opt.cu
-    src/core/expert_cache.cpp src/core/native_head.cpp src/core/decode_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
+    src/core/expert_cache.cpp src/core/native_head.cpp src/core/decode_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/mtp_head.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -717,6 +717,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # Manual integration test: two GPUs and --gguf are required; do not run it implicitly in CTest.
     add_executable(decode_head_test tests/core/decode_head_test.cpp)
     target_link_libraries(decode_head_test PRIVATE strata_engine Threads::Threads)
+    add_executable(mtp_head_test tests/core/mtp_head_test.cpp)
+    target_link_libraries(mtp_head_test PRIVATE strata_engine Threads::Threads)
+    add_executable(local_tp_bench tests/core/local_tp_bench.cu)
+    target_link_libraries(local_tp_bench PRIVATE strata_engine Threads::Threads)
     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
     target_include_directories(host_graph_launch_test PRIVATE include)
     target_link_libraries(host_graph_launch_test PRIVATE CUDA::cudart Threads::Threads)
