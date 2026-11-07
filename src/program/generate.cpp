@@ -11761,6 +11761,14 @@ int main(int argc, char** argv) {
         // drafter and every normal graph retain their placement. Unset/-1 keeps the original engine path.
         int decode_head_device = -1;
         std::vector<int> decode_head_devices;
+        const bool piped_target_head = [] {
+            const char* v = std::getenv("STRATA_PIPED_TARGET_HEAD");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (piped_target_head && (!piped_mtp || !batch_mtp || batch_df2 || o.batch_groups <= 1)) {
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_TARGET_HEAD requires deferred-commit piped MTP batches\n");
+            return 1;
+        }
         if (const char* v = std::getenv("STRATA_DECODE_HEAD_GPU"); v != nullptr && v[0] != '\0' && std::strcmp(v, "-1") != 0) {
             const char* at = v;
             while (*at) {
@@ -11808,6 +11816,22 @@ int main(int argc, char** argv) {
                          second ? (std::string("+") + std::to_string(decode_head_devices[1])).c_str() : "",
                          (unsigned long long) (decode_head_owner.head[0].weight_bytes() >> 20),
                          second ? " (two vocabulary shards, greedy only)" : " only");
+        }
+        if (piped_target_head) {
+            if (decode_head_devices.empty()) {
+                std::fprintf(stderr, "strata serve: STRATA_PIPED_TARGET_HEAD needs the existing STRATA_DECODE_HEAD_GPU bank\n");
+                return 1;
+            }
+            const auto* second = decode_head_devices.size() == 2 ? &decode_head_owner.head[1] : nullptr;
+            if (!stage_ver_p(n_stages - 1, 0).set_piped_target_head(decode_head_owner.head[0], err, second)) {
+                std::fprintf(stderr, "strata serve: piped target head: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_TARGET_HEAD: CUDA%d%s, source CUDA%d, "
+                                 "full logits return before original slot sampling; prefill placement unchanged\n",
+                         decode_head_device,
+                         second ? (std::string("+") + std::to_string(decode_head_devices[1])).c_str() : "",
+                         stage_ver_p(n_stages - 1, 0).device());
         }
         // Keep the drafter's body/KV and prefill in place. Only explicitly selected solo PW2 chains may
         // use these two vocabulary shards, and their full logits return before the original probability tail.
@@ -14778,6 +14802,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP_HEAD requires the deferred-commit piped route\n");
             return 1;
         }
+        if (piped_target_head && !pmtp) {
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_TARGET_HEAD requires the deferred-commit piped route\n");
+            return 1;
+        }
+        uint64_t target_head_reported_windows = 0, target_head_reported_rows = 0;
         std::vector<uint64_t> pmtp_head_reported(piped_mtp_head ? slot_mtp.size() : 0, 0);
         if (piped && batch_mtp && !pmtp)   // #1413: said, not silent
             std::fprintf(stderr,
@@ -15240,6 +15269,17 @@ int main(int argc, char** argv) {
                 if (pmtp)
                     std::fprintf(stderr, " (%lld of %lld MTP proposals kept)", (long long) bt_accepted, (long long) bt_tokens);
                 std::fprintf(stderr, "\n");
+                if (piped_target_head) {
+                    const auto& last = stage_verifier(n_pipe - 1);
+                    const uint64_t windows = last.piped_target_head_windows(), rows = last.piped_target_head_rows();
+                    std::fprintf(stderr, "strata piped target head: CUDA%d%s, %llu windows, %llu verification rows offloaded in this batch\n",
+                                 decode_head_device,
+                                 decode_head_devices.size() == 2 ? (std::string("+") + std::to_string(decode_head_devices[1])).c_str() : "",
+                                 (unsigned long long) (windows - target_head_reported_windows),
+                                 (unsigned long long) (rows - target_head_reported_rows));
+                    target_head_reported_windows = windows;
+                    target_head_reported_rows = rows;
+                }
                 if (piped_mtp_head) {
                     for (size_t b = 0; b < slot_mtp.size(); ++b) {
                         const uint64_t steps = slot_mtp[b]->head_shard_steps();

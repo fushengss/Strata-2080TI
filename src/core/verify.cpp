@@ -713,6 +713,10 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamSynchronize(cs_);
     decode_head_.reset();
     decode_head_second_.reset();
+    piped_target_head_.reset();
+    piped_target_head_second_.reset();
+    for (auto graph : target_head_tail_) if (graph) cudaGraphExecDestroy(graph);
+    if (target_head_ready_) cudaEventDestroy(target_head_ready_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     for (auto& row : exec_)
         for (auto& e : row)
@@ -2615,11 +2619,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
                 if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
-                if (record_decode_head_) {
+                if (record_decode_head_ || record_piped_target_head_) {
                     // Keep the final mixer's exact Q8_1 image. Each chunk has its own portable staging rows;
                     // xq_ is reused by the next chunk, so publish it here before proceeding.
                     const size_t row_bytes = strata::kernels::native_q8_1_bytes((int) N, 1);
-                    for (auto* window : {decode_head_.get(), decode_head_second_.get()}) {
+                    auto* first = record_piped_target_head_ ? piped_target_head_.get() : decode_head_.get();
+                    auto* second = record_piped_target_head_ ? piped_target_head_second_.get() : decode_head_second_.get();
+                    for (auto* window : {first, second}) {
                         if (!window) continue;
                         auto* dst = static_cast<unsigned char*>(window->handoff()) + (size_t) h0 * row_bytes;
                         copy_from_mapped(reinterpret_cast<float*>(dst), reinterpret_cast<const float*>(xq_),
@@ -2642,22 +2648,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
-        if (!record_decode_head_) {
-        if (argmax_rows_wanted()) {   // sm_80 to sm_89 (sm_7x opt-in): the pick over many blocks a row (bitwise the one-block kernel's)
-            argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
-        } else {
-            SamplerParams sp;
-            sp.greedy = true;
-            sp.temperature = 0.0f;
-            sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
-        }
-        // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
-        if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
-        }
+        if (!record_decode_head_ && !record_piped_target_head_) record_head_pick(T, cs);
     }
     stamp(g.n_layers, 1, 0);
     if (tap_on_ && !batch_rec_ && tap_file_ != nullptr) copy_from_mapped(m_tap_, tap_dev_, (int64_t) T * (int64_t) tap_layers_.size() * N, cs);
     return true;
+}
+
+void Verifier::record_head_pick(int T, cudaStream_t cs) {
+    using namespace strata::kernels;
+    // The same global-vocabulary tail for ordinary graphs and returned piped-head logits. In particular plain
+    // greedy slots do not enter sample_rows, and must see this pick rather than a stale previous window's token.
+    if (argmax_rows_wanted()) {
+        argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
+    } else {
+        SamplerParams sp;
+        sp.greedy = true;
+        sp.temperature = 0.0f;
+        sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+    }
+    if (nan_guard_on()) logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
 }
 
 std::string Verifier::profile_by_t_report() {
@@ -4007,18 +4017,22 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
 }
 
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
-    cudaGraphExec_t& ex = exec_bm_[bkey(rows, S, hbase)];
+    const bool target_head = staging_deferred_ && piped_target_head_ != nullptr;
+    const auto key = bkey(rows, S, hbase, target_head);
+    cudaGraphExec_t& ex = exec_bm_[key];
     if (ex != nullptr) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin batch capture failed";
         return false;
     }
     batch_rec_ = true;
+    record_piped_target_head_ = target_head;
     row_base_ = hbase;
     for (int t = 0; t < S; ++t) brow_[t] = rows[t];
     std::string rerr;
     sel_long_ = 0;   // batch rows: the one-CTA select
     const bool ok = record_window(S, cs_, rerr);
+    record_piped_target_head_ = false;
     batch_rec_ = false;
     row_base_ = 0;
     cudaGraph_t graph = nullptr;
@@ -4028,7 +4042,7 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
+    const bool made = instantiate_evicting(ex, graph, key, "verify: batch instantiate: ", err);
     cudaGraphDestroy(graph);
     if (!made) return false;
     if (cudaGraphUpload(ex, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess)
@@ -4193,7 +4207,9 @@ bool Verifier::init_deferred_commit(int rows, std::string& err) {
 
 bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& err) {
     using namespace strata::kernels;
-    const auto key = bkey(rows, S, hbase);
+    // The save/commit pair must protect the same executable key while instantiate_evicting handles OOM. A
+    // normal key here could evict the new headless body before batch_launch_rows gets a chance to launch it.
+    const auto key = bkey(rows, S, hbase, piped_target_head_ != nullptr);
     cudaGraphExec_t& sex = save_bm_[key];
     cudaGraphExec_t& cex = dcommit_bm_[key];
     if (sex != nullptr && cex != nullptr) return true;
@@ -4335,10 +4351,12 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
     const bool staged = stage_batch(rows, S, hbase, tokens, pos, err);
     staging_deferred_ = false;
     if (!staged || !capture_deferred(rows, S, hbase, err)) return false;
-    const auto key = bkey(rows, S, hbase);
+    b_target_head_ = piped_target_head_ != nullptr;
+    const auto key = bkey(rows, S, hbase, b_target_head_);
     cudaError_t le = cudaGraphLaunch(exec_bm_[key], cs_);
     if (le == cudaSuccess) le = cudaGraphLaunch(save_bm_[key], cs_);   // the rows the commit replays, kept for it
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+    if (b_target_head_ && !launch_piped_target_head(S, err)) return false;
     (void) cudaStreamQuery(cs_);
     b_k_ = 0;
     b_steps_ = le_ - lb_;
@@ -4350,7 +4368,7 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
 bool Verifier::batch_commit_rows(const int* rows, int S, int hbase, const int* keep, const int32_t* tokens,
                                  const int64_t* pos, std::string& err) {
     const OnDevice on_device(device_);
-    const auto it = dcommit_bm_.find(bkey(rows, S, hbase));
+    const auto it = dcommit_bm_.find(bkey(rows, S, hbase, piped_target_head_ != nullptr));
     if (it == dcommit_bm_.end() || it->second == nullptr) { err = "verify: a deferred commit without its window"; return false; }
     const int64_t CB = 2 + max_t_;
     // Each slot's accepted prefix.  The graph reads it from mapped memory when it runs; this slot's entry is written
@@ -4613,7 +4631,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     refresh_ar();
     // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
-    const auto key = bkey(rows, S, hbase);
+    const auto key = bkey(rows, S, hbase, staging_deferred_ && piped_target_head_ != nullptr);
     bool evicted = false;
     if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
         !evict_batch_graph(key, evicted, err))
@@ -4947,6 +4965,7 @@ bool Verifier::sample_rows(int S, std::string& err) {
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
+    b_target_head_ = false;   // ordinary piped groups retain their original full-head graph
     int rows[strata::kernels::kVerifyMaxT] = {};
     for (int t = 0; t < S && t < strata::kernels::kVerifyMaxT; ++t) rows[t] = base + t;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
@@ -5074,6 +5093,12 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     if (q != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(q); b_running_ = false; return -1; }
     const cudaError_t qc = cudaStreamQuery(copy_);   // no host function of this window may raise flag B in the next
     if (qc == cudaErrorNotReady) return 0;
+    if (b_target_head_) {
+        // cs_ has finished the complete-logit gather and original pick/guard, so no following group can overwrite
+        // either helper workspace or last_rows_/final_R before the verdict consumes this window.
+        if (!piped_target_head_->done(err)) return err.empty() ? 0 : -1;
+        if (piped_target_head_second_ && !piped_target_head_second_->done(err)) return err.empty() ? 0 : -1;
+    }
     if (prof_on_) collect_profile();
     if (last_stage()) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }
@@ -5081,6 +5106,11 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         note_nonfinite(S, last_pos_b_);
     }
     ++windows;
+    if (b_target_head_) {
+        ++piped_target_head_windows_;
+        piped_target_head_rows_ += (uint64_t) S;
+        b_target_head_ = false;
+    }
     b_running_ = false;
     progress_beat();
     return 1;
@@ -5202,6 +5232,79 @@ bool Verifier::set_decode_head(const NativeHead& head, std::string& err, const N
     }
     decode_head_ = std::move(window);
     decode_head_second_ = std::move(other);
+    return true;
+}
+
+bool Verifier::set_piped_target_head(const NativeHead& head, std::string& err, const NativeHead* second) {
+    const OnDevice on_device(device_);
+    if (!g_ || !last_stage() || !head_ || !head_->loaded() || !head.loaded() || head.device() == device_ ||
+        head.type() != head_->type() || head.weight_bytes() != head_->weight_bytes() ||
+        slots_.empty() || dc_rows_ < 1 || b_running_ || fl_active_ || !exec_bm_.empty() || piped_target_head_) {
+        err = "piped target head: requires an idle final deferred-commit verifier before batch capture and matching native weights";
+        return false;
+    }
+    if (second && (!second->loaded() || second->device() == device_ || second->device() == head.device() ||
+                   second->type() != head.type() || second->weight_bytes() != head.weight_bytes())) {
+        err = "piped target head: the second shard needs the same weights on another GPU";
+        return false;
+    }
+    const int cut = second ? ((int) n_vocab_ / 2 / 128) * 128 : 0;
+    if (second && (cut <= 0 || cut >= n_vocab_)) { err = "piped target head: vocabulary too small to shard"; return false; }
+    auto first = std::make_unique<DecodeHeadWindow>();
+    if (!first->init(head, device_, (int) g_->n_embd, (int) n_vocab_, max_t_,
+                     g_mmvq_il(), strata::kernels::argmax_rows_wanted(), nan_guard_on(), err, 0, cut, true) ||
+        !first->capture_all(err)) return false;
+    std::unique_ptr<DecodeHeadWindow> other;
+    if (second) {
+        other = std::make_unique<DecodeHeadWindow>();
+        if (!other->init(*second, device_, (int) g_->n_embd, (int) n_vocab_, max_t_,
+                         g_mmvq_il(), strata::kernels::argmax_rows_wanted(), nan_guard_on(), err,
+                         cut, (int) n_vocab_ - cut, true) || !other->capture_all(err)) return false;
+    }
+    if (cudaEventCreateWithFlags(&target_head_ready_, cudaEventDisableTiming) != cudaSuccess) {
+        err = "piped target head: producer event creation failed";
+        return false;
+    }
+    target_head_tail_.assign((size_t) max_t_ + 1, nullptr);
+    for (int T = 1; T <= max_t_; ++T) {
+        if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            err = "piped target head: begin source tail capture failed";
+            return false;
+        }
+        bool ok = true;
+        try { record_head_pick(T, cs_); }
+        catch (const std::exception& e) { err = std::string("piped target head: source tail: ") + e.what(); ok = false; }
+        cudaGraph_t graph = nullptr;
+        cudaError_t status = cudaStreamEndCapture(cs_, &graph);
+        if (ok && status == cudaSuccess)
+            status = cudaGraphInstantiate(&target_head_tail_[(size_t) T], graph, nullptr, nullptr, 0);
+        if (graph) cudaGraphDestroy(graph);
+        if (!ok) return false;
+        if (status != cudaSuccess) { err = std::string("piped target head: capture source tail: ") + cudaGetErrorString(status); return false; }
+        if (cudaGraphUpload(target_head_tail_[(size_t) T], cs_) != cudaSuccess) {
+            err = "piped target head: source tail upload failed";
+            return false;
+        }
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "piped target head: source tail upload did not finish"; return false; }
+    piped_target_head_ = std::move(first);
+    piped_target_head_second_ = std::move(other);
+    return true;
+}
+
+bool Verifier::launch_piped_target_head(int T, std::string& err) {
+    // Both projections wait on the same body/save completion; launch both before enqueueing source waits so the
+    // second helper never depends on the first. Keep this stage occupied through the gather and original tail.
+    if (cudaEventRecord(target_head_ready_, cs_) != cudaSuccess) {
+        err = "piped target head: producer event record failed";
+        return false;
+    }
+    if (!piped_target_head_->launch_logits(T, target_head_ready_, err) ||
+        (piped_target_head_second_ && !piped_target_head_second_->launch_logits(T, target_head_ready_, err))) return false;
+    if (!piped_target_head_->enqueue_return(cs_, head_logits_, (int) n_vocab_, err) ||
+        (piped_target_head_second_ && !piped_target_head_second_->enqueue_return(cs_, head_logits_, (int) n_vocab_, err))) return false;
+    const cudaError_t status = cudaGraphLaunch(target_head_tail_[(size_t) T], cs_);
+    if (status != cudaSuccess) { err = std::string("piped target head: source tail launch: ") + cudaGetErrorString(status); return false; }
     return true;
 }
 
