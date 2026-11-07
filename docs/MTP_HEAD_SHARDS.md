@@ -105,8 +105,9 @@ engine/mtp_head_test --gguf MODEL.gguf --draft-vocab draft_vocab.bin --source 7 
 The test includes original-owner reset, partial-chain drain/reuse and one workspace's reset/rebind while
 peers have queued work. Its log is `/srv/bench100k-20261107-concurrency-mtp/head-build/parity.log` on the test
 host. Engine SHA256: `c9305b08b24e6ff85e363147063827760c54c8243eeec6b2362587159cda5ca6`.
-The end-to-end measurements below followed these checks. The piped-slot option remains undeployed and off by
-default. HIP has not been built. Metal checks cover syntax and the unavailable stub.
+The end-to-end measurements below followed these checks. The piped-slot option remains off by default in code;
+it was enabled on this host with deployment verified at about 21:37 Asia/Taipei on 2026-11-07. HIP has not been
+built. Metal checks cover syntax and the unavailable stub.
 
 ### Piped-slot GPU measurements, 2026-11-07
 
@@ -152,7 +153,19 @@ outputs, usage and exact cache reuse matched within and across rounds. The cold/
 Cold changes had opposite signs. The descriptive pooled cold median changed by +0.70%, while the median of six
 fixture-paired relative changes was -0.22%; startup/suite order and the small sample affect these summaries.
 All solo prefill logs recorded zero piped-head steps. Prefill preservation remains a deployment requirement;
-these measurements do not guarantee zero regression for other conditions. Deployment is still pending.
+these measurements do not guarantee zero regression for other conditions.
+
+The restored service was verified at 21:37:55 Asia/Taipei on 2026-11-07 with engine `c9305b08…`, server `40c5e9df…`,
+`STRATA_BATCH_MTP=1`, `STRATA_PIPED_MTP=1`, `STRATA_BATCH_SELF_COMMIT=0`, `STRATA_PIPED_MTP_HEAD=1` and
+`reasoning_budget_engine_cap=true`. Fresh checks confirmed eight slots, all experts resident, the original
+3.80 GiB prompt buffers on every card and eight private head workspaces on targets 3/5. Main-head targets stay
+2/4. The separately tested prompt-read guard was rejected and remains absent/default-off.
+
+Four synthetic smoke requests completed 128 output tokens each. A later, separate live-route check observed
+4419 actual piped-head steps and passed; it includes resumed test traffic, so these steps are not attributed
+solely to the smoke requests. The original smoke artifact is retained even though its short observation window
+had not yet seen a completed shared-batch summary. Full deployment and verification receipts are listed in
+[the concurrency deployment record](CONCURRENCY_STABILITY.md#restored-service-and-deployment-verification).
 
 Evidence is under `bench/results/2026-11-07-8x2080ti-q5-100k/concurrency-stability/` in the benchmark checkout:
 `head-pilot-analysis/`, `head-reverse-analysis/` and `head-long-analysis/`, with corresponding raw-data directories.

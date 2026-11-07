@@ -1,7 +1,8 @@
 # Prompt reads while requests decode
 
-This candidate targets long gaps in ongoing answers when another request reads a long prompt. It is opt-in and has
-not been measured on a GPU. It does not change the model, sampling, prefill chunks or MTP implementation.
+This opt-in guard targets long gaps in ongoing answers when another request reads a long prompt. It was measured
+on the eight-RTX-2080-Ti host on 2026-11-07 and rejected for deployment because mixed-prompt TTFT and whole-run
+throughput regressed. It does not change the model, sampling, prefill chunks or MTP implementation.
 
 On a layer split with pipelined slot groups, the default prompt read runs to completion before those slots decode
 again. `STRATA_BATCH_DECODE_SHARE` alone does not change that path. The existing `STRATA_PIPED_READ_PIECE` option
@@ -17,7 +18,7 @@ In guarded mode, an idle remainder, cancellation, give-way or failed read clears
 A short completed read does not inherit an earlier long piece's timing. A new request cannot enter a decoding slot
 while the current prompt owns the admission control lines.
 
-A configuration to **test**, not a measured recommendation:
+The tested configuration, rejected for deployment:
 
 ```text
 STRATA_PIPED_READ_PIECE=16384
@@ -31,11 +32,11 @@ finishing groups still in flight can take longer than that budget. A read shorte
 The new guard does not alter `STRATA_PIPED_CONCURRENT`: that separate experimental path takes precedence if enabled
 and remains incompatible with `STRATA_SPLIT_MTP_BATCH=1`.
 
-Reading and decoding still compete for time. Mixed-load prompt TTFT may increase. No claim of unchanged solo
-prefill speed or faster concurrent decoding is made before measurement. A request arriving during an otherwise
-solo read retains the original admission behavior; this guard does not add new preemption points to that read.
+Reading and decoding still compete for time. The measured mixed-load prompt TTFT increased substantially, as
+reported below. A request arriving during an otherwise solo read retains the original admission behavior; this
+guard does not add new preemption points to that read.
 
-Validation should compare the same build with the guard disabled and enabled, preserving all other settings.
+Future variants should compare the same build with the guard disabled and enabled, preserving all other settings.
 Use four ongoing streams and cold joins of 12K, 18K and 61K tokens. Record per-stream p95 and maximum nonempty SSE chunk gaps (token gaps only when actual token timestamps exist),
 rates during prompt reads, aggregate tokens per second, joining-request TTFT and errors. Also test slots finishing
 during a read, cancellation and back-to-back joins. Use fixed greedy prompts for output checks and a separate sampled
@@ -44,12 +45,35 @@ workload matching the application. Test solo cold 100K prefill separately: it mu
 The CPU policy test covers solo whole reads, mixed reads, merging the idle remainder, the unchanged legacy policy,
 chunk rounding and lead-in history at early exits. It does not test CUDA scheduling, output equality or performance.
 
+The GPU comparison kept batch/piped MTP, shared slot heads and the thinking-budget cap enabled in both arms, with
+the same `c9305b08…` engine and `40c5e9df…` server identified below. All six solo prefill pairs and six C4 requests
+had matching full outputs, channel hashes, usage and cache metadata. Solo prompts had 101140 actual input tokens;
+cold read-time median was 16423 ms off and 16383 ms on (-0.24%). Warm requests reused exactly 101133 tokens and read
+seven. Each kind had only three observations.
+
+The mixed case had four 8776-token residents and two cold joins of 8776 and 52063 actual tokens. These actual
+lengths fell outside the harness's nominal 10K/60K tolerance; comparison used identical actual input and output.
+
+| Guard comparison | Off | On | Change |
+|---|---:|---:|---:|
+| 52063-token join TTFT | 10.1087 s | 22.7523 s | +125.08% |
+| Whole C4 API throughput, 8320 completed tokens | 104.817 tokens/s | 91.165 tokens/s | -13.02% |
+| Mixed maximum nonempty SSE gap | 10.246 s | 6.470 s | -36.85% |
+| Mixed pooled p99 SSE gap | 5.887 s | 6.219 s | +5.64% |
+
+The longest gap shortened, while the larger prompt took more than twice as long and p99 increased. Three 16384-token
+pieces took 6093/6176/6351 ms, with 420/421/423 ms of decoding between them. The 400 ms setting limits the requested
+decode budget, not the output gap. Engine read time includes interleaved decode and waits. The source audit points
+to repeated pipeline fill/drain as a hypothesis; it was not profiled and is not a measured time breakdown. The
+guard remains absent/default-off in the restored service. Evidence: `guard-analysis/` in the benchmark directory
+listed below, including `source-notes.md` and the independent review.
+
 ## Bound native generation at a known thinking budget
 
 `reasoning_budget_engine_cap` is a separate, default-off server option. It does not enable the prompt-read policy
 above or change the batch/piped MTP switches. As of 2026-11-07, its CPU tests and the GPU budget-boundary checks below
-have passed. The concurrency comparisons enabled this option in both arms. It has not been deployed to the normal
-service. The frozen candidate `serve/server.py` SHA256 is
+have passed. The concurrency comparisons enabled this option in both arms. It was enabled in the normal service
+with deployment verified at about 21:37 Asia/Taipei on 2026-11-07. The installed `serve/server.py` SHA256 is
 `40c5e9dfc96ab208b6514bd2f5f48986afb3e01b3927f873cff8d358d62528c9`.
 
 The triggering observation was a thinking-budget continuation during sampled C4: two requests with batch MTP
@@ -129,7 +153,7 @@ These 2026-11-07 measurements used Qwen3.8-Flash-Next-Uncensored Q5_K_M on eight
 card, eight slots and eight pipeline groups. All experts remained resident, and each card retained its original
 3.80 GiB prompt buffers. Main-head shards stayed on GPUs 2/4 and the solo MTP-head shards on GPUs 3/5. These are
 isolated synthetic tests with the single-pair and repeated-round scopes stated below; they do not establish a
-production tail latency guarantee. The prompt-read guard described above remains unmeasured and undeployed.
+production tail latency guarantee. The prompt-read guard described above was measured and rejected for deployment.
 
 The v4 budget comparison used engine SHA256
 `113a4ea9bf2101a9ad9a3449ae611f8a21f892cc62293fa9a779d302dc2df96f` and the server candidate identified above.
@@ -206,5 +230,35 @@ Reproducible local records are under
 `budget-v4-analysis/` and `budget-v4-c4-sampled/` for v4, `c8-v5/` for the eight-stream batch comparison, and
 `head-pilot-analysis/`, `head-reverse-analysis/` and `head-long-analysis/` plus their corresponding raw directories
 for the shared-head comparisons. The analysis directories include input SHA256 manifests and per-request checks.
-None of these candidate switches has been deployed to the normal service as of this report. Deployment and
-prefill-preservation decisions remain pending; the measured C8 gain does not resolve mixed-prefill stalls.
+
+## Restored service and deployment verification
+
+The service was restored at 21:36 Asia/Taipei on 2026-11-07; fresh verification completed at 21:37:55. The actual
+process used engine SHA256 `c9305b08b24e6ff85e363147063827760c54c8243eeec6b2362587159cda5ca6`, server SHA256
+`40c5e9dfc96ab208b6514bd2f5f48986afb3e01b3927f873cff8d358d62528c9` and library SHA256
+`fb67bffc9ece81aa90ee22aa97fed40710c4d57ece6bceeb4ae023f9728a0661`. The installed settings are:
+
+```text
+STRATA_BATCH_MTP=1
+STRATA_PIPED_MTP=1
+STRATA_BATCH_SELF_COMMIT=0
+STRATA_PIPED_MTP_HEAD=1
+reasoning_budget_engine_cap=true
+```
+
+Main-head targets remain 2/4 and MTP-head targets 3/5. A separate check of the actual process confirmed that
+`STRATA_PIPED_READ_PIECE`, `STRATA_PIPED_READ_DECODE_ONLY`, `STRATA_PIPED_DECODE_MAX_MS` and
+`STRATA_PIPED_CONCURRENT` are all unset; the prompt-read guard is off.
+The original prefill configuration, six-layer split and API key were retained. Fresh startup checks confirmed
+eight requested/serving slots, full expert residency, all eight original 3.80 GiB prompt buffers, and eight private
+head workspaces sharing one weight bank on GPUs 3/5.
+
+Four synthetic smoke requests each completed all 128 output tokens without API errors. A separate subsequent
+live-route observation counted 4419 actual piped-head steps after startup and passed its postflight checks.
+Those summaries include resumed test traffic and are not attributed solely to the four smoke requests. The
+initial smoke artifact is retained; its short summary-observation window had not yet seen a completed shared
+batch. The deployment establishes the enabled route and resource checks, not a cure for mixed-prefill stalls.
+
+Receipts in the same benchmark directory: `deployment-receipt.json`, `deployment-verified.json`,
+`maintenance-restored.json`, `deployment-smoke.json`, `deployment-route-observed.json` and
+`deployment-read-policy.json`.
