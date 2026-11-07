@@ -189,6 +189,26 @@ public:
     void set_head_shards_active(bool on) { head_shards_active_ = on && head_shards_.initialized(); }
     bool head_shards_enabled() const { return head_shards_.initialized(); }
     uint64_t head_shard_steps() const { return head_shard_steps_; }
+    struct TimingSummary {
+        uint64_t count = 0;
+        double total_ms = 0, min_ms = 0, max_ms = 0;
+        void add(double ms) {
+            if (count == 0) min_ms = max_ms = ms;
+            else { min_ms = std::min(min_ms, ms); max_ms = std::max(max_ms, ms); }
+            total_ms += ms;
+            ++count;
+        }
+        double mean_ms() const { return count ? total_ms / (double) count : 0.0; }
+    };
+    struct ChainObservation {
+        uint64_t chains = 0;
+        TimingSummary body, head_return, tail;
+    };
+    /// Observation only, after prepare_chain, for an idle piped clone using the shared head. Independent timing
+    /// events per step/slot; no event is reused until chain_poll has consumed it. Nothing is allocated when off.
+    bool enable_piped_observation(std::string& err);
+    /// Completed-chain aggregates since the last take, never a synchronization or a scheduling decision.
+    ChainObservation take_chain_observation() { auto out = chain_observation_; chain_observation_ = {}; return out; }
     /// The catch-up over T cells from `p` (as draft()), then `n_out` outputs from row `a`: output j is the chain's
     /// own pick, and step j (1 <= j <= n_force) takes force[j - 1] as its input token instead of output j - 1.
     /// `n_early`: an event after each of the first `n_early` outputs (chain_outputs_ready).
@@ -308,6 +328,9 @@ private:
     MtpHeadShards head_shards_;
     bool head_shards_active_ = false;
     uint64_t head_shard_steps_ = 0;
+    bool piped_observe_on_ = false;
+    cudaEvent_t observe_events_[8][4] = {};  // body start/end, full head return, tail end; timing enabled
+    ChainObservation chain_observation_;
     cudaGraphExec_t head_round_body_[9] = {}, head_step_body_[9] = {}, head_tail_[9] = {};
     const float* src_R_ = nullptr;
     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
