@@ -70,7 +70,7 @@ int main() {
         &ResidentConcurrentReadSetup::private_buffers, &ResidentConcurrentReadSetup::all_resident,
         &ResidentConcurrentReadSetup::no_loans, &ResidentConcurrentReadSetup::draft_resident,
         &ResidentConcurrentReadSetup::stable_tier, &ResidentConcurrentReadSetup::text_only,
-        &ResidentConcurrentReadSetup::single_prompt};
+        &ResidentConcurrentReadSetup::single_prompt, &ResidentConcurrentReadSetup::lookahead_idle};
     for (auto f : required) resident.*f = true;
     CHECK(resident_concurrent_read_off(resident) == nullptr);
     const char* missing[std::size(required)] = {};
@@ -88,6 +88,7 @@ int main() {
     CHECK(same(missing[4], "shared_prompt_buffers"));
     CHECK(same(missing[6], "active_loan"));
     CHECK(same(missing[7], "draft_weights_not_resident"));
+    CHECK(same(missing[11], "decode_lookahead_busy"));   // old predictor work must finish before source ownership changes
     // piped_read_piece (#1906): off -> one run; whole chunks, at least one, at most 32
     CHECK(piped_read_piece(0, 8192) == 0);
     CHECK(piped_read_piece(-5, 8192) == 0);

@@ -28,8 +28,15 @@ Each prompt part checks the live state after the normal pipeline drain:
 - One text prompt. Images and co-reads use the existing path.
 - A PLE stage with a native quantized key and no BF16 key uses the serial
   path: that key's quantization scratch belongs to the shared weight table.
-- The old source restrictions remain: no prefill helper, DMA doorbell,
-  staging/recycled source buffers, or unknown source type.
+- No prefill helper, DMA doorbell, helper source, or unknown source type.
+- The router lookahead has no pending or running prediction. A staged file
+  source is allowed only in this strict mode, when it is the same source
+  for prefill and decode. Resident batch windows skip the expert dispatch
+  that consumes source blobs and submits lookahead jobs. While the reader
+  runs, `in_prompt_read` prevents adaptive rounds; with no pending changes
+  or asynchronous tier, `apply_pending` cannot mutate the source. The file
+  source's own I/O workers and prefill stagers retain their normal behavior.
+  The legacy `STRATA_PIPED_CONCURRENT` source restriction is unchanged.
 
 A failed check prints a fallback reason and uses the existing serial path.
 Before starting the reader, the host reserves the drafter's input records,
@@ -71,6 +78,12 @@ The startup line reports that the flag was requested, not that an eligible
 read ran. Actual reads print paired `strata piped concurrent MTP: begin` and
 `end` lines with a monotonic `read_id` within that engine process. A rejected
 read prints `fallback ... reason=...`.
+
+`strata resident read source` records the same `read_id`, whether the source
+uses staging, the lookahead's idle observation at entry, and `dispatch_delta`.
+The last field is the change in an atomic decode expert-pool call counter,
+sampled before the final drain; it must be zero for the resident path. These
+are decode dispatch calls, not the prompt source's own I/O or stager calls.
 
 `begin` includes the token interval (`from`, `tokens`), planned chunk,
 active-slot count, and owned/resident stage counts. Prompt parts can end at

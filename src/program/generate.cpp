@@ -1383,7 +1383,7 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
 struct Drive {
     strata::core::ExpertDispatch d;
     double cpu_ms = 0;
-    int64_t calls = 0;
+    std::atomic<int64_t> calls{0};   // resident-read source audit can observe the external doorbell thread
     /// THE ROUTING TRACE, which is P0.S8 and a stated prerequisite of Phase 3.  `drive_pool` is called once
     /// per layer from the main loop - the workers live inside `expert_pool_dispatch` - so a single FILE* here
     /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
@@ -1395,9 +1395,9 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
                 float* out) {
     Drive* t = (Drive*) user;
     const Clock::time_point a = Clock::now();
+    t->calls.fetch_add(1, std::memory_order_relaxed);
     strata::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
-    ++t->calls;
     // THE ROUTING TRACE.  Written AFTER the dispatch so the layer index is still this layer's: `d.layers` is
     // advanced by the adapter as it consumes the blob, and reading it after the call is the same value the
     // dispatch used.  Record = int32 layer, int32 k, k int32 ids, k float weights.
@@ -1426,9 +1426,9 @@ void drive_pool_multi_impl(void* user, const float* x_f, const int32_t* ids, int
     Drive* t = (Drive*) user;
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
+    t->calls.fetch_add(1, std::memory_order_relaxed);
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out, arithmetic);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
-    ++t->calls;
     // the routing trace for the serve path: the same record format drive_pool writes (layer, k, ids, weights),
     // one record per token.  The multi dispatch fuses the router weights into the kernel and does not surface
     // them, so records carry unit weights: tools/make_profile.py ranks pairs by routed frequency, which is the
@@ -17512,7 +17512,9 @@ int main(int argc, char** argv) {
                     // (--remote-expert-opt works only through a helper cache, so without one it does not count)
                     s.helper_caches = prefill_src != srcp;
                     for (int r = 0; r < 3; ++r) s.helper_caches |= o.expert_cache_remote[(size_t) r] > 0;
-                    s.staged_source = srcp == &src && src.stages_blobs();
+                    // Only the strict resident extension may defer this known source's check. Its decode never
+                    // calls the expert pool, and the per-read guard below excludes outstanding lookahead jobs.
+                    s.staged_source = srcp == &src && src.stages_blobs() && !piped_concurrent_mtp;
                     s.other_source = srcp != &src && srcp != &arena_src;
                     if (const char* why = strata::program::concurrent_read_off(s)) {
                         std::fprintf(stderr, "strata batch: STRATA_PIPED_CONCURRENT is off beside %s\n", why);
@@ -17529,6 +17531,8 @@ int main(int argc, char** argv) {
                 }();
                 bool resident_read = false;
                 int concurrent_active_slots = 0, concurrent_own_buffers = 0, concurrent_resident_stages = 0;
+                const bool concurrent_staged_source = srcp == &src && src.stages_blobs();
+                bool concurrent_lookahead_idle = false;
                 if (piped_concurrent_mtp) {
                     strata::program::ResidentConcurrentReadSetup s;
 #if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
@@ -17553,8 +17557,14 @@ int main(int argc, char** argv) {
                                     !remote_caches && !fs_swap;
                     s.text_only = req_imgs.empty();
                     s.single_prompt = co_set.empty();
+                    // All-resident batch_serve skips pool dispatch, the sole lookahead submitter. With the reader
+                    // active pa_due also excludes adaptation, and pending.empty()/!ajob leaves apply_pending a no-op.
+                    // Observe the old predictor job under its mutex before allowing prefill to own the staged source.
+                    concurrent_lookahead_idle = !drive.d.lookahead || drive.d.lookahead->idle();
+                    s.lookahead_idle = concurrent_lookahead_idle;
                     const char* why = strata::program::resident_concurrent_read_off(s);
                     if (!why && !pr_conc) why = "unsupported_setup";
+                    if (!why && concurrent_staged_source && prefill_src != srcp) why = "shared_staged_source";
                     if (!why && (b0 - a0) < pr_conc_min) why = "below_min_tokens";
                     if (!why) {
                         // A failed preparation is a serial fallback, not a half-prepared concurrent admission.
@@ -17694,6 +17704,7 @@ int main(int argc, char** argv) {
                     for (int64_t q0 = a0; q0 < b0;) {
                         const auto tc = Clock::now();
                         const int64_t rows0 = pipe_rows;
+                        const int64_t source_calls0 = drive.calls.load(std::memory_order_relaxed);
                         const uint64_t read_id = resident_read ? ++concurrent_mtp_read_id : 0;
                         if (resident_read)
                             std::fprintf(stderr, "strata piped concurrent MTP: begin read_id=%llu from=%lld tokens=%lld "
@@ -17792,6 +17803,10 @@ int main(int argc, char** argv) {
                                          (unsigned long long) read_id, overlap_ms, (long long) rows_before_done,
                                          (int) read_ok, (int) pump_ok, (long long) sp.stopped_at(),
                                          (int) admit_stop, want_yield.load(std::memory_order_acquire));
+                            std::fprintf(stderr, "strata resident read source: read_id=%llu staged=%d lookahead_idle=%d "
+                                                 "dispatch_delta=%lld\n", (unsigned long long) read_id,
+                                         (int) concurrent_staged_source, (int) concurrent_lookahead_idle,
+                                         (long long) (drive.calls.load(std::memory_order_relaxed) - source_calls0));
                         }
                         if (!pump_ok || !pipe_drain()) {
                             batch_fatal = true;

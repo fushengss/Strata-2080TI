@@ -3101,6 +3101,11 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
     cv_.notify_one();
 }
 
+bool RouterLookahead::idle() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return !pending_ && !busy_;
+}
+
 void RouterLookahead::enable_stats(int64_t n_layers) {
     words_ = (n_expert_ + 63) / 64;
     pmask_.reset(new std::atomic<uint64_t>[(size_t) (n_layers * 3 * words_)]);

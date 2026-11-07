@@ -54,13 +54,13 @@ inline const char* concurrent_read_off(const ConcurrentReadSetup& s) {
 }
 
 /// STRATA_PIPED_CONCURRENT_MTP: each read rechecks live ownership/residency, after the existing pipeline drain.
-/// The old concurrent-read configuration guards remain in force; only its split-MTP restriction may be bypassed
-/// after these checks. CUDA allocations can still introduce barriers, so prepared batch PLE must be published
+/// The old configuration guards remain except split MTP and a known file source whose consumer is only prefill:
+/// resident windows skip expert dispatch, and the lookahead must be idle. CUDA allocation barriers still require PLE publication
 /// before launching a resident graph, rather than by a later host service call.
 struct ResidentConcurrentReadSetup {
     bool cuda_backend = false, piped_mtp = false, split_mtp_batch = false, active_slots = false;
     bool private_buffers = false, all_resident = false, no_loans = false, draft_resident = false;
-    bool stable_tier = false, text_only = false, single_prompt = false;
+    bool stable_tier = false, text_only = false, single_prompt = false, lookahead_idle = false;
 };
 
 inline const char* resident_concurrent_read_off(const ResidentConcurrentReadSetup& s) {
@@ -75,6 +75,7 @@ inline const char* resident_concurrent_read_off(const ResidentConcurrentReadSetu
     if (!s.stable_tier) return "mutable_tier_or_kv";
     if (!s.text_only) return "image_input";
     if (!s.single_prompt) return "co_read";
+    if (!s.lookahead_idle) return "decode_lookahead_busy";
     return nullptr;
 }
 
