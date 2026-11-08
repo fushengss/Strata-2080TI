@@ -2,6 +2,14 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
+## Current optimization series (2026-11-08)
+
+The current source uses the tested **0.1.57 engine / 0.2.11 software baseline** with this fork's
+output-head sharding, concurrent MTP and guarded prefill/decode overlap. See the
+[iteration index](docs/OPTIMIZATION_ITERATIONS.md) for separate changes, opt-in settings,
+validation and measured tradeoffs. The Q8_0 numbers below are historical measurements;
+the current Q5_K_M concurrent results are in [CONCURRENT_MTP_READ.md](docs/CONCURRENT_MTP_READ.md).
+
 ## This fork: 8x RTX 2080 Ti 22 GB
 
 Strata-2080TI is based on [Niko1221/Strata](https://github.com/Niko1221/Strata) and tuned for one server with
