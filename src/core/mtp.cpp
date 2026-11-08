@@ -141,7 +141,12 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }  // namespace
 
 MtpDrafter::~MtpDrafter() {
+    const OnDevice on_device(device_);
     if (cs_) cudaStreamSynchronize(cs_);
+    head_shards_.reset();  // its cross-device events and buffers outlive every queued chain tail
+    for (auto& e : head_round_body_) if (e) cudaGraphExecDestroy(e);
+    for (auto& e : head_step_body_) if (e) cudaGraphExecDestroy(e);
+    for (auto& e : head_tail_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
     if (pf_dev_) cudaFree(pf_dev_);
@@ -1020,12 +1025,12 @@ bool mtp_head_mix_multi_on() {
 }  // namespace
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
-bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err) {
+bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, bool head_body_only) {
     // step_row0 >= 0: the full layer on step rows [step_row0, +T); step_row0 < 0: K/V only on rows [-1 - step_row0, +T)
     const bool full = step_row0 >= 0;
     if (full && T != 1) { err = "mtp: the full layer runs one row at a time (its attention scratch is sized for one)"; return false; }
     if (!record_front(T, full ? step_row0 : -1 - step_row0, cs, err)) return false;
-    return !full || record_rest(step_row0, cs, err);
+    return !full || record_rest(step_row0, cs, err, head_body_only);
 }
 
 bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err) {
@@ -1151,7 +1156,7 @@ void MtpDrafter::norm_rope(float* data, const float* gamma, int rows, int cols, 
     else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st_.cos_tab, st_.sin_tab, p, cs);
 }
 
-bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
+bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err, bool head_body_only) {
     using namespace strata::kernels;
     if (!decode_ready(err)) return false;   // this is the 512 experts' only reader
     const ModelGeometry& g = *g_;
@@ -1350,10 +1355,26 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         }
         g_mp.stamp(13, cs);
         if (!q8_head) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
+        if (head_body_only) return true;  // the chain exports these exact Q8_1 bytes to both row shards
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
         native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
                     (int) nv, T, cs);
+        return record_head_pick(step_row, cs, err);
+    } catch (const std::exception& e) {
+        err = std::string("mtp: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
+bool MtpDrafter::record_head_pick(int step_row, cudaStream_t cs, std::string& err) {
+    using namespace strata::kernels;
+    const int T = 1;
+    const bool sub = dhead_ != nullptr;
+    const int64_t nv = sub ? n_dvocab_ : n_vocab_;
+    const int32_t* step = step_ + step_row * 4;
+    try {
         g_mp.stamp(14, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
@@ -1380,7 +1401,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         if (sub) map_ids(out_ids_, dvocab_, T, cs);
         g_mp.stamp(15, cs);
     } catch (const std::exception& e) {
-        err = std::string("mtp: ") + e.what();
+        err = std::string("mtp head tail: ") + e.what();
         return false;
     }
     return true;
@@ -1429,8 +1450,9 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
 }
 
-bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
-    cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
+bool MtpDrafter::capture_round(int T, bool coupled, std::string& err, bool head_body_only) {
+    if (head_body_only && coupled) { err = "mtp head: coupled body capture is unsupported"; return false; }
+    cudaGraphExec_t& exec = head_body_only ? head_round_body_[T] : coupled ? round_exec_c_[T] : round_exec_[T];
     if (exec) return true;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
@@ -1458,20 +1480,21 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
         }
         coupled_rec_ = coupled;
         coupled_j_ = 0;
-        ok = record_rest(ra, cs_, err);
+        ok = record_rest(ra, cs_, err, head_body_only);
         coupled_rec_ = false;
     }
-    if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
-    if (ok) g_mp.stamp(16, cs_);
+    if (ok && !head_body_only) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    if (ok && !head_body_only) g_mp.stamp(16, cs_);
     g_mp.base = -1;
-    if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
-    return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
+    if (ok && !head_body_only && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
+    return finish_capture(cs_, ok, exec, head_body_only ? "round (head body)" : coupled ? "round (coupled)" : "round", err);
 }
 
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
 // residual and token (left in Rin_[0] / tok_[0] by mtp_select); draft j and its probability to the mapped outputs.
-bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
-    cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
+bool MtpDrafter::capture_step(int j, bool coupled, std::string& err, bool head_body_only) {
+    if (head_body_only && coupled) { err = "mtp head: coupled body capture is unsupported"; return false; }
+    cudaGraphExec_t& exec = head_body_only ? head_step_body_[j] : coupled ? step_exec_c_[j] : step_exec_[j];
     if (exec) return true;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
@@ -1484,13 +1507,30 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     coupled_rec_ = coupled;
     coupled_j_ = j;
     g_mp.base = j < kMpGraphs ? j : -1;
-    bool ok = record_forward(1, row, cs_, err);
+    bool ok = record_forward(1, row, cs_, err, head_body_only);
     coupled_rec_ = false;
-    if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    if (ok && !head_body_only) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    if (ok && !head_body_only) g_mp.stamp(16, cs_);
+    g_mp.base = -1;
+    if (ok && !head_body_only && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
+    return finish_capture(cs_, ok, exec, head_body_only ? "step (head body)" : coupled ? "step (coupled)" : "step", err);
+}
+
+bool MtpDrafter::capture_head_tail(int j, std::string& err) {
+    if (head_tail_[j]) return true;
+    using namespace strata::kernels;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "mtp head: begin tail capture"; return false;
+    }
+    const int row = j == 0 ? 2 * max_t_ - 1 : max_t_ + j - 1;
+    g_mp.base = j < kMpGraphs ? j : -1;
+    coupled_rec_ = false;
+    bool ok = record_head_pick(row, cs_, err);
+    if (ok) mtp_select(R_, g_->hc * g_->n_embd, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
     if (ok) g_mp.stamp(16, cs_);
     g_mp.base = -1;
-    if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
-    return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
+    if (ok && force_on_) force_token(tok_, m_force_, j, cs_);
+    return finish_capture(cs_, ok, head_tail_[j], "draft head tail", err);
 }
 
 void MtpDrafter::kv_restore(int64_t upto) {
@@ -1925,6 +1965,26 @@ bool MtpDrafter::stage_source_R(int T, std::string& err) {
     return true;
 }
 
+bool MtpDrafter::prepare_head_shards(int target0, int target1, std::string& err) {
+    const OnDevice on_device(device_);
+    if (head_shards_.initialized()) { err = "mtp head: already prepared"; return false; }
+    if (!force_on_ || !cs_ || !g_ || !head_ || chain_live_ || max_t_ < 2 || max_t_ > 8) {
+        err = "mtp head: prepare after bind on an idle solo PW2 drafter, before prepare_chain";
+        return false;
+    }
+    if (!owns_draft_head_ || !dhead_ || !dvocab_ || !dhead_plain_ || dhead_type_ != 14 || q4_head_ ||
+        n_dvocab_ < 2 || n_dvocab_ > 0x7fffffff) {
+        err = "mtp head: requires an owned plain Q6_K draft-vocabulary subset; full/repacked/Q4/shared heads unsupported";
+        return false;
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp head: source stream is not idle"; return false; }
+    if (!head_shards_.init(dhead_, device_, dhead_type_, (int) g_->n_embd, (int) n_dvocab_, target0, target1, err))
+        return false;
+    std::fprintf(stderr, "strata mtp head: CUDA%d+%d, %lld Q6_K subset rows, exact full logits returned to CUDA%d; solo PW2 greedy only\n",
+                 target0, target1, (long long) n_dvocab_, device_);
+    return true;
+}
+
 bool MtpDrafter::prepare_chain(std::string& err) {
     const OnDevice on_device(device_);
     if (!force_on_ || h_force_ == nullptr) { err = "mtp: chains need set_force_capture before load"; return false; }
@@ -1932,6 +1992,14 @@ bool MtpDrafter::prepare_chain(std::string& err) {
         if (!capture_round(T, false, err)) return false;
     for (int j = 1; j <= max_t_ - 2; ++j)
         if (!capture_step(j, false, err)) return false;
+    if (head_shards_.initialized()) {
+        for (int T = 1; T <= max_t_; ++T)
+            if (!capture_round(T, false, err, true)) return false;
+        for (int j = 1; j <= max_t_ - 2; ++j)
+            if (!capture_step(j, false, err, true)) return false;
+        for (int j = 0; j <= max_t_ - 2; ++j)
+            if (!capture_head_tail(j, err)) return false;
+    }
     if (ev_chain_ == nullptr && cudaEventCreateWithFlags(&ev_chain_, cudaEventDisableTiming) != cudaSuccess) {
         err = "mtp: event creation failed";
         return false;
@@ -1958,6 +2026,14 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     if (round_exec_[T] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
     for (int j = 1; j < n_out; ++j)
         if (step_exec_[j] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
+    // Request eligibility is controlled by the solo PW2 caller. Coupled sampling can never take the greedy
+    // split tail, even if a caller accidentally leaves the opt-in active across requests.
+    const bool head_split = head_shards_active_ && head_shards_.initialized() && !coupled_active_;
+    if (head_split) {
+        if (!head_round_body_[T] || !head_tail_[0]) { err = "mtp head: split round graphs not prepared"; return false; }
+        for (int j = 1; j < n_out; ++j)
+            if (!head_step_body_[j] || !head_tail_[j]) { err = "mtp head: split step graphs not prepared"; return false; }
+    }
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
     auto put = [&](int row, int64_t cell) {
@@ -1979,14 +2055,25 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!stage_source_R(T, err)) return false;
     chain_early_ = std::max(0, std::min(n_early, n_out));
-    bool ok = cudaGraphLaunch(round_exec_[T], cs_) == cudaSuccess;
+    auto launch = [&](int j) {
+        if (!head_split) return cudaGraphLaunch(j == 0 ? round_exec_[T] : step_exec_[j], cs_) == cudaSuccess;
+        if (cudaGraphLaunch(j == 0 ? head_round_body_[T] : head_step_body_[j], cs_) != cudaSuccess) return false;
+        if (!head_shards_.enqueue(cs_, xq_, head_logits_, j, err)) return false;
+        if (cudaGraphLaunch(head_tail_[j], cs_) != cudaSuccess) return false;
+        ++head_shard_steps_;
+        return true;
+    };
+    bool ok = launch(0);
     if (ok && chain_early_ >= 1) ok = cudaEventRecord(ev_step_[0], cs_) == cudaSuccess;
     for (int j = 1; ok && j < n_out; ++j) {
-        ok = cudaGraphLaunch(step_exec_[j], cs_) == cudaSuccess;
+        ok = launch(j);
         if (ok && j < chain_early_) ok = cudaEventRecord(ev_step_[j], cs_) == cudaSuccess;
     }
     if (!ok || cudaEventRecord(ev_chain_, cs_) != cudaSuccess) {
-        err = std::string("mtp chain: ") + cudaGetErrorString(cudaGetLastError());
+        if (err.empty()) err = std::string("mtp chain: ") + cudaGetErrorString(cudaGetLastError());
+        // A partially submitted split chain still owns its shared pinned records. Finish every submitted
+        // producer/head/tail before the caller can reuse inputs or destroy the drafter during error cleanup.
+        if (head_split) { std::string drain_error; (void) head_shards_.drain(drain_error); }
         return false;
     }
     (void) cudaStreamQuery(cs_);   // WDDM: submit now

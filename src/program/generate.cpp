@@ -11801,6 +11801,43 @@ int main(int argc, char** argv) {
                          (unsigned long long) (decode_head_owner.head[0].weight_bytes() >> 20),
                          second ? " (two vocabulary shards, greedy only)" : " only");
         }
+        // Keep the drafter's body/KV and prefill in place. Only explicitly selected solo PW2 chains may
+        // use these two vocabulary shards, and their full logits return before the original probability tail.
+        std::vector<int> mtp_head_devices;
+        if (const char* v = std::getenv("STRATA_MTP_HEAD_GPU"); v != nullptr && v[0] != '\0' && std::strcmp(v, "-1") != 0) {
+            const char* at = v;
+            while (*at) {
+                char* end = nullptr;
+                const long d = std::strtol(at, &end, 10);
+                if (end == at || (*end != '\0' && *end != ',') || d < 0 || d > 31 ||
+                    mtp_head_devices.size() >= 2 || (*end == ',' && end[1] == '\0')) {
+                    std::fprintf(stderr, "strata serve: STRATA_MTP_HEAD_GPU must be -1 (off) or D1,D2\n");
+                    return 1;
+                }
+                mtp_head_devices.push_back((int) d);
+                at = *end == ',' ? end + 1 : end;
+            }
+            if (mtp_head_devices.size() != 2 || mtp_head_devices[0] == mtp_head_devices[1] ||
+                !use_mtp || !pipe || o.pipeline_windows != 2 || !pl_snap_ok) {
+                std::fprintf(stderr, "strata serve: MTP head shards need PW2 and two distinct GPUs in the layer split\n");
+                return 1;
+            }
+            for (const int target : mtp_head_devices) {
+                bool in_split = target == 0;
+                for (const auto& st : stages) in_split = in_split || st->dev == target;
+                if (!in_split || target == mtp.device()) {
+                    std::fprintf(stderr, "strata serve: MTP head targets must differ from the drafter and belong to the layer split\n");
+                    return 1;
+                }
+            }
+            if (!mtp.prepare_head_shards(mtp_head_devices[0], mtp_head_devices[1], err)) {
+                std::fprintf(stderr, "strata serve: MTP head shards: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: MTP draft head on CUDA%d+%d: two vocabulary shards, full logits "
+                                 "returned for the original probability tail; solo greedy PW2 only, prefill unchanged\n",
+                         mtp_head_devices[0], mtp_head_devices[1]);
+        }
         cudaEvent_t pl_mtp_ev[2] = {nullptr, nullptr};
         bool pl_mtp_live[2] = {false, false};
         bool pl_prepared = false;
@@ -17992,6 +18029,15 @@ int main(int argc, char** argv) {
                     ~DecodeHeadScope() { a.set_decode_head_active(false); b.set_decode_head_active(false); }
                 } decode_scope(*PV[1][0], *PV[1][1]);
                 const uint64_t head_windows_before = PV[1][0]->decode_head_windows() + PV[1][1]->decode_head_windows();
+                struct MtpHeadScope {
+                    strata::core::MtpDrafter& drafter;
+                    MtpHeadScope(strata::core::MtpDrafter& d, bool active) : drafter(d) {
+                        drafter.set_head_shards_active(active);
+                    }
+                    ~MtpHeadScope() { drafter.set_head_shards_active(false); }
+                } mtp_head_scope(mtp, mtp.head_shards_enabled() && req_sp.greedy &&
+                                     req_sp.penalty_last_n == 0 && req_bias.empty() && !mtp.coupled());
+                const uint64_t mtp_head_steps_before = mtp.head_shard_steps();
                 struct PW {
                     int T = 0, seq = 0;
                     int64_t p = 0;
@@ -18611,6 +18657,10 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata decode head: CUDA%d, %llu PW2 windows offloaded in this request\n",
                                  decode_head_device, (unsigned long long) (PV[1][0]->decode_head_windows() +
                                  PV[1][1]->decode_head_windows() - head_windows_before));
+                if (!mtp_head_devices.empty())
+                    std::fprintf(stderr, "strata MTP head: CUDA%d+%d, %llu draft steps offloaded in this request\n",
+                                 mtp_head_devices[0], mtp_head_devices[1],
+                                 (unsigned long long) (mtp.head_shard_steps() - mtp_head_steps_before));
                 if (dec_timing) {
                     auto avg = [](double s_, double n_) { return n_ > 0 ? s_ / n_ : 0.0; };
                     std::fprintf(stderr, "strata pipeline: %lld windows in %.0f ms (%.2f ms/window): %lld speculative, %lld on "
