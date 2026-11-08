@@ -152,8 +152,22 @@ restart. Defaults are off unless the table says otherwise.
 | `--prefill-pipe R` (or `STRATA_PREFILL_PIPE=R`) | Reads each prompt in the chunk count with the least pipeline time for b/a = R tokens. `1` evens out today's chunk count. | Opt-in. `./setup.sh --calibrate` measures it per PC and writes it to the config. |
 | `STRATA_SPLIT_RING=N` | Sets the prompt path's streamed ring to N slots (`0`: the pinned-share rule). A split uses 96 when at least 75% of the (layer, expert) pairs sit in some card's cache. | The startup line `lend sizing: ...` shows the result. |
 | `STRATA_SPLIT_CHUNK16K=1` | Keeps the 16384-token auto chunk on AMD gfx12 splits (default 8192). | |
+| `STRATA_DECODE_HEAD_GPU=D` or `D1,D2` | Experimental: the native output head on one other GPU, or two vocabulary shards for greedy solo PW2 decode. Unset or `-1`: off. | Needs `--pipeline-windows 2` and a different GPU already in the split. The original prefill, layer, draft and batch placement stays in place. Adds one head copy per selected card plus per-window buffers; refuses a head that spills to RAM. |
 | `STRATA_SPLIT_OVERLAP=1` | Overlapped hand-off between stages on different cards. | Helps AMD; no gain on NVIDIA. See [below](#overlapped-hand-off). |
 | `--split-device D1[,D2..]` | The later stages' devices (default: the next visible ones). `--layer-split K --split-device 0` runs both stages on one card; a bit-exact hand-off check, not a speed mode. | |
+
+This switch is experimental in CUDA/HIP builds and has only been validated on CUDA. It is unavailable on Metal and SYCL.
+The decode-head experiment transfers each window's final Q8_1 activation through portable pinned RAM to a separate
+stream on the chosen card. The head and sampling run there, and only picks and non-finite flags return; asking for
+logprobs copies the requested logits too. No P2P link is needed. The two PW2 window parities own separate buffers.
+Requests with a history penalty or logit bias keep the ordinary head path. With one target card, sampled PW2 requests
+without those features use their original seed and position counter there. With two target cards, only greedy
+requests use the shards; sampled requests keep the ordinary head path. Each shard returns its best token and raw
+logit, and the CPU chooses the largest value with ties going to the lowest original token id. No softmax or dot
+product is repartitioned. Row sharding requires the original quantized row layout, not an in-place repack.
+A startup line names the placement, and
+`strata decode head: ... windows offloaded` reports the actual count per PW2 request. This setting does not change
+the batch scheduler or move any prefill layers; benchmark both decode and cold prefill before using it on a server.
 
 **The resident RAM mode works on a split.** `--resident-experts` (the low-RAM mode) leaves out of the RAM copy the experts any
 card's cache holds. An adaptive swap copies the evicted expert back into RAM from the card that owns its layer. A RAM budget

@@ -5727,6 +5727,16 @@ int main(int argc, char** argv) {
     }
     // ---- layer split across GPUs: each later stage's own copy of the dense weights, its session and (the last) the
     // head, made on its device before the host arena is mapped (as the drafter below, for the same WDDM reason)
+    // Declared before the stage verifiers so the replicated head outlives their offload graphs.
+    struct DecodeHeadOwner {
+        strata::core::NativeHead head[2];
+        ~DecodeHeadOwner() {
+            for (auto& h : head) {
+                const strata::core::OnDevice on(h.device());
+                h.unload();
+            }
+        }
+    } decode_head_owner;
     std::vector<std::unique_ptr<GpuStage>> stages;
     // One stage's dense weights on its device (the caller has made it current): `trim` = only layers [lb, le).
     auto load_stage_weights = [&](GpuStage& st, int64_t lb, int64_t le, bool trim) -> bool {
@@ -11739,6 +11749,58 @@ int main(int argc, char** argv) {
         // prompt read, a stage-1 window waits until the drafter has read the rows of the same parity's previous window)
         strata::core::Verifier* PV[2][2] = {{&ver, &ver_b}, {pipe ? &stages.back()->ver : nullptr, pipe ? &stages.back()->ver_b : nullptr}};
         SplitDrive* PSD[2] = {&split_drive, &split_drive_b};
+        // Experimental main-head placement for solo PW2 decode only. The prefill layers, original head,
+        // drafter and every normal graph retain their placement. Unset/-1 keeps the original engine path.
+        int decode_head_device = -1;
+        std::vector<int> decode_head_devices;
+        if (const char* v = std::getenv("STRATA_DECODE_HEAD_GPU"); v != nullptr && v[0] != '\0' && std::strcmp(v, "-1") != 0) {
+            const char* at = v;
+            while (*at) {
+                char* end = nullptr;
+                const long d = std::strtol(at, &end, 10);
+                if (end == at || (*end != '\0' && *end != ',') || d < 0 || d > 31 ||
+                    decode_head_devices.size() >= 2 || (*end == ',' && end[1] == '\0')) {
+                    std::fprintf(stderr, "strata serve: STRATA_DECODE_HEAD_GPU must be -1 (off), D or D1,D2\n");
+                    return 1;
+                }
+                decode_head_devices.push_back((int) d);
+                at = *end == ',' ? end + 1 : end;
+            }
+        }
+        if (!decode_head_devices.empty()) {
+            decode_head_device = decode_head_devices.front();
+            if (decode_head_devices.size() == 2 && decode_head_devices[0] == decode_head_devices[1]) {
+                std::fprintf(stderr, "strata serve: decode head shards need different GPUs\n");
+                return 1;
+            }
+            for (size_t i = 0; i < decode_head_devices.size(); ++i) {
+                const int target = decode_head_devices[i];
+                bool in_split = target == 0;
+                for (const auto& st : stages) in_split = in_split || st->dev == target;
+                if (!pipe || o.pipeline_windows != 2 || !last_st || target == last_st->dev ||
+                    !in_split || o.native_head_shards.empty()) {
+                    std::fprintf(stderr, "strata serve: decode head needs PW2 and different GPUs already in the layer split\n");
+                    return 1;
+                }
+                const strata::core::OnDevice on_head(target);
+                auto& head = decode_head_owner.head[i];
+                if (!head.load(o.native_head_shards, g.n_embd, n_vocab, err) || head.on_host()) {
+                    std::fprintf(stderr, "strata serve: decode head on CUDA%d must fit in VRAM: %s\n", target, err.c_str());
+                    return 1;
+                }
+            }
+            const auto* second = decode_head_devices.size() == 2 ? &decode_head_owner.head[1] : nullptr;
+            for (int par = 0; par < 2; ++par)
+                if (!stage_ver_p(n_stages - 1, par).set_decode_head(decode_head_owner.head[0], err, second)) {
+                    std::fprintf(stderr, "strata serve: decode head: %s\n", err.c_str());
+                    return 1;
+                }
+            std::fprintf(stderr, "strata serve: decode head on CUDA%d%s: %llu MiB replicated per GPU, Q8_1 handoff, "
+                                 "PW2 solo decode%s; prefill and batch placement unchanged\n", decode_head_device,
+                         second ? (std::string("+") + std::to_string(decode_head_devices[1])).c_str() : "",
+                         (unsigned long long) (decode_head_owner.head[0].weight_bytes() >> 20),
+                         second ? " (two vocabulary shards, greedy only)" : " only");
+        }
         cudaEvent_t pl_mtp_ev[2] = {nullptr, nullptr};
         bool pl_mtp_live[2] = {false, false};
         bool pl_prepared = false;
@@ -11751,6 +11813,8 @@ int main(int argc, char** argv) {
                     const strata::core::OnDevice on(v.device());
                     if (!v.capture_all(e)) return false;
                 }
+            for (int par = 0; par < 2; ++par)
+                if (!stage_ver_p(n_stages - 1, par).prepare_decode_head(e)) return false;
             if (!mtp.prepare_prefill(e)) return false;
             if (o.pipeline_windows >= 2 && pl_snap_ok && !mtp.prepare_chain(e)) return false;
             const strata::core::OnDevice on(mtp.device());
@@ -17918,6 +17982,16 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                // Scope ends only after pl_drain: prompt reads and serial fallbacks always select normal graphs.
+                struct DecodeHeadScope {
+                    strata::core::Verifier& a;
+                    strata::core::Verifier& b;
+                    DecodeHeadScope(strata::core::Verifier& av, strata::core::Verifier& bv) : a(av), b(bv) {
+                        a.set_decode_head_active(true); b.set_decode_head_active(true);
+                    }
+                    ~DecodeHeadScope() { a.set_decode_head_active(false); b.set_decode_head_active(false); }
+                } decode_scope(*PV[1][0], *PV[1][1]);
+                const uint64_t head_windows_before = PV[1][0]->decode_head_windows() + PV[1][1]->decode_head_windows();
                 struct PW {
                     int T = 0, seq = 0;
                     int64_t p = 0;
@@ -18533,6 +18607,10 @@ int main(int argc, char** argv) {
                 mtp.set_source_R(ver.final_R_all());   // the serial loop's rows again
                 const double pl_ms = std::chrono::duration<double, std::milli>(Clock::now() - pl_t0).count();
                 dt_run += pl_ms;
+                if (decode_head_device >= 0)
+                    std::fprintf(stderr, "strata decode head: CUDA%d, %llu PW2 windows offloaded in this request\n",
+                                 decode_head_device, (unsigned long long) (PV[1][0]->decode_head_windows() +
+                                 PV[1][1]->decode_head_windows() - head_windows_before));
                 if (dec_timing) {
                     auto avg = [](double s_, double n_) { return n_ > 0 ? s_ / n_ : 0.0; };
                     std::fprintf(stderr, "strata pipeline: %lld windows in %.0f ms (%.2f ms/window): %lld speculative, %lld on "

@@ -24,6 +24,7 @@
 #include <cstdio>
 
 #include "strata/core/expert_source.hpp"
+#include "strata/core/decode_head.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -36,11 +37,13 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <memory>
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace strata::core {
+
 
 /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
 /// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their
@@ -337,6 +340,12 @@ public:
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
     bool capture_all(std::string& err);
+    /// Optional PW2 decode-only head on another GPU. Normal prompt/run/batch graphs stay intact.
+    /// The NativeHead must outlive this verifier. Call after init, before capture_all.
+    bool set_decode_head(const NativeHead& head, std::string& err, const NativeHead* second = nullptr);
+    void set_decode_head_active(bool on) { decode_head_active_ = on; }
+    bool prepare_decode_head(std::string& err);
+    uint64_t decode_head_windows() const { return decode_head_windows_; }
     bool pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
     /// Stage a window ahead of its launch (positions, and the PLE rows from `ple_prev` = the two tokens before the
     /// window as they WILL be, their pages prefetched).  A later `pl_launch` of the same window (T, pos0, tokens, and
@@ -620,6 +629,13 @@ private:
     SessionState* ss_ = nullptr;
     VerifyHits hits_;
     const NativeHead* head_ = nullptr;
+    std::unique_ptr<DecodeHeadWindow> decode_head_;
+    std::unique_ptr<DecodeHeadWindow> decode_head_second_;
+    bool decode_head_active_ = false;   // only the PW2 decode scope enables it, never prompt reads
+    bool record_decode_head_ = false;  // capturing the separate headless body variant
+    bool fl_decode_head_ = false;      // snapshotted at launch: drain/cancel must finish the same path
+    uint64_t decode_head_windows_ = 0;
+    bool last_decode_head_ = false;    // the location of the last completed logits
     int max_t_ = 0;
     float* ple_key_ = nullptr;   ///< STRATA_PLE_BATCH: the window rows' PLE key / value projections
     float* ple_val_ = nullptr;
@@ -640,6 +656,7 @@ private:
     // scores; see run()); without it only [0] is ever captured
     // (per window size T = 1..kVerifyLongT: a solo window is at most 8 rows (16 with --lookup-max-t), but a merge window of a wide batch is not)
     cudaGraphExec_t exec_[2][strata::kernels::kVerifyLongT + 1] = {};
+    cudaGraphExec_t exec_decode_head_[2][strata::kernels::kVerifyLongT + 1] = {};
     cudaGraphExec_t exec_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     bool launched_[2][strata::kernels::kVerifyLongT + 1] = {}, launched_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
     int sel_long_ = 0;
