@@ -129,8 +129,29 @@ def gr_kernel_names(s):
     return pat.sub(lambda m: (">>(" if m.group(2) == "gr_down_staged_kernel" else f", dpct_kernel_scalar<{m.group(3)}>>>(")
                    + m.group(1) + m.group(2) + "(", s)
 edit("src/kernels/cuda/fused_gr.dp.cpp", gr_kernel_names)
-edit("src/kernels/cuda/elementwise.dp.cpp", doorbell)
-edit("src/kernels/cuda/verify_kernels.dp.cpp", doorbell)
+# 7c'. #1397: the bound of those spins is chosen per device at run time (strata::spin_max(queue), sycl_doorbell.hpp), not the
+#      build's constant kSpinMax: each waiting kernel takes it as a `uint32_t spin_max` argument and its launcher passes
+#      strata::spin_max(*strata::q_of(stream)). Idempotent: a file that already has the argument is left alone.
+def spin_bound_at_run_time(s):
+    for kernel, launcher in (("doorbell_wait_kernel", "doorbell_wait"), ("wait_flag_ge_or_kernel", "wait_flag_ge_or"),
+                             ("wait_flag_ge_kernel", "wait_flag_ge")):
+        sig = re.compile(r"(__dpct_inline__ void " + kernel + r"\([^)]*?)\)(\s*\{)")
+        m = sig.search(s)
+        if m and "spin_max" not in m.group(1):
+            s = s[:m.start()] + m.group(1) + ", uint32_t spin_max)" + m.group(2) + s[m.end():]
+        call = re.compile(r"(\b" + kernel + r"\((?:[^()]|\([^()]*\))*?)\);")
+        s = call.sub(lambda c: c.group(0) if "spin_max" in c.group(1) else c.group(1) + ", spin_max);", s)
+        head = re.compile(r"^(void " + launcher + r"\([^)]*\)(?: try)? \{\n)", re.M)
+        h = head.search(s)
+        if h and "strata::spin_max(" not in s[h.end():h.end() + 200]:
+            at = h.end()
+            guard = re.match(r"    if \([^\n]*\) return;\n", s[at:])   # a null-argument guard stays first
+            if guard:
+                at += guard.end()
+            s = s[:at] + "    const uint32_t spin_max = strata::spin_max(*strata::q_of(stream));\n" + s[at:]
+    return s.replace("strata::kSpinMax", "spin_max")
+edit("src/kernels/cuda/elementwise.dp.cpp", lambda s: spin_bound_at_run_time(doorbell(s)))
+edit("src/kernels/cuda/verify_kernels.dp.cpp", lambda s: spin_bound_at_run_time(doorbell(s)))
 
 # 7d. cudaMemcpy / cudaMemset are synchronous; dpct emitted `get_in_order_queue().memcpy(...)` with no wait where
 #     the source was pageable ("call wait() if needed"). The streaming expert source hands out ring-buffer blobs,
@@ -212,6 +233,26 @@ edit("src/kernels/cuda/iq_kernels.dp.cpp", lambda s: s.replace("get_int_from_tab
 edit("src/program/generate.cpp", lambda s: s.replace(
     "gs ? gs->adapt_stream\n                           : adapt_stream->memcpy(",
     "(gs ? gs->adapt_stream : adapt_stream)->memcpy("))
+
+# 9c. conversation_snapshot_test: dpct migrated cudaFreeHost(p) on sycl::malloc_host memory to libc free(p) - the
+#     test aborted with "munmap_chunk(): invalid pointer". USM host memory goes back through sycl::free.
+edit("src/core/conversation_snapshot_test.cpp", lambda s: s.replace(
+    "for (void *p : host) DPCT_CHECK_ERROR(free(p));",
+    "for (void *p : host) DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));   // SYCL port: dpct wrote free(p) for cudaFreeHost"))
+
+# 9d. s2_expert_grouped: the new transposed kernels (gu/down_grouped_t_kernel) write `acc += dw * dx * v` in one
+#     expression, which -fp-model=precise contracts to an FMA; the previous kernels compute the product in
+#     chunk_dot and add it in the caller, which it does not. nvcc contracts both, so on CUDA they are bitwise equal
+#     (s2_expert_grouped_parity checks that); here they differed in the last bit. No contraction in the new ones.
+def s2_no_contract(s):
+    import re as _re
+    note = "    #pragma clang fp contract(off)   // SYCL port: round as the previous kernels do (see tools/fixups.py)\n"
+    for name in ("gu_grouped_t_kernel", "down_grouped_t_kernel"):
+        m = _re.search(r"__dpct_inline__ void " + name + r"\([^{]*\{\n", s)
+        if m and not s[m.end():].startswith(note):
+            s = s[:m.end()] + note + s[m.end():]
+    return s
+edit("src/kernels/cuda/s2_expert_grouped.dp.cpp", s2_no_contract)
 
 # 10. %globaltimer: there is no device-side wall clock in SPIR-V; the verify-window stage profiler reads zeros.
 edit("src/kernels/cuda/verify_kernels.dp.cpp", lambda s: s.replace(
@@ -313,3 +354,57 @@ edit("src/program/generate.cpp", sub(
 edit("src/kernels/cuda/native_router.dp.cpp", lambda s: s.replace(
     "    item_ct1.barrier(sycl::access::fence_space::local_space);",
     "    sycl::group_barrier(item_ct1.get_sub_group());  // only subgroup row zero participates"))
+
+# MtpDrafter: CUDA's `cudaStream_t cs_ = nullptr` came out as the device's default in-order queue. A drafter that never
+# loads (no --mtp) kept it, and its destructor waited on and destroyed that queue: exit 139 after the output.
+edit("include/strata/core/mtp.hpp", lambda s: s.replace(
+    "    dpct::queue_ptr cs_ = &dpct::get_in_order_queue();\n",
+    "    dpct::queue_ptr cs_ = nullptr;   // load() creates it; not the device's queue, which ~MtpDrafter would destroy\n"))
+
+# `strata --version` must print before any GPU is touched (the engine smoke test of `strata update` runs it, and a user outside the
+# `render` group has no usable device). Two things in dpct's helper headers looked up the SYCL devices before main:
+# 1. blas::descriptor's `static inline queue_ptr _saved_queue_ptr = &get_default_queue();` (an inline variable): the default is
+#    looked up in get_saved_queue() instead.
+def lazy_saved_queue(s):
+    s = s.replace("  static inline ::dpct::cs::queue_ptr _saved_queue_ptr =\n      &::dpct::cs::get_default_queue();",
+                  "  static inline ::dpct::cs::queue_ptr _saved_queue_ptr = nullptr;")
+    return s.replace("  static inline sycl::queue &get_saved_queue() noexcept {\n    return *_saved_queue_ptr;",
+                     "  static inline sycl::queue &get_saved_queue() noexcept {\n"
+                     "    if (!_saved_queue_ptr) _saved_queue_ptr = &::dpct::cs::get_default_queue();\n"
+                     "    return *_saved_queue_ptr;")
+edit("include/dpct/blas_utils.hpp", lazy_saved_queue)
+
+# 2. dpct::device_memory (global_memory / constant_memory) sized its per-device pointer table, and so built mem_mgr and dev_mgr, in its
+#    constructor. The engine's namespace-scope tables (iq4nl_values, c_codes) are heap objects built before main. Both now happen at the
+#    first get_ptr_impl(); the destruction order the original comment protected does not arise for objects that are never freed.
+def lazy_device_memory(s):
+    s = s.replace("        _host_ptr(nullptr), _device_ptrs(get_ptrs_size(), nullptr) {\n", "        _host_ptr(nullptr) {\n")
+    s = s.replace("    // Make sure that singleton class mem_mgr and dev_mgr will destruct later\n    // than this.\n"
+                  "    detail::mem_mgr::instance();\n    dev_mgr::instance();\n  }\n",
+                  "    // Strata: the pointer table, mem_mgr and dev_mgr are made at the first get_ptr_impl() (sycl/tools/fixups.py)\n  }\n")
+    s = s.replace("  std::vector<value_t *> _device_ptrs;\n  sycl::queue _q;\n};",      # a default-built sycl::queue picks a device
+                  "  std::vector<value_t *> _device_ptrs;\n  std::optional<sycl::queue> _q;   // Strata: a default-built sycl::queue picks a device (sycl/tools/fixups.py)\n};")
+    return s.replace("  value_t *get_ptr_impl(sycl::queue &q) {\n#ifdef DPCT_USM_LEVEL_NONE\n",
+                     "  value_t *get_ptr_impl(sycl::queue &q) {\n"
+                     "    if (_device_ptrs.empty()) {\n      detail::mem_mgr::instance();\n      dev_mgr::instance();\n"
+                     "      _device_ptrs.assign(get_ptrs_size(), nullptr);\n    }\n#ifdef DPCT_USM_LEVEL_NONE\n")
+edit("include/dpct/detail/memory_detail.hpp", lazy_device_memory)
+
+# 3. the migrated generate.cpp has no `--version` (src/program/generate.cpp answers it before any GPU is touched): the engine printed its
+#    usage and exited 2. Same lines as the CUDA tree, at the top of main().
+def version_flag(s):
+    if '"--version"' in s:
+        return s
+    return s.replace("    std::setvbuf(stdout, nullptr, _IONBF, 0);\n#if (defined(STRATA_USE_HIP)",
+                     "    std::setvbuf(stdout, nullptr, _IONBF, 0);\n"
+                     "    // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is touched, as the CUDA\n"
+                     "    // and HIP engines have answered it. `strata update` runs it as the engine's smoke test, and the Intel package build runs it with\n"
+                     "    // an empty environment.\n"
+                     "    for (int i = 1; i < argc && i < 3; ++i) {\n"
+                     "        if (std::strcmp(argv[i], \"--version\") == 0 || std::strcmp(argv[i], \"-V\") == 0) {\n"
+                     "            std::printf(\"strata %s\\n\", STRATA_VERSION);\n"
+                     "            return 0;\n"
+                     "        }\n"
+                     "    }\n"
+                     "#if (defined(STRATA_USE_HIP)", 1)
+edit("src/program/generate.cpp", version_flag)

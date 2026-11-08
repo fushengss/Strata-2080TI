@@ -22,6 +22,7 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
+#include "strata/core/spec_proposal.hpp"
 #include "strata/core/emulate.hpp"
 
 #include <cuda_runtime.h>
@@ -158,7 +159,7 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
     float bv = __int_as_float(0xff800000);   // -inf
     int best = n_vocab;
     for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
-        const float s = apply_penalties(l[v], hit_count(v), p);
+        const float s = apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
         if (s > bv) { bv = s; best = v; }
     }
     for (int off = 16; off > 0; off >>= 1) {
@@ -355,7 +356,7 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
             bool taken = false;
             for (int j = 0; j < i; ++j) if (sel_ids[j] == v) { taken = true; break; }
             if (taken) continue;
-            const float s = apply_penalties(l[v], hit_count(v), p);
+            const float s = apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
             if (s > bv) { bv = s; best = v; }
         }
         for (int off = 16; off > 0; off >>= 1) {
@@ -601,7 +602,7 @@ sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const in
         float bv = __int_as_float(0xff800000);   // -inf
         int best = n_vocab;
         for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
-            const float s = apply_penalties(l[v], hit_count(v), p);
+            const float s = apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
             if ((s < prev_v || (s == prev_v && v > prev_i)) && s > bv) { bv = s; best = v; }
         }
         for (int off = 16; off > 0; off >>= 1) {
@@ -730,7 +731,7 @@ sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const i
 #pragma unroll
     for (int j = 0; j < kSplitPerLane; ++j) {
         const int v = lo + 32 * j + lane;
-        s[j] = v < n_vocab ? l[v] : __int_as_float(0xff800000);
+        s[j] = v < n_vocab ? (p.logit_bias ? l[v] + p.logit_bias[v] : l[v]) : __int_as_float(0xff800000);
     }
     if (use_bits) {
 #pragma unroll
@@ -1007,6 +1008,7 @@ spec_draft_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int
 /// < n_q, a point mass otherwise), and write out[t] = d on an accept, the residual sample on a reject (never d), the
 /// plain sample on the window's last row.  The host's `while (window[a+1] == out[a]) ++a` is unchanged.  Rows are
 /// independent: each draws its own uniforms from its position (p.counter + t).  `dtok` holds the T-1 drafts.
+template<bool Augmented>
 __global__ void __launch_bounds__(32)
 spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vocab, const SamplerParams p, int k, int T,
                          const int32_t* __restrict__ dtok, const int32_t* __restrict__ qbuf, int n_q,
@@ -1028,9 +1030,10 @@ spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_voca
     const int n_keep = sampled_probs_warp(sel_logit, k, p, ex);
     const uint64_t pos = p.counter + (uint64_t) t;
     const int d = t < T - 1 ? dtok[t] : -1;
-    const int32_t* qid = qbuf + (size_t) t * strata::core::kSpecQStride;
-    const float* qpr = (const float*) (qid + strata::core::kSpecQEntries);
     const bool has_q = t < n_q;
+    const int32_t* qid = has_q ? qbuf + (size_t) t * strata::core::kSpecQStride : nullptr;
+    const float* qpr = has_q ? (const float*) (qid + strata::core::kSpecQEntries) : nullptr;
+    const auto kind = strata::core::proposal::rowkind(t, T, n_q);
     // lane 0: p(d), q(d) and the accept decision.  dec: 0 plain sample, 1 accept, 2 reject; point: no usable q(d)
     int dec = 0, point = 1;
     if (lane == 0 && d >= 0) {
@@ -1044,6 +1047,17 @@ spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_voca
         point = qd > 0.0 ? 0 : 1;
         const float u = philox_uniform(p.seed, pos | strata::core::kSpecCtrAccept);
         dec = (pd > 0.0 && (point ? (double) u < pd : (double) u * qd < pd)) ? 1 : 2;
+        if constexpr (Augmented) {
+            // An explicit mu candidate cannot silently become a point proposal.
+            if (has_q && (!(qd > 0.0) || !isfinite(qd))) dec = 3;
+        }
+    }
+    if constexpr (Augmented) {
+        if (lane == 0 && kind == strata::core::proposal::RowKind::MuOffer && (d < 0 || d >= n_vocab)) dec = 3;
+        if (lane == 0 && kind == strata::core::proposal::RowKind::NullTail) {
+            // Last row (including T=1) has d=-1, no dtok read or acceptance draw.
+            dec = 2; point = 0;
+        }
     }
     dec = __shfl_sync(kFullMask, dec, 0);
     point = __shfl_sync(kFullMask, point, 0);
@@ -1065,7 +1079,9 @@ spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_voca
     }
     if (lane == 0) {
         int tok;
-        if (dec == 0) {   // no draft on this row: the plain sample, the exact-match sampler's own draw
+        if (dec == 3) {
+            tok = strata::core::proposal::kProposalSamplerErrorToken;
+        } else if (dec == 0) {   // no draft on this row: the plain sample, the exact-match sampler's own draw
             const float u = philox_uniform(p.seed, pos);
             double cum = 0.0;
             tok = sel_ids[n_keep > 0 ? n_keep - 1 : 0];
@@ -1079,7 +1095,12 @@ spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_voca
             double sum = 0.0;
             for (int i = 0; i < n_keep; ++i) sum += rw[i];
             if (!(sum > 0.0)) {
-                tok = d;   // p and q agree everywhere (rounding): the draft is as likely as it can be
+                if constexpr (Augmented) {
+                    tok = kind == strata::core::proposal::RowKind::NullTail
+                        ? strata::core::proposal::kProposalSamplerErrorToken : d;
+                } else {
+                    tok = d;   // preserve the legacy non-NULL rounding behavior
+                }
             } else {
                 const float u = philox_uniform(p.seed, pos | strata::core::kSpecCtrResid);
                 double cum = 0.0;
@@ -1258,7 +1279,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         }();
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
-        if (!(multi && shmem == 0 && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
+        if (!(multi && shmem == 0 && !p.logit_bias && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
             sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
                 logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
     } else if (sampled_path() == SampledPath::Old) {
@@ -1344,9 +1365,14 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
 }
 
 
-bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+template<bool Augmented>
+static bool sample_tokens_spec_impl(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
                         void* stream) {
+    if constexpr (Augmented) {
+        if (n_tokens < 1 || n_q < 0 || n_q > n_tokens || (n_q > 0 && qbuf == nullptr) ||
+            (n_tokens > 1 && dtok == nullptr)) return false;
+    }
     if (n_tokens <= 0 || n_vocab <= 0 || p.greedy || p.temperature <= 0.0f) return false;
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) return false;
     const int k = sampled_k(p.top_k, n_vocab);
@@ -1358,15 +1384,31 @@ bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const in
     if (scratch == nullptr) return false;
     sampler_split_part_kernel<<<dim3((unsigned) n_blocks, (unsigned) n_tokens), kSplitWarps * 32, 0,
                                 (cudaStream_t) stream>>>(logits, n_vocab, history, history_len, p, k, n_blocks, scratch);
-    spec_verify_merge_kernel<<<(unsigned) n_tokens, 32, 0, (cudaStream_t) stream>>>(scratch, n_blocks, n_vocab, p, k,
+    spec_verify_merge_kernel<Augmented><<<(unsigned) n_tokens, 32, 0, (cudaStream_t) stream>>>(scratch, n_blocks, n_vocab, p, k,
                                                                                     n_tokens, dtok, qbuf, n_q, out);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
+        if constexpr (Augmented) return false;
         std::fprintf(stderr, "sample_tokens_spec launch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) {
+        const cudaError_t sync = cudaDeviceSynchronize();
+        if constexpr (Augmented) { if (sync != cudaSuccess) return false; }
+    }
     return true;
+}
+
+bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
+                        void* stream) {
+    return sample_tokens_spec_impl<false>(logits, n_tokens, n_vocab, history, history_len, p, dtok, qbuf, n_q, out, stream);
+}
+
+bool sample_tokens_proposal(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
+                        void* stream) {
+    return sample_tokens_spec_impl<true>(logits, n_tokens, n_vocab, history, history_len, p, dtok, qbuf, n_q, out, stream);
 }
 
 void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,

@@ -20,6 +20,8 @@
 
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
+#include "strata/kprof.hpp"
+#include "strata/core/geometry.hpp"
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/native_qsa_score.hpp"
@@ -32,6 +34,8 @@ namespace strata::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
+static_assert(D == strata::core::kCompiledGeometry.idx_key_dim && HEADS == strata::core::kCompiledGeometry.idx_q_heads && R == strata::core::kCompiledGeometry.idx_block,
+              "native_qsa_score is compiled for core/geometry.hpp");
 struct TileA { uint32_t x[4]; };
 struct TileB { uint32_t x[2]; };
 struct TileC { float x[4]={0.0f,0.0f,0.0f,0.0f}; };
@@ -290,8 +294,8 @@ void native_qsa_score(const float* pooled,const float* query,const float* bias,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class score_kernel_59cd1b>>(
+        strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+            ->template parallel_for<dpct_kernel_name<class score_kernel_59cd1b>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 unsigned((max_blocks + ROWS - 1) / ROWS)) *

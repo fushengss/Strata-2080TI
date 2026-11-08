@@ -56,6 +56,47 @@ class PrebuiltVision(unittest.TestCase):
         self.assertEqual(quiet(setup.prebuilt_vision, {"archs": [75, 86]}, {"arch": 75}, "gpu")[0], "gpu")
 
 
+class VisionArchsAsAString(unittest.TestCase):
+    """#3810: the packaging recipes write BUILD.json `vision_archs` as ONE string ("75;86;89;120"); 0.2.3 iterated it character by
+    character and setup stopped with int(';') on the released Windows CUDA package.  A string and a list mean the same."""
+    RELEASED = {"version": "0.2.3", "archs": [75, 86, 89, 120], "ptx": True, "cuda": "13.0", "vision": "gpu-cuda13",
+                "vision_archs": "75;86;89;120", "portable": True}
+
+    def test_the_released_package_manifest_is_read(self):
+        for arch in (75, 86, 89, 120):
+            self.assertEqual(quiet(setup.prebuilt_vision, self.RELEASED, {"arch": arch}, "gpu")[0], "gpu")
+
+    def test_a_card_the_string_does_not_list_gets_the_cpu_reader(self):
+        meta = {**self.RELEASED, "vision_archs": "86;89;120", "ptx": False}
+        got, out = quiet(setup.prebuilt_vision, meta, {"arch": 75}, "gpu")
+        self.assertEqual(got, "cpu")
+        self.assertIn("runs on the CPU instead", out)
+        self.assertEqual(quiet(setup.prebuilt_vision, {**meta, "ptx": True}, {"arch": 120}, "gpu")[0], "gpu")
+
+    def test_a_string_and_a_list_agree(self):
+        for value in ("75;86;89;120", [75, 86, 89, 120], ["sm_75", "86-real", "89", "compute_120"], "75,86 89;120"):
+            self.assertEqual(setup.arch_numbers(value), [75, 86, 89, 120], value)
+        self.assertEqual(setup.arch_numbers(None), [])
+        self.assertEqual(setup.arch_numbers(""), [])
+        self.assertEqual(setup.arch_names("gfx1100;gfx1201"), ["gfx1100", "gfx1201"])
+        self.assertEqual(setup.arch_names(["gfx1100"]), ["gfx1100"])
+        self.assertEqual(setup.arch_names(None), [])
+
+    def test_the_other_readers_of_the_manifest_take_a_string_too(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "BUILD.json").write_text('{"archs": "60;61;70", "ptx": true}', encoding="utf-8")
+            with mock.patch.object(setup, "engine_dir", return_value=Path(d)):
+                self.assertEqual(setup.engine_archs(), ([60, 61, 70], True))
+            (Path(d) / "BUILD.json").write_text('{"backend": "hip", "archs": ["gfx1100"], "vision_archs": "gfx1100;gfx1201"}', encoding="utf-8")
+            self.assertEqual(setup.reader_archs(Path(d)), ["gfx1100", "gfx1201"])
+            (Path(d) / "BUILD.json").write_text('{"backend": "hip", "archs": ["gfx1100", "gfx1201"]}', encoding="utf-8")
+            self.assertEqual(setup.reader_archs(Path(d)), ["gfx1100", "gfx1201"])
+        self.assertEqual(setup.reader_archs(Path(__file__).parent / "no-such-folder"), [])
+
+
 class GgufDirShards(unittest.TestCase):
     """#305: --gguf-dir reads the shard count from the -of-N part of the name instead of assuming two."""
 
@@ -95,8 +136,8 @@ class GgufDirShards(unittest.TestCase):
 class GgufDirUnsupported(unittest.TestCase):
     """#444: --gguf-dir with GGUFs Strata cannot run (Unsloth's UD-IQ3_XXS, UD-Q2_K_XL) says so, names the files it
     runs (ISTA-DASLab's GSQ-RCO, the Coder's, Unsloth's UD-Q4_K_XL) and the --family/--model of the usable ones."""
-    UD = ["Qwen3.8-Flash-Next-UD-IQ3_XXS-%05d-of-00003.gguf" % i for i in range(1, 4)] + \
-         ["Qwen3.8-Flash-Next-UD-Q2_K_XL-%05d-of-00003.gguf" % i for i in range(1, 4)]
+    UD = ["Qwen3.8-Flash-Next-UD-IQ1_S-%05d-of-00003.gguf" % i for i in range(1, 4)] + \
+         ["Qwen3.8-Flash-Next-BF16-%05d-of-00008.gguf" % i for i in range(1, 4)]   # round 0214: UD-IQ3_XXS and UD-Q2_K_XL run now; UD-IQ1_S and BF16 do not
 
     def problem(self, names, family="qwen", model="IQ3_XXS"):
         with tempfile.TemporaryDirectory() as d:
@@ -108,8 +149,9 @@ class GgufDirUnsupported(unittest.TestCase):
             return p and (p[0].replace(d, "<D>"), p[1])
 
     def test_quant_names(self):
-        for name, want in (("Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf", "UD-IQ3_XXS"),
-                           ("Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf", "UD-Q2_K_XL"),
+        for name, want in (("Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf", "UD-IQ1_S"),
+                           ("Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf", None),
+                           ("Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf", None),
                            ("model-Q4_K_M.gguf", "Q4_K_M"),
                            ("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", None),
                            ("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf", None),
@@ -118,18 +160,16 @@ class GgufDirUnsupported(unittest.TestCase):
             self.assertEqual(setup.gguf_unsupported(name), want, name)
 
     def test_an_unsloth_ud_file_is_not_taken_for_a_gsq_rco_size(self):
-        msg, hint = self.problem(self.UD)                   # IQ3_XXS: UD-IQ3_XXS has the size in its name
-        self.assertEqual(msg, "Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf is UD-IQ3_XXS, a GGUF Strata "
-                              "cannot run")
+        msg, hint = self.problem(self.UD[:3], "unsloth", "UD-IQ1_M")        # a UD-IQ1_S set asked for as UD-IQ1_M
+        self.assertIn("UD-IQ1_S", msg + hint)
         self.assertIn("ISTA-DASLab's GSQ-RCO files", hint)
-        self.assertIn("Unsloth's UD-Q4_K_XL, UD-IQ4_XS and Q8_0 only", hint)
 
     def test_a_folder_without_the_choice_names_what_is_there(self):
         gsq = ["Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-%05d-of-00002.gguf" % i for i in (1, 2)]
         msg, hint = self.problem(self.UD + gsq, "unsloth", "UD-Q4_K_XL")
         self.assertEqual(msg, "<D> has no Qwen3.8-Flash-Next (Unsloth) UD-Q4_K_XL file")
-        self.assertIn("Not usable here: Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf, "
-                      "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf", hint)
+        self.assertIn("Not usable here: Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf, "
+                      "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf", hint)
         self.assertIn("Usable here: --family coder --model IQ1_M", hint)
 
     def test_usable_folders_are_left_alone(self):
@@ -145,8 +185,8 @@ class GgufDirUnsupported(unittest.TestCase):
             code, out, _, _ = install(ram, found, ["--gguf-dir", d, "--family", "unsloth", "--model", "IQ3_XXS"])
         self.assertEqual(code, 1)
         self.assertIn("has no IQ3_XXS model file", out)
-        self.assertIn("choose one of: UD-IQ4_XS, UD-Q4_K_XL, Q8_0 (or IQ3_XXS: --family qwen --model IQ3_XXS, --family swift --model "
-                      "IQ3_XXS)", out)
+        self.assertIn("choose one of: UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL, Q8_0, UD-IQ1_M, UD-Q2_0, UD-IQ2_XS, UD-Q2_K_XL, UD-IQ3_XXS, UD-Q3_K_XL, "
+                      "UD-IQ4_XS-v31 (or IQ3_XXS: --family qwen --model IQ3_XXS, --family swift --model IQ3_XXS)", out)
         self.assertIn("Strata runs ISTA-DASLab's GSQ-RCO files", out)
 
 
@@ -184,6 +224,74 @@ class ReadOnlyGgufDir(unittest.TestCase):
             self.assertFalse(setup.done(Path(tmp) / "x.gguf"))
 
 
+class ReadOnlyModelFolderMark(unittest.TestCase):
+    """0.2.10: a model folder Strata cannot write to (a read-only disk) keeps its finish marks under Strata's own folder, so the
+    SHA-256 of the 110 GB Engram is not computed again on every launch."""
+
+    def test_the_mark_is_kept_elsewhere_and_the_hash_is_not_repeated(self):
+        real_write = Path.write_text
+
+        def write(self, *a, **k):
+            if self.name.endswith(".done") and "strata_marks" not in str(self):
+                raise PermissionError(13, "read-only")
+            return real_write(self, *a, **k)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = Path(tmp) / "strata_marks", Path(tmp) / "share"
+            share.mkdir()
+            f = share / "engram.gguf"
+            f.write_bytes(b"abc" * 10)
+            sha = "f" * 64
+            hashed = []
+
+            def fake_hash(path, size):
+                hashed.append(path)
+                return sha
+
+            with mock.patch.object(setup, "ROOT", root), mock.patch.object(Path, "write_text", write),                     mock.patch.object(setup, "_hash_file", fake_hash):
+                setup.verify_sha256(f, 30, sha)
+                self.assertEqual(len(hashed), 1)
+                self.assertFalse((share / "engram.gguf.done").exists())
+                self.assertTrue(setup.done(f))
+                setup.verify_sha256(f, 30, sha)                       # the second launch
+                self.assertEqual(len(hashed), 1, "the kept mark is found; nothing is hashed again")
+                f.write_bytes(b"abcd" * 10)                           # a changed file has no mark
+                self.assertFalse(setup.done(f))
+
+
+class OfflineStart(unittest.TestCase):
+    """0.2.10: a PC with every file and no internet starts a model that is already prepared."""
+
+    def test_the_llama_cpp_source_is_not_fetched_until_a_model_is_prepared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fetched = []
+            with mock.patch.object(setup, "home", lambda: Path(tmp)), mock.patch.object(setup, "get_llama_cpp", lambda: fetched.append(1)):
+                path = setup.llama_cpp_if_here()
+                self.assertEqual(path, Path(tmp) / "third_party" / "llama.cpp")
+                self.assertEqual(fetched, [], "starting a prepared model does not reach github.com")
+                with mock.patch.object(setup.subprocess, "run", lambda *a, **k: mock.Mock(returncode=0)),                         mock.patch.object(setup.acquisition, "require", lambda *a, **k: None), mock.patch.object(setup, "CONTROL", False):
+                    setup.run([sys.executable, "tools/x.py"], env=dict(os.environ, STRATA_GGUF_PY=str(path / "gguf-py")))
+                self.assertEqual(fetched, [1], "a preparation tool needs it: fetched then")
+
+    def test_a_pinned_file_copied_in_by_hand_is_checked_here_without_the_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "drafter.gguf"
+            f.write_bytes(b"abc" * 10)
+            url = "https://huggingface.co/x/y/resolve/main/drafter.gguf"
+            with mock.patch.object(setup, "file_pin", lambda u: (30, "a" * 64)), mock.patch.object(setup, "_hash_file", lambda p, n: "a" * 64),                     mock.patch.object(setup, "_urlopen", side_effect=OSError("no network")):
+                quiet(setup.download, url, f, "drafter")
+            self.assertTrue(setup.done(f))
+            self.assertIn("sha256 " + "a" * 64, setup.mark_text(f))
+
+    def test_every_shared_deepseek_file_has_a_pin_so_a_copy_made_by_hand_never_needs_the_network(self):
+        """The final boston gate stopped on "cannot reach huggingface.co" at a shared file (the drafter, the metadata shard) that was already
+        in the shared folder with no finish mark: the pin is what lets download() check it here."""
+        for name, base in setup.DSV41_SHARED.items():
+            pin = setup.file_pin(base + name)
+            self.assertIsNotNone(pin, name)
+            self.assertEqual(tuple(pin), tuple(setup.DSV41_ALL_FILES[name]), name)
+
+
 class VsRange(unittest.TestCase):
     """#985: Visual Studio 2026 (version 18) is looked for only with CUDA 13.3 or newer."""
 
@@ -191,15 +299,26 @@ class VsRange(unittest.TestCase):
         seen = []
         with mock.patch.object(setup.Path, "exists", lambda self: True),                 mock.patch.object(setup, "out", lambda cmd, *a, **k: seen.append(cmd) or "C:/VS"):
             setup.find_vcvars(cuda_v)
-        return seen[0][seen[0].index("-version") + 1]
+        return seen[0][seen[0].index("-version") + 1] if "-version" in seen[0] else None
 
     def test_the_range_follows_the_toolkit(self):
-        self.assertEqual(self.asked(None), "[16.0,18.0)")
-        self.assertEqual(self.asked((13, 0)), "[16.0,18.0)")
-        self.assertEqual(self.asked((13, 2)), "[16.0,18.0)")
-        self.assertEqual(self.asked((13, 3)), "[16.0,19.0)")
-        self.assertEqual(self.asked((14, 0)), "[16.0,19.0)")
+        self.assertIsNone(self.asked(None))      # #881: without CUDA vswhere gets no version range
+        self.assertEqual(self.asked((13, 0)), "[17.0,18.0)")
+        self.assertEqual(self.asked((13, 2)), "[17.0,18.0)")
+        self.assertEqual(self.asked((13, 3)), "[17.0,19.0)")
+        self.assertEqual(self.asked((14, 0)), "[17.0,19.0)")
 
+
+    def test_vcvars_by_hand(self):
+        """#881: STRATA_VCVARS names a vcvars64.bat directly, for an install vswhere cannot use."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            bat = Path(d) / "vcvars64.bat"
+            bat.write_text("rem")
+            with mock.patch.dict(os.environ, {"STRATA_VCVARS": str(bat)}):
+                self.assertEqual(setup.find_vcvars(), bat)
+            with mock.patch.dict(os.environ, {"STRATA_VCVARS": str(Path(d) / "missing.bat")}):
+                self.assertIsNone(setup.find_vcvars())
 
 class ExperimentalSm60(unittest.TestCase):
     """#295: Pascal (6.x) and Volta (7.0) only with STRATA_EXPERIMENTAL_SM60=1, built with -DSTRATA_EXPERIMENTAL_SM60=ON
@@ -307,15 +426,13 @@ class ExperimentalSm60(unittest.TestCase):
 class HipVision(unittest.TestCase):
     """#304: --vision cpu with --backend hip builds the CPU image encoder beside the HIP engine."""
 
-    @mock.patch.object(setup, "WIN", False)            # Linux: compiled here (Windows has no AMD image encoder yet)
+    @mock.patch.object(setup, "WIN", False)
     def test_the_choice(self):
         self.assertEqual(quiet(setup.hip_vision, "cpu"), ("cpu", ""))
-        for asked in (None, "no", "none"):
+        for asked in ("no", "none"):
             self.assertEqual(quiet(setup.hip_vision, asked), ("none", ""))
-        for asked in ("yes", "gpu"):
-            got, out = quiet(setup.hip_vision, asked)
-            self.assertEqual(got, "none")
-            self.assertIn("--vision cpu", out)
+        for asked in (None, "yes", "gpu"):            # pictures are on by default; the engine folder's readers settle gpu vs cpu
+            self.assertEqual(quiet(setup.hip_vision, asked), ("gpu", ""))
 
     def build(self, meta, vision, vexe=False):
         """build_engine_hip with an engine that is already built: only the encoder can be missing."""
@@ -360,11 +477,12 @@ class HipVision(unittest.TestCase):
 class RotationalDisk(unittest.TestCase):
     """#605: a model on a rotational disk gets --ple-io ram when the n-gram table fits the RAM, else a warning."""
 
-    def install(self, ram, disk):
+    def install(self, ram, disk, platform_ok=False, model="Q2_0"):
         from test_setup_golden import PROFILES, install
         _, found = PROFILES["64GB-1x32GB"]
-        return install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start"],
-                       extra=[mock.patch.object(setup, "rotational_disk", lambda p: disk)])
+        return install(ram, found, ["--family", "qwen", "--model", model, "--no-start"],
+                       extra=[mock.patch.object(setup, "rotational_disk", lambda p: disk),
+                              mock.patch.object(setup, "ple_ram_platform_ok", lambda: platform_ok)])
 
     def test_fits(self):
         code, out, cfg, _ = self.install(127.8, "sdb")
@@ -383,6 +501,29 @@ class RotationalDisk(unittest.TestCase):
         code, out, cfg, _ = self.install(127.8, None)
         self.assertNotIn("--ple-io", cfg["args"])
         self.assertNotIn("rotational", out)
+
+    def test_ssd_ram_to_spare(self):
+        # 147-verify (Linux): an SSD and RAM beyond the model's need + the table + 16 GB: the table in RAM too
+        code, out, cfg, _ = self.install(127.8, None, platform_ok=True)
+        self.assertEqual(code, 0, out)
+        a = cfg["args"]
+        self.assertEqual(a[a.index("--ple-io") + 1], "ram")
+        self.assertIn("kept in RAM (--ple-io ram)", out)
+        self.assertNotIn("rotational", out)
+
+    def test_ssd_little_ram_keeps_the_ssd(self):
+        # Q2_0 needs 48 GB + the 28.8 GB table + 16: a 64 GB / 92 GB PC keeps the SSD reads
+        for ram in (63.7, 92.0):
+            code, out, cfg, _ = self.install(ram, None, platform_ok=True)
+            self.assertEqual(code, 0, out)
+            self.assertNotIn("--ple-io", cfg["args"])
+
+    def test_ssd_ram_rule_follows_the_model(self):
+        # IQ3_S needs 62 GB: 96 GB is not enough to spare the table, 128 GB is
+        for ram, want in ((95.8, False), (127.8, True)):
+            code, out, cfg, _ = self.install(ram, None, platform_ok=True, model="IQ3_S")
+            self.assertEqual(code, 0, out)
+            self.assertEqual("--ple-io" in cfg["args"], want, (ram, cfg["args"]))
 
     def test_sysfs(self):
         if not sys.platform.startswith("linux"):
@@ -410,8 +551,12 @@ class VramReserve(unittest.TestCase):
         self.assertEqual(a.count("--vram-reserve-mib"), 1)
         self.assertEqual(a[a.index("--vram-reserve-mib") + 1], "2048")
         self.assertIn("VRAM kept free for other programs: 2048 MiB", out)
-        code, out, cfg, _ = self.install()
+        code, out, cfg, _ = self.install("--vision", "no")
         self.assertNotIn("--vram-reserve-mib", cfg["args"])          # not given: the engine's default, as before
+        code, out, cfg, _ = self.install("--vision", "cpu")
+        self.assertNotIn("--vram-reserve-mib", cfg["args"])          # the CPU reader needs no reserve
+        code, out, cfg, _ = self.install()
+        self.assertEqual(cfg["args"][cfg["args"].index("--vram-reserve-mib") + 1], "700")   # pictures on by default, GPU reader on a 32 GB card: its 700 MiB
 
     def test_with_images_one_value(self):
         code, out, cfg, _ = self.install("--vision", "cpu", "--vram-reserve-mib", "1500")
@@ -531,12 +676,138 @@ class CudaVision(unittest.TestCase):
                 with mock.patch.object(setup, "ROOT", root), mock.patch.object(setup, "cmake_build", cmake_build), \
                         mock.patch.object(setup, "source_hash", lambda p: "V" if p == setup.VISION_SOURCES else "S"), \
                         mock.patch.object(setup, "install_build_tools", lambda gpu, yes: (str(root / "nvcc"), None)), \
-                        mock.patch.object(setup, "source_version", lambda: "test"):
+                        mock.patch.object(setup, "gpus", lambda: []), \
+                        mock.patch.object(setup, "source_version", lambda: "test"):      # no real card of the box (#4662)
                     quiet(setup.build_engine, {"arch": "86"}, vision, True, "llama")
                 self.assertEqual([t for t, _ in built], ["strata-vision"])
                 self.assertIn("-DSTRATA_PORTABLE=OFF", built[0][1])
                 self.assertIn(f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}", built[0][1])
 
 
+class ProxyHint(unittest.TestCase):
+    """0.2.10: a download that cannot reach its server says what to do behind a proxy."""
+
+    def test_the_hint_names_the_variable_and_notices_one_already_set(self):
+        names = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for n in names:
+                os.environ.pop(n, None)
+            self.assertIn("set HTTPS_PROXY", setup.proxy_hint())
+            os.environ["HTTPS_PROXY"] = "http://user:secret@proxy:3128"
+            hint = setup.proxy_hint()
+            self.assertIn("a proxy is set", hint)
+            self.assertNotIn("secret", hint)
+
+
+class SwiftIq3s(unittest.TestCase):
+    """#1651: Swift 1.5 has its own IQ3_S tier since 2026-10-08 (ukisai's Swift-1.5 GGUF repo) - the model choice
+    must not hide it behind the qwen family.  Names and sizes checked against the Hub listing when written."""
+
+    def test_iq3_s_is_a_swift_choice(self):
+        self.assertIn("swift", setup.MODELS["IQ3_S"].get("families", ("qwen", "swift")))
+
+    def test_the_published_file_names(self):
+        fam = setup.FAMILIES["swift"]
+        self.assertEqual(setup.model_shards(fam, "IQ3_S"), 2)
+        self.assertEqual([setup.model_file(fam, "IQ3_S", i) for i in (1, 2)],
+                         ["Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+                          "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"])
+
+
+class HostCompilers(unittest.TestCase):
+    """#1645: CC / CXX / CUDAHOSTCXX name the build's compilers - handed to CMake as -D, so a build folder that is
+    already configured picks them up too (CXX alone reaches CMake only on the first configure: the reporter's
+    `CXX=g++-14` run died at the last step).  CUDAHOSTCXX is nvcc's host compiler and defaults to CXX."""
+
+    def test_env_names_the_compilers(self):
+        with mock.patch.dict(os.environ, {"CC": "gcc-14", "CXX": "g++-14", "CUDAHOSTCXX": "g++-14-alt"}):
+            self.assertEqual(setup.host_compiler_defs(True), ["-DCMAKE_C_COMPILER=gcc-14",
+                                                              "-DCMAKE_CXX_COMPILER=g++-14",
+                                                              "-DCMAKE_CUDA_HOST_COMPILER=g++-14-alt"])
+
+    def test_cudahostcxx_defaults_to_cxx_and_needs_cuda(self):
+        with mock.patch.dict(os.environ, {"CC": "", "CXX": "g++-14", "CUDAHOSTCXX": ""}):
+            self.assertEqual(setup.host_compiler_defs(True), ["-DCMAKE_CXX_COMPILER=g++-14",
+                                                              "-DCMAKE_CUDA_HOST_COMPILER=g++-14"])
+            self.assertEqual(setup.host_compiler_defs(False), ["-DCMAKE_CXX_COMPILER=g++-14"])   # a C++-only project
+
+    def test_unset_adds_nothing(self):
+        with mock.patch.dict(os.environ, {"CC": "", "CXX": "", "CUDAHOSTCXX": ""}):
+            self.assertEqual(setup.host_compiler_defs(True), [])
+
+    def test_the_defs_reach_cmake(self):
+        """The engine's and the CUDA encoder's configure both take them."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            eng = root / "engine"
+            eng.mkdir()
+            (eng / "BUILD.json").write_text(json.dumps({"source": "local", "archs": [86], "src": "old"}))
+            built = []
+
+            def cmake_build(src_dir, bdir, target, defs, vcvars, bat):
+                built.append((target, defs))
+                (bdir / "bin").mkdir(parents=True, exist_ok=True)
+                (bdir / "bin" / setup.VEXE).write_bytes(b"vision")
+                (bdir / setup.EXE).write_bytes(b"engine")
+
+            env = {"CC": "gcc-14", "CXX": "g++-14", "CUDAHOSTCXX": ""}
+            with mock.patch.dict(os.environ, env), mock.patch.object(setup, "ROOT", root), \
+                    mock.patch.object(setup, "cmake_build", cmake_build), \
+                    mock.patch.object(setup, "source_hash", lambda p: "V" if p == setup.VISION_SOURCES else "new"), \
+                    mock.patch.object(setup, "install_build_tools", lambda gpu, yes: (str(root / "nvcc"), None)), \
+                    mock.patch.object(setup, "source_version", lambda: "test"):
+                quiet(setup.build_engine, {"arch": "86"}, "gpu", True, "llama")
+        for target, defs in built:
+            self.assertIn("-DCMAKE_CXX_COMPILER=g++-14", defs, target)
+            self.assertIn("-DCMAKE_CUDA_HOST_COMPILER=g++-14", defs, target)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class CalibrateWithModel(unittest.TestCase):
+    """#2036: --calibrate --model X tunes model X (it used to fall through to a plain re-setup); a model that is not
+    installed is an error that says so; --calibrate with --setup or --check says it does nothing."""
+
+    def run_main(self, *argv, installed=("iq3_xxs", "q2_0")):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfgs = []
+        for tag in installed:
+            p = Path(tmp.name) / f"strata-{tag}.json"
+            p.write_text(json.dumps({"exe": "x", "args": ["--max-context", "8192"], "model_name": tag}))
+            cfgs.append(p)
+        tuned = []
+        with mock.patch.object(sys, "argv", ["setup.py", *argv]), \
+                mock.patch.object(setup, "installed_configs", lambda: cfgs), \
+                mock.patch.object(setup, "update_installed_engine", lambda *a, **k: None), \
+                mock.patch.object(setup, "calibrate_config", lambda c: tuned.append(c.name) or True), \
+                mock.patch.object(setup, "start", lambda *a, **k: 0), \
+                mock.patch.object(setup, "data_folder", lambda d, *a, **k: (Path(tmp.name), [])), \
+                mock.patch.object(setup, "step", side_effect=SystemExit("reached the plain setup")):
+            try:
+                code, out = quiet(setup.main)
+            except SystemExit as e:
+                code, out = e.code, ""
+        return code, tuned
+
+    def test_model_is_the_target(self):
+        code, tuned = self.run_main("--calibrate", "--model", "IQ3_XXS", "--yes", "--no-start")
+        self.assertEqual((code, tuned), (0, ["strata-iq3_xxs.json"]))
+
+    def test_a_model_not_installed_is_an_error(self):
+        code, tuned = self.run_main("--calibrate", "--model", "IQ3_S", "--yes", "--no-start")
+        self.assertEqual((code, tuned), (1, []))
+
+    def test_targets(self):
+        with tempfile.TemporaryDirectory() as d:
+            ps = []
+            for tag in ("iq3_xxs", "q2_0"):
+                p = Path(d) / f"strata-{tag}.json"
+                p.write_text(json.dumps({"args": []}))
+                ps.append(p)
+            self.assertEqual(setup.calibration_targets(ps, None, None), ps)
+            self.assertEqual(setup.calibration_targets(ps, "Q2_0", None), [ps[1]])
+            self.assertEqual(setup.calibration_targets(ps, "Q2_0", "qwen"), [ps[1]])
+            self.assertEqual(setup.calibration_targets(ps, "Q4_K_M", None), [])

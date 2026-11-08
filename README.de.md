@@ -1,47 +1,202 @@
-<h1 align="center">Strata-2080TI</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
+    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
+  </picture>
+</p>
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · **Deutsch** · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+<h3 align="center">Leistungsstarke KI auf deinem eigenen Computer.</h3>
+<p align="center">Chatten, programmieren und mit Bildern arbeiten, lokal.</p>
 
-## Dieser Fork: 8x RTX 2080 Ti 22 GB
+<p align="center">
+  <a href="#modelle">Modelle</a> · <a href="#installation"><b>Installation</b></a> ·
+  <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
+  <a href="#hilfe">Hilfe</a> · <a href="#strata-unterstützen">Unterstützen</a>
+</p>
 
-Strata-2080TI basiert auf [Niko1221/Strata](https://github.com/Niko1221/Strata) und ist auf einen Server mit
-**8x NVIDIA RTX 2080 Ti 22 GB** (Turing, sm_75) abgestimmt. Installation und Bedienung von Strata: siehe die README von [Niko1221/Strata](https://github.com/Niko1221/Strata).
+<p align="center">
+  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Strata herunterladen"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT-Lizenz"></a>
+  <a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor-EA4AAA?logo=githubsponsors&logoColor=fff" alt="Strata über GitHub Sponsors unterstützen"></a>
+  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Strata auf Buy Me a Coffee unterstützen"></a>
+</p>
 
-**Testrechner:** 8x RTX 2080 Ti 22 GB nur über PCIe (kein NVLink, kein P2P), die Karten auf zwei NUMA-Knoten verteilt,
-377 GB RAM, CUDA 12.8. Modell: [Unsloth Q8_0](docs/UNSLOTH_Q8.md), schichtweise auf alle 8 Karten verteilt, jeder
-Experte im VRAM (99,8 % Cache-Treffer). Engine 0.1.40.3, gemessen am 2026-10-11.
+<p align="center"><sub><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <b>Deutsch</b> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
 
-**Was sich geändert hat:**
+**Kostenlos, Open Source und ganz in deiner Hand.** Nutze Strata auf dem Desktop oder mit deinen liebsten Coding-Tools. Kein Konto nötig.
 
-- `--split-chunks N` (neue Engine-Option): Bei einer Schichtaufteilung wird ein Prompt in etwa N Stücken zu 2048-4096
-  Tokens gelesen, sodass die Puffer nicht mehr den Großteil des Experten-Caches jeder Karte leihen. Vorher lieh
-  `--prefill auto:32768` 2.295 der 3.072 Plätze jeder Karte, und die Experten liefen bei jedem Prompt erneut über PCIe.
-- Die Prompt-Threads der Stufen erben nicht mehr den festgelegten Kern des Host-Threads. 35 Engine-Threads teilten
-  sich CPU 0, und die GPUs warteten 14 % der GPU-Zeit eines Prompts darauf (8,4 s -> 0,4 s).
-- Einstellungen für Turing: `STRATA_BF16_TC=1` (BF16-Tensor-Cores), `STRATA_PREFILL_ZC=1` (residente Experten an Ort
-  und Stelle gelesen, optional, nicht bitgleich), `"parallel": 4` mit `--batch-groups 4`.
+## Modelle
 
-**Liest deinen Prompt** (Tokens/s):
+Wir empfehlen **zuerst ISTA-DASLab**, danach **Unsloth** und andere Anbieter, soweit ein passendes Modell in deinen Speicher passt.
 
-| Prompt | Vorher, `--prefill auto:32768` | Dieser Fork | Faktor ggü. `auto:32768` |
-| ---: | ---: | ---: | ---: |
-| 4K | 713-751 | **1.080** | 1,5x |
-| 16K | 891-908 | **2.240** | 2,5x |
-| 32K | 809-883 | **2.920** | 3,4x |
-| 100K | — | **3.974** | — |
+<details>
+<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
 
-**Schreibt Antworten:** 57-60 Tokens/s für eine Anfrage (unverändert: das Dekodieren ist GPU-gebunden, die 8 Karten
-rechnen ihre Schichten nacheinander). **8 Anfragen gleichzeitig:** 136 Tokens/s insgesamt, gegenüber 50 Tokens/s
-nacheinander.
+| Anbieter | Auswahl |
+| --- | --- |
+| **ISTA-DASLab · empfohlen** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) zum Programmieren. |
+| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
+| **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Geringerer Speicherbedarf, aber langsamer. |
+| **Weitere Optionen** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
 
-Die „Vorher“-Spalte ist das Originalprojekt mit `--prefill auto:32768`, je zwei Anfragen, aus [docs/MULTI_GPU.md](docs/MULTI_GPU.md#what-each-card-holds) (dort auch
-die Zahlen Schritt für Schritt). Auf diesen Karten ohne Gewinn getestet: `--spec 6` (langsamer), `--mtp-q4 all`,
-`STRATA_HC_Q8`.
+[Größen, Speicherbedarf und Kompatibilität vergleichen](docs/MODELS.md).
 
-Die Einstellungen, ergänzt in der Konfiguration, die Setup geschrieben hat (`strata-<model>.json`):
+</details>
 
-```json
-"args": ["...", "--prefill", "auto", "--split-chunks", "4", "--batch-groups", "4"],
-"env": {"STRATA_BF16_TC": "1", "STRATA_PREFILL_ZC": "1"},
-"parallel": 4
+<details>
+<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
+
+**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. Das sind die derzeit dokumentierten Pakete für dieses Modell.
+
+[Modellanleitung und Kompatibilität](docs/QWEN36.md).
+
+</details>
+
+<details>
+<summary><img src="docs/media/models/deepseek.svg" width="22" alt="" align="middle"> &nbsp;<b>DeepSeekV4.1-Flash-1017</b></summary>
+
+In der **Desktop-App** und im **Terminal**. Was nicht in den Arbeitsspeicher passt, wird von deiner SSD gelesen. Darum brauchst du viel freien Speicherplatz.
+
+| Set (ISTA-DAS) | Download | Freier Speicherplatz nötig |
+| --- | ---: | ---: |
+| 1.75 bpw | 239 GB | etwa 245 GB |
+| 2.00 bpw | 257 GB | etwa 265 GB |
+| 2.25 bpw | 274 GB | etwa 280 GB |
+
+Läuft auf NVIDIA RTX 30, 40 und 50 (Windows und Linux) und auf AMD Radeon AI PRO R9700 (Linux). Das Setup lädt die Dateien und die DeepSeek-Engine herunter und startet dann das Modell.
+
+```sh
+strata launch --family deepseek41 --model ist-das-2.00bpw --plan
 ```
+
+Gemessen mit dem 2.00-bpw-Set auf Strata 0.2.5. „Ausgabe“ ist das Tempo der Antwort, „Prompt“ zeigt, wie schnell Strata deine Eingabe liest.
+
+| Hardware | Ausgabe | Prompt |
+| --- | ---: | ---: |
+| RTX 5070 12 GB, 64 GB RAM | 4 bis 6 Token/s | etwa 110 Token/s (4K) |
+| RTX 3060 12 GB, 46 GB RAM | 9 bis 11 Token/s | etwa 155 Token/s (4K) |
+| 1x Radeon AI PRO R9700, 251 GB RAM | 21 bis 25 Token/s | 320 bis 360 Token/s (8K) |
+| 4x Radeon AI PRO R9700 | 74 bis 77 Token/s | 400 bis 450 Token/s (8K) |
+
+[Speicher, Festplatte und Details](docs/DEEPSEEK41.md) · [Versionshinweise](https://github.com/Niko1221/Strata/releases)
+
+</details>
+
+<a id="the-other-sizes"></a>
+
+Unsicher, was passt? [Wähle ein Modell für deinen Computer](docs/MODELS.md#pick-by-memory).
+
+## Installation
+
+<a id="option-a-the-strata-app"></a>
+
+### Desktop-App
+
+**[Strata für Windows, Linux oder Mac herunterladen →](https://github.com/Niko1221/Strata/releases/latest)**
+
+Installiere die App, wähle ein Modell und leg mit dem Chat los. Es gibt einen Installer pro System. Beim ersten Start lädt die App die Engine für deine Grafikkarte herunter. [Hilfe zum Installer](docs/INSTALL.md#the-app).
+
+<sub>Dateien: `Strata-0.2.9-windows-x64-setup.exe` · `Strata-0.2.9-linux-x86_64.AppImage` · `Strata-0.2.9-macos-arm64.dmg`</sub>
+
+<p align="center">
+  <img src="docs/media/app-chat.png" width="900" alt="Strata-Desktop-App mit Chat und Live-Codevorschau nebeneinander">
+  <br><sub>Chat, Dateien und Live-Vorschau in einem Fenster.</sub>
+</p>
+
+<a id="option-b-the-terminal-one-line"></a>
+
+### Terminal-App
+
+Lieber im Terminal? Installiere Strata und starte dann **`strata launch`**.
+
+<details open>
+<summary><b>Installationsbefehle</b></summary>
+
+**Linux / Mac**
+
+```sh
+curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+```
+
+**Windows PowerShell**
+
+```powershell
+irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+```
+
+Öffne unter Windows danach ein neues Terminal. Dann:
+
+```sh
+strata launch
+```
+
+Folge den Anweisungen, um ein Modell herunterzuladen und zu starten. [Terminal-Anleitung](docs/TERMINAL_LAUNCH.md).
+
+</details>
+
+<p align="center">
+  <img src="docs/media/terminal-monitor.png" width="900" alt="Strata-Terminal-App mit Modellaktivität, Tempo, Speicher und letzten Anfragen">
+  <br><sub>Behalte Modell und Hardware im Blick, während es läuft.</sub>
+</p>
+
+<a id="build-from-source"></a>
+
+[Aus dem Quellcode bauen](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [Vollständige Installationsanleitung](docs/INSTALL.md)
+
+<a id="what-you-need"></a>
+
+## Hardware
+
+| Unterstützte Hardware | Anleitung |
+| --- | --- |
+| **NVIDIA GeForce RTX 20 / 30 / 40 / 50** | [NVIDIA-Setup](docs/INSTALL.md#what-you-need) |
+| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [AMD-Setup](docs/AMD_HIP.md) |
+| **AMD Radeon RX 6800 / 6900 · experimentell** | [RX-6000-Setup](docs/AMD_HIP.md#rdna2-gfx1030) |
+| **Intel Arc · Linux** | [Intel-Setup](docs/INTEL_ARC.md) |
+| **Apple Silicon · M1 oder neuer** | [Mac-Setup](docs/MAC.md) |
+| **AMD Ryzen AI Max · Strix Halo** | [Strix-Halo-Setup](docs/STRIX_HALO.md) |
+
+<a id="using-it"></a>
+
+## Tools
+
+**Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**, und weitere über die OpenAI- und Anthropic-kompatiblen APIs.
+
+Führe **`strata connect`** aus, um die Einrichtung für dein Tool zu sehen. [Verbindungsanleitung](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
+
+<a id="guides"></a>
+<a id="how-fast-is-it"></a>
+<a id="how-does-it-work"></a>
+<a id="something-went-wrong"></a>
+
+## Hilfe
+
+[Alle Anleitungen](docs) · [Fehlerbehebung](docs/TROUBLESHOOTING.md) · [Fehler melden](https://github.com/Niko1221/Strata/issues/new/choose) ·
+[Benchmarks](docs/COMMUNITY_BENCHMARKS.md) · [So funktioniert es](docs/HOW_IT_WORKS.md) · [Mitmachen](CONTRIBUTING.md)
+
+## Strata unterstützen
+
+**Hilf mit, lokale KI für alle offen zu halten.** Ein GitHub-Sponsoring oder ein Kaffee hilft, Entwicklung und Tests auf mehr Hardware zu finanzieren.
+
+<a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="GitHub Sponsors: Strata unterstützen" height="48"></a>
+<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee: Strata unterstützen" height="48"></a>
+
+### Treue Unterstützer
+
+Danke an alle, die Strata unterstützen.
+
+<!-- supporters:start (one line per public supporter, newest last; copy a line and change the GitHub name in all four places) -->
+<a href="https://github.com/ryan4yin"><img src="https://github.com/ryan4yin.png?size=96" width="48" height="48" alt="ryan4yin" title="ryan4yin"></a>
+<a href="https://github.com/themactep"><img src="https://github.com/themactep.png?size=96" width="48" height="48" alt="themactep" title="themactep"></a>
+<a href="https://github.com/macintog"><img src="https://github.com/macintog.png?size=96" width="48" height="48" alt="macintog" title="macintog"></a>
+<a href="https://github.com/bisonbet"><img src="https://github.com/bisonbet.png?size=96" width="48" height="48" alt="bisonbet" title="bisonbet"></a>
+<a href="https://github.com/vizv"><img src="https://github.com/vizv.png?size=96" width="48" height="48" alt="vizv" title="vizv"></a>
+<!-- supporters:end -->
+
+[MIT-Lizenz](LICENSE) · [Danksagung und Modelllizenzen](docs/HOW_IT_WORKS.md#credits) · [Datenschutz](docs/SAFETY.md)
+
+<a id="option-c-let-your-ai-set-it-up"></a>
+
+<sub>Für KI-Tools und automatische Leser: <a href="AGENTS.md">technische Referenz</a> · <a href="docs/AI_SETUP.md">Setup-Anleitung</a>.</sub>
+
+**Sponsoring, Hardware-Partnerschaften oder Zusammenarbeit:** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
