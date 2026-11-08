@@ -346,6 +346,17 @@ public:
     void set_decode_head_active(bool on) { decode_head_active_ = on; }
     bool prepare_decode_head(std::string& err);
     uint64_t decode_head_windows() const { return decode_head_windows_; }
+    /// Deferred-commit piped batches only: borrow the same helper weights, return complete logits, then run the
+    /// original source-card pick/guard and per-slot sampling. Normal batch/admission and prompt graphs stay intact.
+    /// Set once after init_slots/init_deferred_commit, before any batch graph is captured. NativeHeads outlive us.
+    bool set_piped_target_head(const NativeHead& head, std::string& err, const NativeHead* second = nullptr);
+    uint64_t piped_target_head_windows() const { return piped_target_head_windows_; }
+    uint64_t piped_target_head_rows() const { return piped_target_head_rows_; }
+    /// Let batch_poll yield while the original per-slot sampler runs. Pinned/device history rows are reserved
+    /// here, before any batch runs; every row stays owned until its completion event and the window's verdict.
+    bool enable_piped_async_sampling(std::string& err);
+    uint64_t piped_async_sample_windows() const { return piped_async_sample_windows_; }
+    uint64_t piped_async_sample_rows() const { return piped_async_sample_rows_; }
     bool pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
     /// Stage a window ahead of its launch (positions, and the PLE rows from `ple_prev` = the two tokens before the
     /// window as they WILL be, their pages prefetched).  A later `pl_launch` of the same window (T, pos0, tokens, and
@@ -451,9 +462,12 @@ private:
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
     int last_rows_[strata::kernels::kWindowMaxT] = {};                ///< the slots of the last batch window's rows
-    std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
+    std::vector<int> bkey(const int* rows, int S, int hbase, bool target_head = false) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
+        // No ordinary row/layout key contains a negative slot. Keep headless deferred bodies distinct from the
+        // ordinary batch graph even when an admission/adaptive step uses the same rows and handoff base.
+        if (target_head) k.push_back(-1);
         return k;
     }
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
@@ -485,8 +499,18 @@ private:
     std::vector<std::vector<int32_t>> slot_tail_;        ///< per slot: its reply tail for the penalty window (set_slot_history)
     int32_t* slot_hist_d_ = nullptr;                     ///< the penalty-history rows of the current batch window (device)
     size_t slot_hist_cap_ = 0;
-    bool sample_rows(int S, std::string& err);
-    int slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, const int32_t*& hist, int& hlen, std::vector<int32_t>& hrows, std::string& err);   ///< the sampled slots' rows of the last batch window
+    bool sample_rows(int S, std::string& err, bool wait = true, int* queued_rows = nullptr);
+    int slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, const int32_t*& hist, int& hlen,
+                      std::vector<int32_t>& hrows, std::string& err, bool async_history = false);   ///< the sampled slots' rows of the last batch window
+    static constexpr int kSlotHistMax = 4096;   // serve's kPenaltyWindowCap, per row
+    int32_t *async_hist_host_ = nullptr, *async_hist_device_ = nullptr;
+    int async_hist_rows_ = 0;
+    cudaEvent_t async_sample_done_ = nullptr;
+    bool piped_async_sampling_ = false, b_sample_pending_ = false;
+    std::chrono::steady_clock::time_point b_sample_since_{};
+    int b_sample_rows_ = 0;
+    uint64_t piped_async_sample_windows_ = 0, piped_async_sample_rows_ = 0;
+    int finish_polled_batch(int S);
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
@@ -631,6 +655,14 @@ private:
     const NativeHead* head_ = nullptr;
     std::unique_ptr<DecodeHeadWindow> decode_head_;
     std::unique_ptr<DecodeHeadWindow> decode_head_second_;
+    std::unique_ptr<DecodeHeadWindow> piped_target_head_, piped_target_head_second_;
+    bool record_piped_target_head_ = false;
+    bool b_target_head_ = false;        // the current batch_launch_rows owns the helpers until batch_poll completes
+    cudaEvent_t target_head_ready_ = nullptr;
+    std::vector<cudaGraphExec_t> target_head_tail_;
+    uint64_t piped_target_head_windows_ = 0, piped_target_head_rows_ = 0;
+    void record_head_pick(int T, cudaStream_t cs);
+    bool launch_piped_target_head(int T, std::string& err);
     bool decode_head_active_ = false;   // only the PW2 decode scope enables it, never prompt reads
     bool record_decode_head_ = false;  // capturing the separate headless body variant
     bool fl_decode_head_ = false;      // snapshotted at launch: drain/cancel must finish the same path

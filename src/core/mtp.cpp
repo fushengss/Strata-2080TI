@@ -143,6 +143,7 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 MtpDrafter::~MtpDrafter() {
     const OnDevice on_device(device_);
     if (cs_) cudaStreamSynchronize(cs_);
+    for (auto& step : observe_events_) for (auto& e : step) if (e) cudaEventDestroy(e);
     head_shards_.reset();  // its cross-device events and buffers outlive every queued chain tail
     for (auto& e : head_round_body_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : head_step_body_) if (e) cudaGraphExecDestroy(e);
@@ -2034,6 +2035,39 @@ bool MtpDrafter::prepare_chain(std::string& err) {
     return true;
 }
 
+bool MtpDrafter::enable_piped_observation(std::string& err) {
+#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    err = "mtp observe: only the CUDA piped shared-head path is supported";
+    return false;
+#else
+    const OnDevice on_device(device_);
+    const char* global_profile = std::getenv("STRATA_MTP_PROFILE");
+    if (global_profile && std::atoi(global_profile) != 0) {
+        err = "mtp observe: disable the shared-buffer STRATA_MTP_PROFILE";
+        return false;
+    }
+    if (piped_observe_on_ || chain_live_ || owns_weights_ || owns_draft_head_ || !force_on_ || !cs_ ||
+        !head_shards_active_ || !head_shards_.initialized() || coupled_active_ || !ev_chain_ ||
+        !head_round_body_[1] || !head_tail_[0] || max_t_ < 2 || max_t_ > 8) {
+        err = "mtp observe: requires an idle prepared piped shared-head clone";
+        return false;
+    }
+    for (auto& step : observe_events_) for (auto& e : step) {
+        const cudaError_t status = cudaEventCreateWithFlags(&e, cudaEventDefault);
+        if (status != cudaSuccess) {
+            err = std::string("mtp observe: create timing event: ") + cudaGetErrorString(status);
+            for (auto& allocated_step : observe_events_) for (auto& allocated : allocated_step) {
+                if (allocated) cudaEventDestroy(allocated);
+                allocated = nullptr;
+            }
+            return false;
+        }
+    }
+    piped_observe_on_ = true;
+    return true;
+#endif
+}
+
 bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force,
                               int n_out, int n_early, std::string& err) {
     const OnDevice on_device(device_);
@@ -2051,6 +2085,10 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     // Solo request eligibility is controlled by its PW2 caller. Piped slots always draft greedily, including
     // sampled targets. Coupled sampling can never take this greedy split tail, regardless of either caller.
     const bool head_split = head_shards_active_ && head_shards_.initialized() && !coupled_active_;
+    if (piped_observe_on_ && (!head_split || n_out > 8)) {
+        err = "mtp observe: an observed chain must keep its shared-head route";
+        return false;
+    }
     if (head_split) {
         if (!head_round_body_[T] || !head_tail_[0]) { err = "mtp head: split round graphs not prepared"; return false; }
         for (int j = 1; j < n_out; ++j)
@@ -2077,11 +2115,21 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!stage_source_R(T, err)) return false;
     chain_early_ = std::max(0, std::min(n_early, n_out));
+    auto observe_record = [&](int step, int point) {
+        const cudaError_t status = cudaEventRecord(observe_events_[step][point], cs_);
+        if (status == cudaSuccess) return true;
+        err = std::string("mtp observe: record timing event: ") + cudaGetErrorString(status);
+        return false;
+    };
     auto launch = [&](int j) {
         if (!head_split) return cudaGraphLaunch(j == 0 ? round_exec_[T] : step_exec_[j], cs_) == cudaSuccess;
+        if (piped_observe_on_ && !observe_record(j, 0)) return false;
         if (cudaGraphLaunch(j == 0 ? head_round_body_[T] : head_step_body_[j], cs_) != cudaSuccess) return false;
+        if (piped_observe_on_ && !observe_record(j, 1)) return false;
         if (!head_shards_.enqueue(cs_, xq_, head_logits_, j, err)) return false;
+        if (piped_observe_on_ && !observe_record(j, 2)) return false;
         if (cudaGraphLaunch(head_tail_[j], cs_) != cudaSuccess) return false;
+        if (piped_observe_on_ && !observe_record(j, 3)) return false;
         ++head_shard_steps_;
         return true;
     };
@@ -2128,6 +2176,25 @@ int MtpDrafter::chain_poll(std::string& err) {
     if (q == cudaErrorNotReady) return 0;
     chain_live_ = false;
     if (q != cudaSuccess) { err = std::string("mtp chain: ") + cudaGetErrorString(q); return -1; }
+    if (piped_observe_on_) {
+        // ev_chain_ is after every observed event on this source stream: elapsed-time reads never wait on an
+        // unfinished chain. These are stream wall intervals, including GPU contention and head-transfer waits.
+        float elapsed[8][3] = {};
+        for (int j = 0; j < chain_n_; ++j) for (int part = 0; part < 3; ++part) {
+            const cudaError_t status = cudaEventElapsedTime(&elapsed[j][part], observe_events_[j][part],
+                                                           observe_events_[j][part + 1]);
+            if (status != cudaSuccess) {
+                err = std::string("mtp observe: read completed timing events: ") + cudaGetErrorString(status);
+                return -1;
+            }
+        }
+        for (int j = 0; j < chain_n_; ++j) {
+            chain_observation_.body.add(elapsed[j][0]);
+            chain_observation_.head_return.add(elapsed[j][1]);
+            chain_observation_.tail.add(elapsed[j][2]);
+        }
+        ++chain_observation_.chains;
+    }
     for (int j = 0; j < chain_n_; ++j) {
         chain_tok_[j] = ((volatile int32_t*) h_out_)[j];
         chain_prob_[j] = ((volatile float*) h_prob_)[j];

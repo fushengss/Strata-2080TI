@@ -6828,6 +6828,24 @@ int main(int argc, char** argv) {
     // each stage commits a group's window once the last stage has judged its proposals
     // (Verifier::batch_launch_rows / batch_commit_rows)
     bool piped_mtp = batch_mtp && !stages.empty() && batch_groups_for(true).mtp_piped;   // (final once the slots that fit are known, below)
+    const bool piped_mtp_observe = [] {
+        const char* v = std::getenv("STRATA_PIPED_MTP_OBSERVE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (piped_mtp_observe) {
+        const char* shared_head = std::getenv("STRATA_PIPED_MTP_HEAD");
+        const char* global_profile = std::getenv("STRATA_MTP_PROFILE");
+        if (!o.serve || !piped_mtp || !shared_head || std::atoi(shared_head) == 0 ||
+            (global_profile && std::atoi(global_profile) != 0)) {
+            std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP_OBSERVE requires serving piped MTP shared-head chains "
+                                 "and STRATA_MTP_PROFILE disabled\n");
+            return 1;
+        }
+#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+        std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP_OBSERVE is supported only on CUDA\n");
+        return 1;
+#endif
+    }
     // STRATA_PIPED_MTP=N: up to N proposals per slot and window (at most --spec - 1); the first always, each further
     // one while the draft layer is at least --spec-min-p sure of it, as the solo path extends its windows
     int pm_drafts = 0;
@@ -11761,6 +11779,22 @@ int main(int argc, char** argv) {
         // drafter and every normal graph retain their placement. Unset/-1 keeps the original engine path.
         int decode_head_device = -1;
         std::vector<int> decode_head_devices;
+        const bool piped_target_head = [] {
+            const char* v = std::getenv("STRATA_PIPED_TARGET_HEAD");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        const bool piped_async_sample = [] {
+            const char* v = std::getenv("STRATA_PIPED_ASYNC_SAMPLE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (piped_target_head && (!piped_mtp || !batch_mtp || batch_df2 || o.batch_groups <= 1)) {
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_TARGET_HEAD requires deferred-commit piped MTP batches\n");
+            return 1;
+        }
+        if (piped_async_sample && (!piped_mtp || !batch_mtp || batch_df2 || o.batch_groups <= 1)) {
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_ASYNC_SAMPLE requires deferred-commit piped MTP batches\n");
+            return 1;
+        }
         if (const char* v = std::getenv("STRATA_DECODE_HEAD_GPU"); v != nullptr && v[0] != '\0' && std::strcmp(v, "-1") != 0) {
             const char* at = v;
             while (*at) {
@@ -11808,6 +11842,31 @@ int main(int argc, char** argv) {
                          second ? (std::string("+") + std::to_string(decode_head_devices[1])).c_str() : "",
                          (unsigned long long) (decode_head_owner.head[0].weight_bytes() >> 20),
                          second ? " (two vocabulary shards, greedy only)" : " only");
+        }
+        if (piped_target_head) {
+            if (decode_head_devices.empty()) {
+                std::fprintf(stderr, "strata serve: STRATA_PIPED_TARGET_HEAD needs the existing STRATA_DECODE_HEAD_GPU bank\n");
+                return 1;
+            }
+            const auto* second = decode_head_devices.size() == 2 ? &decode_head_owner.head[1] : nullptr;
+            if (!stage_ver_p(n_stages - 1, 0).set_piped_target_head(decode_head_owner.head[0], err, second)) {
+                std::fprintf(stderr, "strata serve: piped target head: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_TARGET_HEAD: CUDA%d%s, source CUDA%d, "
+                                 "full logits return before original slot sampling; prefill placement unchanged\n",
+                         decode_head_device,
+                         second ? (std::string("+") + std::to_string(decode_head_devices[1])).c_str() : "",
+                         stage_ver_p(n_stages - 1, 0).device());
+        }
+        if (piped_async_sample) {
+            auto& last = stage_ver_p(n_stages - 1, 0);
+            if (!last.enable_piped_async_sampling(err)) {
+                std::fprintf(stderr, "strata serve: piped async sample: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_ASYNC_SAMPLE: source CUDA%d, "
+                                 "event-polled slot sampling with persistent history\n", last.device());
         }
         // Keep the drafter's body/KV and prefill in place. Only explicitly selected solo PW2 chains may
         // use these two vocabulary shards, and their full logits return before the original probability tail.
@@ -11860,10 +11919,18 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 d.set_head_shards_active(true); // only chain_launch reads this; admission/prefill use their original graphs
+                if (piped_mtp_observe && !d.enable_piped_observation(err)) {
+                    std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP_OBSERVE slot %zu: %s\n", b, err.c_str());
+                    return 1;
+                }
             }
             std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP_HEAD: %zu private slot workspaces, CUDA%d+%d, "
                                  "1 shared weight bank, source CUDA%d; greedy proposals include sampled targets\n",
                          slot_mtp.size(), mtp_head_devices[0], mtp_head_devices[1], mtp.device());
+            if (piped_mtp_observe)
+                std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP_OBSERVE: %zu independent slot event sets; "
+                                     "source-stream body/head-return/tail intervals, no packing or scheduling changes\n",
+                             slot_mtp.size());
         }
         cudaEvent_t pl_mtp_ev[2] = {nullptr, nullptr};
         bool pl_mtp_live[2] = {false, false};
@@ -14778,6 +14845,20 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP_HEAD requires the deferred-commit piped route\n");
             return 1;
         }
+        if (piped_target_head && !pmtp) {
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_TARGET_HEAD requires the deferred-commit piped route\n");
+            return 1;
+        }
+        if (piped_async_sample && !pmtp) {
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_ASYNC_SAMPLE requires the deferred-commit piped route\n");
+            return 1;
+        }
+        if (piped_mtp_observe && (!pmtp || !piped_mtp_head || slot_mtp.empty())) {
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP_OBSERVE requires the active piped shared-head route\n");
+            return 1;
+        }
+        uint64_t target_head_reported_windows = 0, target_head_reported_rows = 0;
+        uint64_t async_sample_reported_windows = 0, async_sample_reported_rows = 0;
         std::vector<uint64_t> pmtp_head_reported(piped_mtp_head ? slot_mtp.size() : 0, 0);
         if (piped && batch_mtp && !pmtp)   // #1413: said, not silent
             std::fprintf(stderr,
@@ -14828,6 +14909,19 @@ int main(int argc, char** argv) {
         // STRATA_PIPED_MTP: a slot whose next proposals are drafting (its chain in flight on the drafter's stream), and
         // per slot the event after the copy of its rows on the last stage's stream, which the chain waits for
         std::vector<char> pm_drafting(bs.size(), 0);
+        // Counts below describe host observations, not a ready queue or a time-weighted GPU occupancy measure.
+        // In particular pm_drafting means submitted but not yet reaped; an event may already have completed.
+        struct MtpHostObservation {
+            strata::core::MtpDrafter::TimingSummary verdict_gap;
+            Clock::time_point last_verdict{};
+            bool have_verdict = false;
+            uint64_t verdicts = 0, stage0_draft_skips = 0;
+            std::vector<uint64_t> pending_pump_hist, unsubmitted_verdict_hist;
+        } mtp_observation;
+        if (piped_mtp_observe) {
+            mtp_observation.pending_pump_hist.assign(bs.size() + 1, 0);
+            mtp_observation.unsubmitted_verdict_hist.assign(bs.size() + 1, 0);
+        }
         std::vector<cudaEvent_t> pm_copied(pmtp ? bs.size() : 0, nullptr);
         if (pmtp) {
             const strata::core::OnDevice on_last(stage_verifier(n_pipe - 1).device());
@@ -14865,6 +14959,14 @@ int main(int argc, char** argv) {
         // Judge the proposals, queue every stage's commit of the kept rows (each stage runs it before that group's next
         // window there: the same stream), emit them, and start drafting the next proposals.
         auto pmtp_verdict = [&](PGroup& G, strata::core::Verifier& vk, const int32_t* outb) -> bool {
+            if (piped_mtp_observe) {
+                const auto now = Clock::now();
+                if (mtp_observation.have_verdict)
+                    mtp_observation.verdict_gap.add(std::chrono::duration<double, std::milli>(now - mtp_observation.last_verdict).count());
+                mtp_observation.last_verdict = now;
+                mtp_observation.have_verdict = true;
+                ++mtp_observation.verdicts;
+            }
             auto is_eos = [&](int32_t y) {
                 return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
             };
@@ -14942,6 +15044,13 @@ int main(int argc, char** argv) {
             // rows - the last stage's final residuals - are copied on THAT stage's stream, so its next window, which
             // rewrites them, runs after the copy; the chain waits for the copy.
             const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+            if (piped_mtp_observe) {
+                size_t candidates = 0;
+                for (const Blk& blk : blks) if (bs[(size_t) blk.b].active) ++candidates;
+                // Only this verdict's live jobs, immediately submitted below. GS=1 gives 0 or 1; these have not
+                // even run their body yet and are not a GPU post-attention ready batch.
+                ++mtp_observation.unsubmitted_verdict_hist[candidates];
+            }
             for (const Blk& blk : blks) {
                 BSlot& sl = bs[(size_t) blk.b];
                 if (!sl.active) continue;   // it ended: no more drafts for it
@@ -15006,6 +15115,11 @@ int main(int argc, char** argv) {
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
             const strata::program::PipeProbe::PumpScope p4_scope(p4);
+            if (piped_mtp_observe) {
+                size_t pending_chains = 0;
+                for (char pending_chain : pm_drafting) pending_chains += pending_chain != 0;
+                ++mtp_observation.pending_pump_hist[pending_chains];
+            }
             if (p4.timing()) {
                 int nb = 0, nf = 0;
                 for (int k = 0; k < n_pipe; ++k) if (stage_group[(size_t) k] >= 0) ++nb;
@@ -15115,7 +15229,10 @@ int main(int argc, char** argv) {
                                 if (dr < 0) return false;
                                 if (dr == 0) { ready = false; break; }
                             }
-                            if (!ready) continue;
+                            if (!ready) {
+                                if (piped_mtp_observe) ++mtp_observation.stage0_draft_skips;
+                                continue;
+                            }
                         }
                         pick = gi;
                     }
@@ -15240,6 +15357,26 @@ int main(int argc, char** argv) {
                 if (pmtp)
                     std::fprintf(stderr, " (%lld of %lld MTP proposals kept)", (long long) bt_accepted, (long long) bt_tokens);
                 std::fprintf(stderr, "\n");
+                if (piped_target_head) {
+                    const auto& last = stage_verifier(n_pipe - 1);
+                    const uint64_t windows = last.piped_target_head_windows(), rows = last.piped_target_head_rows();
+                    std::fprintf(stderr, "strata piped target head: CUDA%d%s, %llu windows, %llu verification rows offloaded in this batch\n",
+                                 decode_head_device,
+                                 decode_head_devices.size() == 2 ? (std::string("+") + std::to_string(decode_head_devices[1])).c_str() : "",
+                                 (unsigned long long) (windows - target_head_reported_windows),
+                                 (unsigned long long) (rows - target_head_reported_rows));
+                    target_head_reported_windows = windows;
+                    target_head_reported_rows = rows;
+                }
+                if (piped_async_sample) {
+                    const auto& last = stage_verifier(n_pipe - 1);
+                    const uint64_t windows = last.piped_async_sample_windows(), rows = last.piped_async_sample_rows();
+                    std::fprintf(stderr, "strata piped async sample: %llu windows, %llu sampled rows completed in this batch\n",
+                                 (unsigned long long) (windows - async_sample_reported_windows),
+                                 (unsigned long long) (rows - async_sample_reported_rows));
+                    async_sample_reported_windows = windows;
+                    async_sample_reported_rows = rows;
+                }
                 if (piped_mtp_head) {
                     for (size_t b = 0; b < slot_mtp.size(); ++b) {
                         const uint64_t steps = slot_mtp[b]->head_shard_steps();
@@ -15248,6 +15385,40 @@ int main(int argc, char** argv) {
                                      (unsigned long long) (steps - pmtp_head_reported[b]));
                         pmtp_head_reported[b] = steps;
                     }
+                }
+                if (piped_mtp_observe) {
+                    auto summary = [](const char* name, const strata::core::MtpDrafter::TimingSummary& s) {
+                        std::fprintf(stderr, " %s_ms(n=%llu,mean=%.6f,min=%.6f,max=%.6f,sum=%.6f)", name,
+                                     (unsigned long long) s.count, s.mean_ms(), s.min_ms, s.max_ms, s.total_ms);
+                    };
+                    for (size_t b = 0; b < slot_mtp.size(); ++b) {
+                        const auto obs = slot_mtp[b]->take_chain_observation();
+                        std::fprintf(stderr, "strata piped MTP observe: slot %zu, completed_chains=%llu, source_stream_intervals",
+                                     b, (unsigned long long) obs.chains);
+                        summary("body", obs.body);
+                        summary("head_return", obs.head_return);
+                        summary("tail", obs.tail);
+                        std::fprintf(stderr, "\n");
+                    }
+                    std::fprintf(stderr, "strata piped MTP observe host: verdicts=%llu, stage0_draft_not_ready_group_skips=%llu",
+                                 (unsigned long long) mtp_observation.verdicts,
+                                 (unsigned long long) mtp_observation.stage0_draft_skips);
+                    summary("verdict_gap", mtp_observation.verdict_gap);
+                    auto histogram = [](const char* name, const std::vector<uint64_t>& hist) {
+                        std::fprintf(stderr, " %s=[", name);
+                        for (size_t i = 0; i < hist.size(); ++i)
+                            std::fprintf(stderr, "%s%zu:%llu", i ? "," : "", i, (unsigned long long) hist[i]);
+                        std::fprintf(stderr, "]");
+                    };
+                    histogram("submitted_unreaped_pump_samples", mtp_observation.pending_pump_hist);
+                    histogram("unsubmitted_jobs_at_verdict", mtp_observation.unsubmitted_verdict_hist);
+                    std::fprintf(stderr, " (pump-sample counts, not walltime shares; verdict jobs are immediately submitted, "
+                                         "not a post-attention ready batch; GPU intervals include contention and mapped head transfer)\n");
+                    mtp_observation.verdict_gap = {};
+                    mtp_observation.have_verdict = false;
+                    mtp_observation.verdicts = mtp_observation.stage0_draft_skips = 0;
+                    std::fill(mtp_observation.pending_pump_hist.begin(), mtp_observation.pending_pump_hist.end(), 0);
+                    std::fill(mtp_observation.unsubmitted_verdict_hist.begin(), mtp_observation.unsubmitted_verdict_hist.end(), 0);
                 }
                 p4.flush();
                 pa_rounds = pa_swaps = 0;
