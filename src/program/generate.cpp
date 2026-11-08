@@ -9457,8 +9457,16 @@ int main(int argc, char** argv) {
                     // smaller ones pipeline through the stages.  8x RTX 2080 Ti, Unsloth Q8_0, N = 4 picks 2048 for
                     // 4K prompts (920 tok/s against 740 in one chunk) and 4096 for 16K / 32K (1,830 / 2,330 tok/s
                     // against 1,480 / 2,050 in --prefill auto's 8192 and 900 / 850 in auto:32768's 27,904).
+                    // STRATA_SPLIT_CHUNK_MAX=N raises the 4096 ceiling: where the experts a card does not hold cross PCIe
+                    // once per chunk, long prompts want --prefill's 8192 while short ones keep two chunks.  4x RTX 2080 Ti,
+                    // orca Q5_K_M (81% of the experts in VRAM): 8192 chunks read a 64K prompt in 22.5 s against 27.9 s.
+                    static const int64_t split_max = [] {
+                        const char* v = std::getenv("STRATA_SPLIT_CHUNK_MAX");
+                        const int64_t n = v ? (int64_t) std::atoll(v) : 0;
+                        return n >= 2048 ? n / 256 * 256 : (int64_t) 4096;
+                    }();
                     const int64_t per = (tokens + o.split_chunks - 1) / o.split_chunks;
-                    cap = std::min(cap, std::clamp<int64_t>((per + 255) / 256 * 256, 2048, 4096));
+                    cap = std::min(cap, std::clamp<int64_t>((per + 255) / 256 * 256, 2048, split_max));
                 }
                 const int64_t want_full = equal_chunk(tokens, cap);
                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
