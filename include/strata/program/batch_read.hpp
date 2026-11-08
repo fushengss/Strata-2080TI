@@ -30,7 +30,7 @@ inline int64_t batch_read_piece(bool batch, bool piped, bool layer_split, bool b
 /// What a configuration has that keeps the concurrent read (STRATA_PIPED_CONCURRENT=1) off.
 struct ConcurrentReadSetup {
     bool prefill_help = false;      ///< STRATA_PREFILL_HELP: the idle stage's help allocates on the read's thread
-    bool split_mtp_batch = false;   ///< STRATA_SPLIT_MTP_BATCH: the batched draft K/V frees there (a free waits)
+    bool split_mtp_batch = false;   ///< legacy path excludes STRATA_SPLIT_MTP_BATCH; the resident extension checks it separately
     bool fs_slots = false;          ///< STRATA_FS_SLOTS (Foresight swap space): serving a doorbell makes a CUDA call
     bool pcie_dma = false;          ///< --pcie-mode dma: the same (its copies)
     bool helper_caches = false;     ///< --expert-cache-device1..3 (and --remote-expert-opt on them), a prompt source of
@@ -50,6 +50,32 @@ inline const char* concurrent_read_off(const ConcurrentReadSetup& s) {
     if (s.staged_source)
         return "an expert source that stages its blobs (the GGUF in place, unbuffered, STRATA_IO_PREFETCH)";
     if (s.other_source) return "this expert source";
+    return nullptr;
+}
+
+/// STRATA_PIPED_CONCURRENT_MTP: each read rechecks live ownership/residency, after the existing pipeline drain.
+/// The old configuration guards remain except split MTP and a known file source whose consumer is only prefill:
+/// resident windows skip expert dispatch, and the lookahead must be idle. CUDA allocation barriers still require PLE publication
+/// before launching a resident graph, rather than by a later host service call.
+struct ResidentConcurrentReadSetup {
+    bool cuda_backend = false, piped_mtp = false, split_mtp_batch = false, active_slots = false;
+    bool private_buffers = false, all_resident = false, no_loans = false, draft_resident = false;
+    bool stable_tier = false, text_only = false, single_prompt = false, lookahead_idle = false;
+};
+
+inline const char* resident_concurrent_read_off(const ResidentConcurrentReadSetup& s) {
+    if (!s.cuda_backend) return "backend";
+    if (!s.piped_mtp) return "not_piped_mtp";
+    if (!s.split_mtp_batch) return "split_mtp_disabled";
+    if (!s.active_slots) return "no_active_slots";
+    if (!s.private_buffers) return "shared_prompt_buffers";
+    if (!s.all_resident) return "nonresident_stage";
+    if (!s.no_loans) return "active_loan";
+    if (!s.draft_resident) return "draft_weights_not_resident";
+    if (!s.stable_tier) return "mutable_tier_or_kv";
+    if (!s.text_only) return "image_input";
+    if (!s.single_prompt) return "co_read";
+    if (!s.lookahead_idle) return "decode_lookahead_busy";
     return nullptr;
 }
 

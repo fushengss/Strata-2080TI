@@ -1228,6 +1228,7 @@ struct Prefill::Impl {
     cudaStream_t ple_copy = nullptr;         // STRATA_PLE_COPY_STREAM: the raw rows' upload stream (null: on cs)
     cudaEvent_t ple_raw_free = nullptr;      // cs has dequantized ple_raw_dev: the next chunk's upload may overwrite it
     float* ple_norm = nullptr;
+    void* concurrent_ple_scratch = nullptr;  // opt-in reads: the verifier still uses ss.ple.scratch
     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
     uint64_t region_bytes = 0;
     PrefillStats* stats = nullptr;
@@ -1392,6 +1393,10 @@ void Prefill::release() {
     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     if (impl_->lm.dev) cudaFree(impl_->lm.dev);
+    if (impl_->concurrent_ple_scratch) {
+        cudaFree(impl_->concurrent_ple_scratch);
+        impl_->concurrent_ple_scratch = nullptr;
+    }
     if (impl_->lm.R_host) cudaFreeHost(impl_->lm.R_host);
     if (impl_->lm.tab_host) cudaFreeHost(impl_->lm.tab_host);
     if (impl_->lm.idsw_host) cudaFreeHost(impl_->lm.idsw_host);
@@ -4024,7 +4029,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     po.result = m.R + t * D;
                     try {
                         strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple.hist, ss.ple.w, po,
-                                                   ss.ple.scratch, m.cs);
+                                                   m.concurrent_ple_scratch ? m.concurrent_ple_scratch : ss.ple.scratch, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                     strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
                 }
@@ -7483,7 +7488,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         po.result = m.R + t * D;
                         try {
                             strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ssp->ple_hist, m.ss->ple.w, po,
-                                                       m.ss->ple.scratch, cs);
+                                                       m.concurrent_ple_scratch ? m.concurrent_ple_scratch : m.ss->ple.scratch, cs);
                         } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                         strata::kernels::ple_history_advance(ssp->ple_hist, m.ple_norm, cs);
                     }
@@ -7830,6 +7835,51 @@ bool Prefill::drain_pipeline(std::string& err) {
     }
 
     return ok;
+}
+
+bool Prefill::owns_prompt_buffers() const {
+    return impl_ != nullptr && impl_->region != nullptr && !impl_->borrowed && !impl_->borrow_spill &&
+           !ring_room_active_;
+}
+
+bool Prefill::prepare_concurrent_read(int64_t T, std::string& err) {
+    if (!owns_prompt_buffers() || T <= 0) {
+        err = "prefill: concurrent read needs private prompt buffers";
+        return false;
+    }
+    for (Prefill* p = this; p != nullptr; p = p->next_) {
+        if (!p->owns_prompt_buffers()) { err = "prefill: a stage does not own its prompt buffers"; return false; }
+        const Impl& m = *p->impl_;
+        // ple_block's native-key path also writes PleWeights::key_native_q8_1, which belongs to the shared
+        // weight table. Isolating the ordinary PLE scratch is not enough for that route. Keep it serial.
+        if (m.ss->ple.ready() && p->stage_lb_ <= 1 && (p->stage_le_ < 0 || p->stage_le_ > 1) &&
+            m.ss->ple.w.key_bf16 == nullptr && m.ss->ple.w.key_native_data != nullptr) {
+            err = "prefill: the native PLE key shares quantization scratch with decode";
+            return false;
+        }
+    }
+    if (!reserve_uploads(T)) {
+        err = "prefill: concurrent read upload reservation failed";
+        return false;
+    }
+    try {
+        for (Prefill* p = this; p != nullptr; p = p->next_) {
+            Impl& m = *p->impl_;
+            const core::OnDevice on_device(m.device);
+            if (m.ss->ple.ready() && p->stage_lb_ <= 1 && (p->stage_le_ < 0 || p->stage_le_ > 1) &&
+                !m.concurrent_ple_scratch &&
+                cudaMalloc(&m.concurrent_ple_scratch, strata::kernels::ple_block_scratch_bytes()) != cudaSuccess) {
+                (void) cudaGetLastError();
+                err = "prefill: concurrent read PLE scratch reservation failed";
+                return false;
+            }
+            if (mmq::built() && !m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+        }
+    } catch (const std::exception&) {
+        err = "prefill: concurrent read MMQ context preparation failed";
+        return false;
+    }
+    return true;
 }
 
 bool Prefill::reserve_uploads(int64_t T) {

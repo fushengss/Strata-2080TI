@@ -1383,7 +1383,7 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
 struct Drive {
     strata::core::ExpertDispatch d;
     double cpu_ms = 0;
-    int64_t calls = 0;
+    std::atomic<int64_t> calls{0};   // resident-read source audit can observe the external doorbell thread
     /// THE ROUTING TRACE, which is P0.S8 and a stated prerequisite of Phase 3.  `drive_pool` is called once
     /// per layer from the main loop - the workers live inside `expert_pool_dispatch` - so a single FILE* here
     /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
@@ -1395,9 +1395,9 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
                 float* out) {
     Drive* t = (Drive*) user;
     const Clock::time_point a = Clock::now();
+    t->calls.fetch_add(1, std::memory_order_relaxed);
     strata::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
-    ++t->calls;
     // THE ROUTING TRACE.  Written AFTER the dispatch so the layer index is still this layer's: `d.layers` is
     // advanced by the adapter as it consumes the blob, and reading it after the call is the same value the
     // dispatch used.  Record = int32 layer, int32 k, k int32 ids, k float weights.
@@ -1426,9 +1426,9 @@ void drive_pool_multi_impl(void* user, const float* x_f, const int32_t* ids, int
     Drive* t = (Drive*) user;
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
+    t->calls.fetch_add(1, std::memory_order_relaxed);
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out, arithmetic);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
-    ++t->calls;
     // the routing trace for the serve path: the same record format drive_pool writes (layer, k, ids, weights),
     // one record per token.  The multi dispatch fuses the router weights into the kernel and does not surface
     // them, so records carry unit weights: tools/make_profile.py ranks pairs by routed frequency, which is the
@@ -6828,6 +6828,10 @@ int main(int argc, char** argv) {
     // each stage commits a group's window once the last stage has judged its proposals
     // (Verifier::batch_launch_rows / batch_commit_rows)
     bool piped_mtp = batch_mtp && !stages.empty() && batch_groups_for(true).mtp_piped;   // (final once the slots that fit are known, below)
+    const bool piped_concurrent_mtp = [] {
+        const char* v = std::getenv("STRATA_PIPED_CONCURRENT_MTP");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
     const bool piped_mtp_observe = [] {
         const char* v = std::getenv("STRATA_PIPED_MTP_OBSERVE");
         return v != nullptr && std::atoi(v) != 0;
@@ -14841,6 +14845,10 @@ int main(int argc, char** argv) {
         const int pmtp_rows_per_group = GS * pmtp_rows_per_slot;    // the group's slots
         const bool pmtp = piped && piped_mtp && ver.deferred_commit_on() &&
                           pmtp_rows_per_group <= batch_max_t();
+        if (piped_concurrent_mtp)
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_CONCURRENT_MTP: enabled; resident own-buffer whole reads; "
+                                 "prepared PLE published before batch launch\n");
+        uint64_t concurrent_mtp_read_id = 0;
         if (piped_mtp_head && !pmtp) {
             std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP_HEAD requires the deferred-commit piped route\n");
             return 1;
@@ -17480,28 +17488,33 @@ int main(int argc, char** argv) {
                 // them missing and compute those experts on the CPU, as between pieces.  A BYIELD ends the run at
                 // its next chunk (Prefill::stop_at_chunk): the pipeline is drained there and the part read gives
                 // way as below, or the read goes on from there.
-                // Not where a read's thread allocates or frees (the idle stage's help, STRATA_PREFILL_HELP; the batched
-                // draft K/V, STRATA_SPLIT_MTP_BATCH: a free waits for the device), where serving a doorbell makes a
+                // The legacy path excludes the batched draft K/V. STRATA_PIPED_CONCURRENT_MTP is a narrower opt-in
+                // for resident piped MTP with private prompt buffers: checked again for every read below. It prepares
+                // known uploads before starting and publishes prepared PLE before any batch graph can wait for it.
+                // Internal MMQ/GEMM pools may still allocate lazily; those barriers can cost time.
+                // Not with the idle stage's help (STRATA_PREFILL_HELP), where serving a doorbell makes a
                 // CUDA call (--pcie-mode dma, the Foresight swap space STRATA_FS_SLOTS, the helper caches), and where
                 // the expert source recycles the buffers it hands out (the GGUF in place, an unbuffered source, the
                 // I/O read-ahead: one thread at a time).  Pictures are read the usual way (their rows go up through
                 // pinned slots of a size known only then).
                 static const bool pr_conc = [&] {
                     const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
-                    if (v == nullptr || std::atoi(v) == 0) return false;
+                    if (!piped_concurrent_mtp && (v == nullptr || std::atoi(v) == 0)) return false;
                     auto env_on = [](const char* k) {
                         const char* x = std::getenv(k);
                         return x != nullptr && std::atoi(x) != 0;
                     };
                     strata::program::ConcurrentReadSetup s;
                     s.prefill_help = env_on("STRATA_PREFILL_HELP");
-                    s.split_mtp_batch = env_on("STRATA_SPLIT_MTP_BATCH");
+                    s.split_mtp_batch = !piped_concurrent_mtp && env_on("STRATA_SPLIT_MTP_BATCH");
                     s.fs_slots = env_on("STRATA_FS_SLOTS");
                     s.pcie_dma = o.pcie_mode == "dma";
                     // (--remote-expert-opt works only through a helper cache, so without one it does not count)
                     s.helper_caches = prefill_src != srcp;
                     for (int r = 0; r < 3; ++r) s.helper_caches |= o.expert_cache_remote[(size_t) r] > 0;
-                    s.staged_source = srcp == &src && src.stages_blobs();
+                    // Only the strict resident extension may defer this known source's check. Its decode never
+                    // calls the expert pool, and the per-read guard below excludes outstanding lookahead jobs.
+                    s.staged_source = srcp == &src && src.stages_blobs() && !piped_concurrent_mtp;
                     s.other_source = srcp != &src && srcp != &arena_src;
                     if (const char* why = strata::program::concurrent_read_off(s)) {
                         std::fprintf(stderr, "strata batch: STRATA_PIPED_CONCURRENT is off beside %s\n", why);
@@ -17516,13 +17529,63 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_PIPED_CONCURRENT_MIN");
                     return v != nullptr ? (int64_t) std::max(0LL, std::atoll(v)) : (int64_t) 0;
                 }();
-                if (piped && pr_conc && req_imgs.empty() && (b0 - a0) >= pr_conc_min) {   // (with no slot decoding it only watches for a BYIELD)
+                bool resident_read = false;
+                int concurrent_active_slots = 0, concurrent_own_buffers = 0, concurrent_resident_stages = 0;
+                const bool concurrent_staged_source = srcp == &src && src.stages_blobs();
+                bool concurrent_lookahead_idle = false;
+                if (piped_concurrent_mtp) {
+                    strata::program::ResidentConcurrentReadSetup s;
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                    s.cuda_backend = true;
+#endif
+                    s.piped_mtp = pmtp;
+                    const char* split = std::getenv("STRATA_SPLIT_MTP_BATCH");
+                    s.split_mtp_batch = split != nullptr && std::atoi(split) != 0;
+                    for (const auto& sl : bs) if (sl.active) ++concurrent_active_slots;
+                    s.active_slots = concurrent_active_slots > 0;
+                    if (sp.owns_prompt_buffers()) ++concurrent_own_buffers;
+                    for (const auto& st : stages) if (st->sp.owns_prompt_buffers()) ++concurrent_own_buffers;
+                    s.private_buffers = concurrent_own_buffers == n_pipe;
+                    for (int k = 0; k < n_pipe; ++k)
+                        if (stage_verifier(k).ar_live()) ++concurrent_resident_stages;
+                    s.all_resident = concurrent_resident_stages == n_pipe && !host_res.empty() &&
+                        std::none_of(host_res.begin(), host_res.end(), [](int32_t r) { return r < 0; });
+                    s.no_loans = !mtp_room_open;
+                    for (const auto& p : pf_parts) s.no_loans = s.no_loans && p.lent.empty();
+                    s.draft_resident = use_mtp && mtp.experts_resident();
+                    s.stable_tier = pending.empty() && !ajob && !kvg.on && !peer.valid() && !remote_opt &&
+                                    !remote_caches && !fs_swap;
+                    s.text_only = req_imgs.empty();
+                    s.single_prompt = co_set.empty();
+                    // All-resident batch_serve skips pool dispatch, the sole lookahead submitter. With the reader
+                    // active pa_due also excludes adaptation, and pending.empty()/!ajob leaves apply_pending a no-op.
+                    // Observe the old predictor job under its mutex before allowing prefill to own the staged source.
+                    concurrent_lookahead_idle = !drive.d.lookahead || drive.d.lookahead->idle();
+                    s.lookahead_idle = concurrent_lookahead_idle;
+                    const char* why = strata::program::resident_concurrent_read_off(s);
+                    if (!why && !pr_conc) why = "unsupported_setup";
+                    if (!why && concurrent_staged_source && prefill_src != srcp) why = "shared_staged_source";
+                    if (!why && (b0 - a0) < pr_conc_min) why = "below_min_tokens";
+                    if (!why) {
+                        // A failed preparation is a serial fallback, not a half-prepared concurrent admission.
+                        // The optional strict mode preserves reserve_prefill's legacy warning-only behavior elsewhere.
+                        std::string prep_err;
+                        if (!mtp.reserve_prefill(C, prep_err, true)) why = "draft_reserve_failed";
+                        else if (!sp.prepare_concurrent_read(C, prep_err)) why = "prompt_prepare_failed";
+                    }
+                    resident_read = why == nullptr;
+                    if (why)
+                        std::fprintf(stderr, "strata piped concurrent MTP: fallback from=%lld tokens=%lld reason=%s\n",
+                                     (long long) a0, (long long) (b0 - a0), why);
+                }
+                if (piped && pr_conc && req_imgs.empty() && (b0 - a0) >= pr_conc_min &&
+                    (!piped_concurrent_mtp || resident_read)) {   // legacy mode also watches idle reads for a BYIELD
                     // the drafter's prompt pass captures its graphs and grows its records at first use, and the
                     // prompt path's pinned upload slots grow at their first larger upload: done here, with nothing in
                     // flight (on the reader's thread a capture, an allocation or a free takes the driver's lock and
                     // can wait for the device, #31)
-                    if (use_mtp && !mtp.reserve_prefill(C, e)) return false;
-                    if (!sp.reserve_uploads(C))
+                    if (!resident_read && use_mtp && !mtp.reserve_prefill(C, e)) return false;
+                    if (!resident_read && !sp.reserve_uploads(C))
                         std::fprintf(stderr, "strata batch: the prompt path's pinned upload slots could not be "
                                              "reserved (they grow at first use)\n");
                     // where the read's thread and the doorbell thread run: on Linux a thread inherits its creator's
@@ -17641,12 +17704,23 @@ int main(int argc, char** argv) {
                     for (int64_t q0 = a0; q0 < b0;) {
                         const auto tc = Clock::now();
                         const int64_t rows0 = pipe_rows;
+                        const int64_t source_calls0 = drive.calls.load(std::memory_order_relaxed);
+                        const uint64_t read_id = resident_read ? ++concurrent_mtp_read_id : 0;
+                        if (resident_read)
+                            std::fprintf(stderr, "strata piped concurrent MTP: begin read_id=%llu from=%lld tokens=%lld "
+                                                 "chunk=%lld active_slots=%d stages=%d own_buffers=%d resident_stages=%d\n",
+                                         (unsigned long long) read_id, (long long) q0, (long long) (b0 - q0),
+                                         (long long) C_read, concurrent_active_slots, n_pipe, concurrent_own_buffers,
+                                         concurrent_resident_stages);
                         // per stage, for the read's log line: its windows and the host time that set them up (the
                         // PLE gather included, which waits while the prompt holds the table) - both this thread's
                         std::vector<std::pair<int64_t, double>> st0((size_t) n_pipe);
                         for (int k = 0; k < n_pipe; ++k)
                             st0[(size_t) k] = {stage_verifier(k).windows, stage_verifier(k).ms_host};
                         std::atomic<bool> done{false};
+                        std::atomic<bool> started{false};
+                        Clock::time_point reader_started{}, reader_finished{};
+                        int64_t rows_before_done = 0;
                         std::atomic<int> want_yield{-1};
                         bool read_ok = true;
                         std::string read_err;
@@ -17657,6 +17731,8 @@ int main(int argc, char** argv) {
                             conc_thread_cpus();
                             try {   // (an exception leaving a std::thread ends the process: a failed read instead)
                                 if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
+                                reader_started = Clock::now();
+                                started.store(true, std::memory_order_release);
                                 read_ok = sp.run(ids.data() + q0, b0 - q0, q0, read_err);
                             } catch (const std::exception& x) {
                                 read_ok = false;
@@ -17665,6 +17741,7 @@ int main(int argc, char** argv) {
                                 read_ok = false;
                                 read_err = "the prompt read failed";
                             }
+                            reader_finished = Clock::now();
                             done.store(true, std::memory_order_release);
                             { std::lock_guard<std::mutex> lk(in_mu); }   // (the loop below may be waiting on in_cv)
                             in_cv.notify_all();
@@ -17682,8 +17759,16 @@ int main(int argc, char** argv) {
                         bool pump_ok = true;
                         size_t seen = 0;   // in_lines' length after the last look: a line that comes wakes the wait
                         while (!done.load(std::memory_order_acquire)) {
+                            if (resident_read && !started.load(std::memory_order_acquire)) {
+                                std::this_thread::yield();
+                                continue;
+                            }
                             const bool decoding = pump_ok && (batch_on() || pipe_inflight());
                             if (decoding) pump_ok = pump(true);
+                            // A conservative output count: only a completed pump observed before the read's done
+                            // publication counts. Excludes the ambiguous final pump and the subsequent pipe_drain.
+                            if (resident_read && !done.load(std::memory_order_acquire))
+                                rows_before_done = pipe_rows - rows0;
                             std::unique_lock<std::mutex> lk(in_mu);
                             if (!decoding)   // nothing to pump: until the read ends or a line comes (both notify)
                                 in_cv.wait_for(lk, std::chrono::milliseconds(2), [&] {
@@ -17708,6 +17793,21 @@ int main(int argc, char** argv) {
                         reader.join();   // (a failed window leaves the read to finish: it is not stopped mid-run)
                         sp.stop_at_chunk = nullptr;
                         in_prompt_read = false;
+                        if (resident_read) {
+                            const double overlap_ms = started.load(std::memory_order_acquire)
+                                ? std::chrono::duration<double, std::milli>(reader_finished - reader_started).count() : 0.0;
+                            const bool admit_stop = admit_slot >= 0 && admit_slot < (int) bs.size() && bs[(size_t) admit_slot].stop;
+                            std::fprintf(stderr, "strata piped concurrent MTP: end read_id=%llu read_ms=%.3f "
+                                                 "decode_rows_before_done=%lld read_ok=%d pump_ok=%d stopped_at=%lld "
+                                                 "admit_stop_requested=%d yield_slot=%d\n",
+                                         (unsigned long long) read_id, overlap_ms, (long long) rows_before_done,
+                                         (int) read_ok, (int) pump_ok, (long long) sp.stopped_at(),
+                                         (int) admit_stop, want_yield.load(std::memory_order_acquire));
+                            std::fprintf(stderr, "strata resident read source: read_id=%llu staged=%d lookahead_idle=%d "
+                                                 "dispatch_delta=%lld\n", (unsigned long long) read_id,
+                                         (int) concurrent_staged_source, (int) concurrent_lookahead_idle,
+                                         (long long) (drive.calls.load(std::memory_order_relaxed) - source_calls0));
+                        }
                         if (!pump_ok || !pipe_drain()) {
                             batch_fatal = true;
                             e = "a pipelined batch window failed";

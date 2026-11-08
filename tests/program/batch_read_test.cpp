@@ -9,6 +9,8 @@
 using strata::program::batch_read_piece;
 using strata::program::concurrent_read_off;
 using strata::program::ConcurrentReadSetup;
+using strata::program::ResidentConcurrentReadSetup;
+using strata::program::resident_concurrent_read_off;
 using strata::program::piped_decode_budget_ms;
 using strata::program::piped_read_lead_in;
 using strata::program::piped_read_piece;
@@ -59,6 +61,34 @@ int main() {
         for (size_t j = i; j < std::size(each); ++j) s.*each[j] = true;
         CHECK(same(concurrent_read_off(s), named[i]));
     }
+    // The resident MTP extension fails closed for every live ownership/state requirement. None of these checks
+    // makes an unsupported legacy source safe: callers must also retain concurrent_read_off's source guards.
+    ResidentConcurrentReadSetup resident;
+    bool ResidentConcurrentReadSetup::*const required[] = {
+        &ResidentConcurrentReadSetup::cuda_backend, &ResidentConcurrentReadSetup::piped_mtp,
+        &ResidentConcurrentReadSetup::split_mtp_batch, &ResidentConcurrentReadSetup::active_slots,
+        &ResidentConcurrentReadSetup::private_buffers, &ResidentConcurrentReadSetup::all_resident,
+        &ResidentConcurrentReadSetup::no_loans, &ResidentConcurrentReadSetup::draft_resident,
+        &ResidentConcurrentReadSetup::stable_tier, &ResidentConcurrentReadSetup::text_only,
+        &ResidentConcurrentReadSetup::single_prompt, &ResidentConcurrentReadSetup::lookahead_idle};
+    for (auto f : required) resident.*f = true;
+    CHECK(resident_concurrent_read_off(resident) == nullptr);
+    const char* missing[std::size(required)] = {};
+    for (size_t i = 0; i < std::size(required); ++i) {
+        auto s = resident;
+        s.*required[i] = false;
+        missing[i] = resident_concurrent_read_off(s);
+        CHECK(missing[i] != nullptr);
+        for (size_t j = 0; j < i; ++j) CHECK(!same(missing[i], missing[j]));
+        // A failure earlier in the order wins, including when an admission changes more than one property.
+        for (size_t j = i; j < std::size(required); ++j) s.*required[j] = false;
+        CHECK(same(resident_concurrent_read_off(s), missing[i]));
+    }
+    CHECK(same(missing[3], "no_active_slots"));   // solo prefill must retain the existing single-run path
+    CHECK(same(missing[4], "shared_prompt_buffers"));
+    CHECK(same(missing[6], "active_loan"));
+    CHECK(same(missing[7], "draft_weights_not_resident"));
+    CHECK(same(missing[11], "decode_lookahead_busy"));   // old predictor work must finish before source ownership changes
     // piped_read_piece (#1906): off -> one run; whole chunks, at least one, at most 32
     CHECK(piped_read_piece(0, 8192) == 0);
     CHECK(piped_read_piece(-5, 8192) == 0);

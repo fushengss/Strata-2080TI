@@ -326,6 +326,9 @@ public:
     /// Layer `layer`'s MoE input for `n_tok` tokens (host floats): predict and warm layer + 1.  Never waits: a
     /// prediction still running for an earlier layer makes this one skip.
     void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res);
+    /// No submitted or executing prediction. The caller must separately exclude future submit calls; this
+    /// observation is not a pause. Resident batch windows do not enter the expert dispatch that submits jobs.
+    bool idle();
     /// STRATA_IO_PREFETCH_DEPTH: how many layers ahead of `layer` are predicted and warmed (default 1, the next layer).
     /// A deeper one predicts layer + j from layer's input, which is less exact the further it looks.
     void set_depth(int d) { depth_ = d < 1 ? 1 : d > 4 ? 4 : d; }
