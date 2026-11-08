@@ -66,6 +66,26 @@ inline int64_t piped_read_piece(int64_t piece_tokens, int64_t chunk) {
     return std::clamp<int64_t>(piece_tokens / chunk, 1, kPipedMaxChunks) * chunk;
 }
 
+/// STRATA_PIPED_READ_DECODE_ONLY: leave an idle read whole, also after the last decoding slot finishes.
+/// Re-evaluate at a drained piece boundary; the prompt's planned chunk stays the same.
+inline int64_t piped_read_piece(int64_t piece_tokens, int64_t chunk, bool decode_only, bool beside_slots) {
+    return decode_only && !beside_slots ? 0 : piped_read_piece(piece_tokens, chunk);
+}
+
+/// The lead-in belongs to a completed read beside still-active slots. In decode-only mode an idle remainder,
+/// a cancellation, a give-way or a failed read must not leave a budget for a later, unrelated admission.
+struct PipedReadHistory {
+    bool have_previous = false;
+    double piece_ms = 0.0;
+
+    void finish(bool decode_only, bool completed, bool beside_slots) {
+        if (decode_only && (!completed || !beside_slots)) {
+            have_previous = false;
+            piece_ms = 0.0;
+        }
+    }
+};
+
 /// The slots' decode time between two pieces: share x the piece's time (STRATA_BATCH_DECODE_SHARE, the rule the
 /// one-GPU path uses between chunks), at most cap_ms (STRATA_PIPED_DECODE_MAX_MS; <= 0: no cap), at least floor_ms
 /// (STRATA_PIPED_DECODE_MIN_MS).

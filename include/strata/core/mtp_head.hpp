@@ -2,13 +2,16 @@
 
 #include <cuda_runtime.h>
 #include <cstddef>
+#include <memory>
 #include <string>
 
 namespace strata::core {
 
 /// Two row shards of a plain Q6_K draft head. No probability or token reduction runs on the target cards:
 /// the complete logits return in their original row order, for the caller's unchanged source-card tail.
-/// init() owns a copy of each half of source_weights. The source stream passed to enqueue() must outlive reset().
+/// init() creates a shared read-only copy of each half of source_weights. init_shared() borrows that bank,
+/// with private streams, graphs, events and scratch for every workspace. The bank outlives its last workspace;
+/// resetting the original owner does not invalidate clones. Source streams must outlive their workspace reset().
 /// A chain may enqueue steps 0..7 without a host wait. Enqueue the source tail before the next body/enqueue;
 /// that source-stream ordering protects the shared activation/logits buffers. Drain before reusing a step index.
 class MtpHeadShards {
@@ -20,6 +23,7 @@ public:
 
     bool init(const void* source_weights, int source_device, int type, int n, int vocab,
               int target0, int target1, std::string& err);
+    bool init_shared(const MtpHeadShards& owner, std::string& err);
     /// Copies exact Q8_1 bytes, records source-ready, queues both head graphs, then source waits and a full-logit copy.
     /// Does not synchronize or poll. The caller can immediately enqueue the original argmax/probability tail.
     bool enqueue(cudaStream_t source_stream, const void* source_q8, float* source_logits, int step, std::string& err);
@@ -29,11 +33,18 @@ public:
     size_t row_bytes() const { return q8_bytes_; }
     int row_begin(int shard) const { return shard >= 0 && shard < 2 ? shards_[shard].begin : -1; }
     int row_count(int shard) const { return shard >= 0 && shard < 2 ? shards_[shard].count : 0; }
+    bool shares_weights_with(const MtpHeadShards& other) const noexcept {
+        return initialized() && other.initialized() && weights_ == other.weights_;
+    }
 
 private:
+    struct WeightBank;
+    std::shared_ptr<const WeightBank> weights_;
+    bool init_workspace(std::shared_ptr<const WeightBank> weights, std::string& err,
+                        const void* source_weights = nullptr, WeightBank* new_weights = nullptr);
     struct Shard {
         int device = -1, begin = 0, count = 0;
-        void *weights = nullptr, *q8 = nullptr, *activation = nullptr;
+        void *q8 = nullptr, *activation = nullptr;
         float *logits = nullptr, *mapped_logits = nullptr;
         cudaStream_t stream = nullptr;
         cudaGraphExec_t graph = nullptr;

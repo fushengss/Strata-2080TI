@@ -6,6 +6,9 @@ MtpHeadShards::~MtpHeadShards() = default;
 bool MtpHeadShards::init(const void*, int, int, int, int, int, int, std::string& err) {
     err = "mtp head: CUDA row-shard graphs are unavailable on Metal"; return false;
 }
+bool MtpHeadShards::init_shared(const MtpHeadShards&, std::string& err) {
+    err = "mtp head: shared CUDA row-shard workspaces are unavailable on Metal"; return false;
+}
 bool MtpHeadShards::enqueue(cudaStream_t, const void*, float*, int, std::string& err) {
     err = "mtp head: unavailable on Metal"; return false;
 }
@@ -45,6 +48,19 @@ bool checked(cudaError_t status, const char* operation, std::string& err) {
 }
 }  // namespace
 
+// Mutable only while the first workspace initializes it. Other workspaces receive a const shared_ptr after
+// that initialization succeeds; all captured target graphs read these pointers and never write the weights.
+struct MtpHeadShards::WeightBank {
+    struct Part { int device = -1, begin = 0, count = 0; void* data = nullptr; } part[2];
+    int source = -1, type = -1, n = 0, vocab = 0;
+    ~WeightBank() {
+        for (auto& p : part) if (p.device >= 0 && p.data) {
+            const DeviceScope target(p.device);
+            if (target.status == cudaSuccess) (void) cudaFree(p.data);
+        }
+    }
+};
+
 MtpHeadShards::~MtpHeadShards() { reset(); }
 
 bool MtpHeadShards::drain(std::string& err) {
@@ -77,7 +93,6 @@ void MtpHeadShards::reset() noexcept {
         if (s.graph) (void) cudaGraphExecDestroy(s.graph);
         for (auto e : s.finished) if (e) (void) cudaEventDestroy(e);
         if (s.stream) (void) cudaStreamDestroy(s.stream);
-        if (s.weights) (void) cudaFree(s.weights);
         if (s.q8) (void) cudaFree(s.q8);
         if (s.logits) (void) cudaFree(s.logits);
         s = {};
@@ -94,6 +109,9 @@ void MtpHeadShards::reset() noexcept {
     activation_host_ = activation_source_ = nullptr;
     logits_host_ = logits_source_ = nullptr;
     last_source_stream_ = nullptr;
+    // Each workspace has drained its consumers and destroyed its graphs before dropping the bank. A clone
+    // retains its own reference even if the original workspace resets first.
+    weights_.reset();
 }
 
 bool MtpHeadShards::init(const void* weights, int source_device, int type, int n, int vocab,
@@ -115,7 +133,38 @@ bool MtpHeadShards::init(const void* weights, int source_device, int type, int n
     if (source_device >= devices || target0 >= devices || target1 >= devices) {
         err = "mtp head: target device is outside the visible device set"; return false;
     }
-    source_ = source_device; n_ = n; vocab_ = vocab;
+    try {
+        auto bank = std::make_shared<WeightBank>();
+        bank->source = source_device; bank->type = type; bank->n = n; bank->vocab = vocab;
+        const int split = (vocab / 2 / 128) * 128;
+        for (int i = 0; i < 2; ++i) {
+            bank->part[i].device = i == 0 ? target0 : target1;
+            bank->part[i].begin = i == 0 ? 0 : split;
+            bank->part[i].count = i == 0 ? split : vocab - split;
+        }
+        // Keep the solo initialization's CUDA allocation/capture order: each half is copied immediately
+        // before its own scratch and graph, rather than preloading both weights ahead of the workspace.
+        return init_workspace(bank, err, weights, bank.get());
+    } catch (const std::exception& e) {
+        err = std::string("mtp head: weight bank: ") + e.what(); return false;
+    }
+}
+
+bool MtpHeadShards::init_shared(const MtpHeadShards& owner, std::string& err) {
+    if (source_ >= 0) { err = "mtp head: already initialized"; return false; }
+    if (!owner.ready_ || !owner.weights_) { err = "mtp head: shared owner is not initialized"; return false; }
+    return init_workspace(owner.weights_, err);
+}
+
+bool MtpHeadShards::init_workspace(std::shared_ptr<const WeightBank> bank, std::string& err,
+                                   const void* source_weights, WeightBank* new_weights) {
+    using namespace strata::kernels;
+    if (source_ >= 0 || !bank) { err = "mtp head: workspace needs an uninitialized instance and weight bank"; return false; }
+    const DeviceScope source(bank->source);
+    if (!checked(source.status, "select workspace source", err)) return false;
+    weights_ = std::move(bank);
+    source_ = weights_->source; n_ = weights_->n; vocab_ = weights_->vocab;
+    const int type = weights_->type, n = n_, vocab = vocab_;
     auto fail = [&]() { reset(); return false; };
     try {
         q8_bytes_ = native_q8_1_bytes(n, 1);
@@ -129,26 +178,28 @@ bool MtpHeadShards::init(const void* weights, int source_device, int type, int n
             if (!checked(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "create producer event", err)) return fail();
         const size_t weight_row = native_mmvq_weight_bytes(type, n, 1);
         // Preserve the original MMVQ row/tile phase at the second shard, including the odd 106299-row subset.
-        const int split = (vocab / 2 / 128) * 128;
         for (int i = 0; i < 2; ++i) {
             auto& s = shards_[i];
-            s.device = i == 0 ? target0 : target1;
-            s.begin = i == 0 ? 0 : split;
-            s.count = i == 0 ? split : vocab - split;
+            const auto& w = weights_->part[i];
+            s.device = w.device; s.begin = w.begin; s.count = w.count;
             // Stage only this half, preserving the gathered subset's exact bytes and row order. No P2P required.
-            std::vector<unsigned char> host((size_t) s.count * weight_row);
-            if (!checked(cudaMemcpy(host.data(), (const unsigned char*) weights + (size_t) s.begin * weight_row,
-                                    host.size(), cudaMemcpyDeviceToHost), "read shard weights", err)) return fail();
+            std::vector<unsigned char> host;
+            if (new_weights) {
+                host.resize((size_t) s.count * weight_row);
+                if (!checked(cudaMemcpy(host.data(), (const unsigned char*) source_weights + (size_t) s.begin * weight_row,
+                                        host.size(), cudaMemcpyDeviceToHost), "read shard weights", err)) return fail();
+            }
             const DeviceScope target(s.device);
             if (!checked(target.status, "select target", err)) return fail();
             int lo = 0, hi = 0;
             const char* priority = std::getenv("STRATA_MTP_PRIORITY");
             if ((!priority || std::atoi(priority) != 0) &&
                 !checked(cudaDeviceGetStreamPriorityRange(&lo, &hi), "get target priority", err)) return fail();
-            if (!checked(cudaStreamCreateWithPriority(&s.stream, cudaStreamNonBlocking, hi), "create target stream", err) ||
-                !checked(cudaMalloc(&s.weights, host.size()), "allocate shard weights", err) ||
-                !checked(cudaMemcpy(s.weights, host.data(), host.size(), cudaMemcpyHostToDevice), "copy shard weights", err) ||
-                !checked(cudaMalloc(&s.q8, q8_bytes_), "allocate target Q8_1", err) ||
+            if (!checked(cudaStreamCreateWithPriority(&s.stream, cudaStreamNonBlocking, hi), "create target stream", err)) return fail();
+            if (new_weights &&
+                (!checked(cudaMalloc(&new_weights->part[i].data, host.size()), "allocate shard weights", err) ||
+                 !checked(cudaMemcpy(new_weights->part[i].data, host.data(), host.size(), cudaMemcpyHostToDevice), "copy shard weights", err))) return fail();
+            if (!checked(cudaMalloc(&s.q8, q8_bytes_), "allocate target Q8_1", err) ||
                 !checked(cudaMalloc((void**) &s.logits, (size_t) s.count * sizeof(float)), "allocate target logits", err) ||
                 !checked(cudaHostGetDevicePointer(&s.activation, activation_host_, 0), "map target activation", err) ||
                 !checked(cudaHostGetDevicePointer((void**) &s.mapped_logits, logits_host_, 0), "map target logits", err)) return fail();
@@ -158,7 +209,7 @@ bool MtpHeadShards::init(const void* weights, int source_device, int type, int n
             bool ok = true;
             try {
                 copy_from_mapped((float*) s.q8, (const float*) s.activation, (int64_t) q8_bytes_ / sizeof(float), s.stream);
-                native_mmvq(type, s.weights, s.q8, s.logits, n, s.count, 1, s.stream);
+                native_mmvq(type, w.data, s.q8, s.logits, n, s.count, 1, s.stream);
                 // A vocabulary/subset need not contain a multiple of four rows (106299 -> 53120/53179).
                 // Copy the exact 32-bit words: no float arithmetic, padding, or access beyond this shard.
                 copy_i32_from_mapped((int32_t*) (s.mapped_logits + s.begin), (const int32_t*) s.logits, s.count, s.stream);

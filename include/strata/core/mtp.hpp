@@ -182,6 +182,10 @@ public:
     /// Only plain Q6_K subset rows are supported; unsupported layouts return a clear error. The caller enables
     /// this per request only for supported greedy solo PW2 work. Ordinary draft/prefill/batch graphs stay intact.
     bool prepare_head_shards(int target0, int target1, std::string& err);
+    /// A piped slot borrows the initialized solo head's read-only shard bank, with its own workspace.
+    /// Bind this clone to owner first, then call before prepare_chain while both drafters are idle. The
+    /// ordinary shared dense/expert/subset-map lifetime contract still requires the owner drafter to live.
+    bool prepare_shared_head_shards(const MtpDrafter& owner, std::string& err);
     void set_head_shards_active(bool on) { head_shards_active_ = on && head_shards_.initialized(); }
     bool head_shards_enabled() const { return head_shards_.initialized(); }
     uint64_t head_shard_steps() const { return head_shard_steps_; }

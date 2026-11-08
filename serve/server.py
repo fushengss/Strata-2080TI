@@ -4770,6 +4770,7 @@ class Service:
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        self.reasoning_budget_engine_cap = False      # opt-in: stop native speculation at the known thinking boundary
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -6204,6 +6205,14 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        # Snapshot the loaded setting for this request. Internal cap continuations otherwise reset the native
+        # penalty window's start, so requests with effective history penalties retain the original path.
+        budget_engine_cap = self.shared.get("reasoning_budget_engine_cap", self.reasoning_budget_engine_cap) is True
+        budget_engine_cap = (budget_engine_cap and isinstance(self.engine, StrataEngine)
+                             and not self.engine.split_engine and not self.engine.multi)
+        budget_engine_cap = budget_engine_cap and not any(
+            isinstance((sampling or {}).get(key), (int, float)) and (sampling or {})[key] != neutral
+            for key, neutral in (("repetition_penalty", 1.0), ("frequency_penalty", 0.0), ("presence_penalty", 0.0)))
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -6380,8 +6389,17 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        segment_max = max_new - n
+                        if budget_engine_cap and budget and parser.state == "reasoning":
+                            # A native max_new bounds the whole speculative window. BSTOP after the frontend's
+                            # budget can arrive after extra tokens already changed the slot's recurrent state.
+                            # A partial tag/UTF-8 character at the boundary advances one token at a time until
+                            # the existing clean-boundary check below permits the wrap-up.
+                            segment_max = min(segment_max, max(1, budget - thought))
+                        engine_limited = segment_max < max_new - n
+                        segment_exhausted = False
+                        gen = self.engine.generate(prompt, segment_max, sampling, cancel, embeddings=emb) if emb \
+                            else self.engine.generate(prompt, segment_max, sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -6468,6 +6486,16 @@ class Service:
                                     elif parser.state == "content" and parser.clean and not detok.pending():
                                         opens = True
                                         break
+                            else:
+                                segment_exhausted = True
+                            if (engine_limited and (wrap or opens) and len(seg) == segment_max
+                                    and not cancel.is_set()):
+                                # Consume the length-ending BDONE on this request's thread before close().
+                                # Leaving it to the background BSTOP drain loses this segment's accounting.
+                                for t in gen:
+                                    if t is not None:
+                                        raise ValueError("the engine exceeded the reasoning segment token cap")
+                                    yield "ping", None
                         except EngineNonFinite:
                             nonfinite = True
                         except EngineDied as e:
@@ -6562,6 +6590,13 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+                        if (engine_limited and segment_exhausted and len(seg) == segment_max
+                                and finish == "length" and not (wrap or opens or repeated or looped)
+                                and not cancel.is_set() and n < max_new):
+                            # Artificial length, not EOS/stop/cancel: preserve parser, UTF-8 decoder, sampling and
+                            # counters. This also lets an early natural </think> keep its full answer allowance.
+                            prompt = prompt + seg
+                            continue
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -9229,7 +9264,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
 
 
 SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
-               "experimental_speed_projection")
+               "experimental_speed_projection", "reasoning_budget_engine_cap")
 
 
 def clean_shared_defaults(d) -> dict:
@@ -9264,9 +9299,9 @@ def clean_shared_defaults(d) -> dict:
             if not number or value != int(value) or value < 0:
                 raise ValueError("reasoning_budget_tokens: a whole number of tokens (0: no budget)")
             value = int(value)
-        elif key == "experimental_speed_projection":
+        elif key in ("experimental_speed_projection", "reasoning_budget_engine_cap"):
             if not isinstance(value, bool):
-                raise ValueError("experimental_speed_projection: true or false")
+                raise ValueError(f"{key}: true or false")
         else:
             raise ValueError(f"unknown setting {key!r}")
         out[key] = float(value) if key in ("temperature", "top_p") else value
@@ -10232,6 +10267,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    svc.reasoning_budget_engine_cap = cfg.get("reasoning_budget_engine_cap") is True
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
