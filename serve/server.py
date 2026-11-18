@@ -6106,10 +6106,15 @@ class Service:
             cut = text.find(self.PREFIX_END)
             if cut >= 0:
                 text = text[:cut]
+            plain = ()
             if changed:
                 text, plain = unmark_think_literals(text, self.literals)
-                return self.tok.encode(text, parse_special=True, plain=plain)
-            return self.tok.encode(text, parse_special=True)
+            # The full prompt was just encoded. Reuse its verified special-token boundaries when rendering this
+            # shorter head, without replacing the cached full prompt. The comparison below still validates the pin.
+            if self.prompts is not None:
+                return self.prompts.encode(text, plain, store=False)
+            return self.tok.encode(text, parse_special=True, plain=plain) if plain else \
+                self.tok.encode(text, parse_special=True)
 
         if "tokens" in spec:
             n = spec["tokens"]

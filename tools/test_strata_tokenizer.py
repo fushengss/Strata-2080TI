@@ -274,6 +274,25 @@ class Margin(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(enc.encode(text), tk.encode(text, parse_special=True))
 
+    def test_branches_keep_the_long_message_ending(self):
+        tk = byte_tokenizer(["<|im_start|>", "<|im_end|>", "<|long_control_literal_for_lookahead|>"])
+        enc = ST.PromptEncoder(tk)
+        prefix = "<|im_start|>user\n" + "shared document " * 1000 + "<|im_end|>\n<|im_start|>"
+        first, second = prefix + "user\nfirst branch", prefix + "assistant\nsecond branch"
+        enc.encode(first)
+        self.assertEqual(enc.encode(second), tk.encode(second, parse_special=True))
+        self.assertEqual(enc.last_reused, len(prefix))
+
+    def test_skipped_longer_literal_can_hide_a_shorter_match(self):
+        tk = byte_tokenizer(["<|start|>", "<|end|>", "b<|end|>tail"])
+        enc = ST.PromptEncoder(tk)
+        prefix = "<|start|>" + "a" * 40
+        first, second = prefix + "b<|end|>test", prefix + "b<|end|>tail"
+        plain = ((len(prefix), len(prefix) + 1),)
+        enc.encode(first, plain)
+        self.assertEqual(enc.encode(second, plain), tk.encode(second, parse_special=True, plain=plain))
+        self.assertEqual(enc.last_reused, len("<|start|>"))
+
     def test_random_specials(self):
         """Literals that extend or end inside one another, texts that change right after one of them."""
         rnd = random.Random(3)
