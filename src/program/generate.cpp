@@ -17252,8 +17252,16 @@ int main(int argc, char** argv) {
                         const int64_t n = v ? (int64_t) std::atoll(v) : 0;
                         return n >= 2048 ? n / 256 * 256 : (int64_t) 4096;
                     }();
+                    // STRATA_SPLIT_CHUNK_MIN=N (default 2048): the floor of a chunk.  A read below it walks the stages in one
+                    // chunk, one card at a time (a 570-token append took 0.75-0.83 s, 94-100 ms a stage on the 8x RTX 2080 Ti
+                    // split); a lower floor splits it so the cards work on different chunks at once.
+                    static const int64_t split_min = [] {
+                        const char* v = std::getenv("STRATA_SPLIT_CHUNK_MIN");
+                        const int64_t n = v ? (int64_t) std::atoll(v) : 0;
+                        return n >= 256 ? n / 256 * 256 : (int64_t) 2048;
+                    }();
                     const int64_t per = (tokens + o.split_chunks - 1) / o.split_chunks;
-                    cap = std::min(cap, std::clamp<int64_t>((per + 255) / 256 * 256, 2048, split_max));
+                    cap = std::min(cap, std::clamp<int64_t>((per + 255) / 256 * 256, std::min(split_min, split_max), split_max));
                 }
                 const int64_t want_full = planned_chunk(tokens, cap, pf_plan_chunk);
                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
