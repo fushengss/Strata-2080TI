@@ -249,10 +249,24 @@ bool on_device(const void* p) {
 // STRATA_PARK_TRACE: where conversation_kv_save's time goes since the park's begin (ms): the pointer-attribute
 // queries, the host buffer resizes and the copies (into the stage, or the synchronous ones).  Read by the park trace.
 struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; };
-KvSaveTrace& kv_save_trace() { static KvSaveTrace t; return t; }
+// (per thread: a layer split's stages are saved on threads of their own, STRATA_PARK_THREADS)
+KvSaveTrace& kv_save_trace() { thread_local KvSaveTrace t; return t; }
 bool park_trace_on() {
     static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr;
     return on;
+}
+// STRATA_KV_PIECE_KIB (read once; default 1024, 16384 gives the 16 MiB segments of before): the size of the pieces a K/V part
+// is captured in.  1 MiB pieces are all one size, so the pieces of an evicted or superseded image are exactly what the next
+// park needs (a block cache keeps their pages in); with 16 MiB segments the tail of every part (0-16 MiB, ~40% of a
+// conversation's K/V on the 8x RTX 2080 Ti split) came in a size no other part shared.  A copy per MiB costs ~15 us.
+size_t kv_piece_bytes() {
+    static const size_t v = [] {
+        const char* e = std::getenv("STRATA_KV_PIECE_KIB");
+        long long k = e != nullptr ? std::atoll(e) : 1024;
+        k = std::max<long long>(64, std::min<long long>(k, 16384));
+        return (size_t) k << 10;
+    }();
+    return v;
 }
 
 bool transfer(void* dst, const void* src, size_t n, std::string& error) {
@@ -339,7 +353,8 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                             return true;
                         })) return false;
                 } else {
-                    dst[i]->resize(sizes[i]);
+                    // every byte past the kept prefix is written by the copy below (or the save fails): no zero fill first
+                    dst[i]->resize_for_overwrite(sizes[i], kv_piece_bytes());
                     if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                             return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
                         })) return false;
@@ -357,8 +372,9 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const bool staged = a.active && src[i] != nullptr && sizes[i] > keep && a.used + (sizes[i] - keep) <= a.cap &&
                             (st.kv_mode == 0 || on_device(src[i]));
         const auto t1 = tick();
-        if (staged) dst[i]->resize_for_overwrite(sizes[i]);
-        else dst[i]->resize(sizes[i]);
+        // staged or not, every byte past the kept prefix is written by the copy below (or the save fails): no zero fill first.
+        // (A zero fill touched the fresh pages one more time: 36-72 ms of a stage's 45-90 ms K/V save on the 8x RTX 2080 Ti split.)
+        dst[i]->resize_for_overwrite(sizes[i], kv_piece_bytes());
         const auto t2 = tick();
         const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                 const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
@@ -594,6 +610,8 @@ void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& cop
 
 bool conversation_park_async_begin(size_t need) {
     if (park_trace_on()) kv_save_trace() = {};   // (the sums cover this park's saves)
+    // switch off: none of the shared stage state is touched (a layer split's stages begin their saves on threads of their own)
+    if (!park_async_on()) return false;
     conversation_park_join();   // (the stage is reused)
     ParkAsync& a = park_async();
     a.active = false;

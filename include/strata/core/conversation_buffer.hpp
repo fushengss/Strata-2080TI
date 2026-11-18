@@ -62,8 +62,11 @@ public:
             (count > SIZE_MAX / sizeof(Segment) || !add(total, count * sizeof(Segment)))) return SIZE_MAX;
         return total;
     }
-    void resize(size_t n, uint8_t value = 0) { resize_impl(n, &value); }
-    void resize_impl(size_t n, const uint8_t* value) {
+    void resize(size_t n, uint8_t value = 0) { resize_impl(n, &value, segment_bytes); }
+    // `piece`: the largest segment this call adds (segment_bytes unless a caller asks for less).  A fresh capture in pieces of
+    // 1 MiB leaves segments that are all one size, so those of an evicted or superseded image are exactly what the next
+    // capture needs and a block cache hands them out again with their pages in (see conversation_kv_save).
+    void resize_impl(size_t n, const uint8_t* value, size_t piece) {
         if (n > size_) {
             const size_t held = size_;
             const bool growing = held != 0;
@@ -77,7 +80,7 @@ public:
                 size_ += extend;
             }
             while (size_ < n) {
-                const size_t count = std::min(segment_bytes, n - size_);
+                const size_t count = std::min(piece, n - size_);
                 const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
                 Segment segment;
                 segment.reserve(segment_capacity(count, previous, growing, held));
@@ -99,7 +102,7 @@ public:
     void pop_back() { resize(size_ - 1); }
     // resize() without the zero fill of what it adds (the fresh pages are not touched here): only for a caller that
     // writes every added byte before anything reads it (STRATA_PARK_ASYNC's background copy)
-    void resize_for_overwrite(size_t n) { resize_impl(n, nullptr); }
+    void resize_for_overwrite(size_t n, size_t piece = segment_bytes) { resize_impl(n, nullptr, piece > 0 ? piece : segment_bytes); }
 
     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) {
