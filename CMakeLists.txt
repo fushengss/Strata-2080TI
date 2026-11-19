@@ -2486,6 +2486,9 @@ if(STRATA_NATIVE_EXPERTS)
       # layers on sm_80+ (77 below sm_80 and without a card)
       add_test(NAME prefill_fused_iq_test_q2n COMMAND prefill_fused_iq_test "--only=Q2_0 / Q2_0" --unset-pf-fused)
       set_tests_properties(prefill_fused_iq_test_q2n PROPERTIES ENVIRONMENT "STRATA_PF_FUSED_Q2N=1" SKIP_RETURN_CODE 77 TIMEOUT 600)
+      add_test(NAME prefill_fused_iq_test_sm75_kq COMMAND prefill_fused_iq_test "--only=Q5_K / Q" --unset-pf-fused --no-timing)
+      set_tests_properties(prefill_fused_iq_test_sm75_kq PROPERTIES
+                           ENVIRONMENT "STRATA_PF_FUSED_SM75_KQ=1;STRATA_MMQ_KQ=1" SKIP_RETURN_CODE 77 TIMEOUT 600)
       # the opt-in STRATA_PF_FUSED_NT=256 kernels (256 threads, two blocks a multiprocessor, two-pass weight loads) against the
       # same references; the batches of the test reach them through the Batch overload of experts_native (77 below sm_80)
       add_test(NAME prefill_fused_iq_test_nt256 COMMAND prefill_fused_iq_test)

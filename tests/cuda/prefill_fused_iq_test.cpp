@@ -661,13 +661,21 @@ int main(int argc, char** argv) {
 #endif
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
-        // gfx12: only the native kernels exist (fused::available() is the Q2_0 pack's), so they decide there
-        if (!fused::available() && !fused::native_supported(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL)) {
-            std::printf("the fused kernels need sm_80 or newer (or gfx11 / gfx12 matrix cores): skipped\n");
+        const char* kq = std::getenv("STRATA_PF_FUSED_SM75_KQ");
+        const bool sm75_kq = kq != nullptr && kq[0] == '1';
+        if (sm75_kq) {
+            int major = 0, minor = 0;
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0);
+            if (major != 7 || minor != 5) { std::printf("the Turing K-quant test needs sm_75: skipped\n"); return 77; }
+        }
+        // gfx12: only the native kernels exist (fused::available() is the Q2_0 pack's), so they decide there.
+        if (!sm75_kq && !fused::available() && !fused::native_supported(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL)) {
+            std::printf("this fused kernel test needs sm_80 or newer (or gfx11 / gfx12 matrix cores): skipped\n");
             return 77;
         }
         // with STRATA_PF_FUSED unset nothing is set up below sm_80 (Turing's pair is STRATA_PF_FUSED=1 STRATA_PF_FUSED_SM75=1's)
-        if (unset_pf) {
+        if (unset_pf && !sm75_kq) {
             int major = 0;
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
             if (strata::cc_major_of(major) < 8) { std::printf("STRATA_PF_FUSED unset: nothing is set up below sm_80 (skipped)\n"); return 77; }
@@ -689,7 +697,7 @@ int main(int argc, char** argv) {
             {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S / Q2_0"},       {GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, "IQ2_XXS / Q2_0"},
             {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, "IQ2_XS / IQ4_NL"}, {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, "IQ3_XXS / IQ4_NL"},
             {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, "IQ3_S / IQ4_NL"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0, "IQ4_XS / Q2_0"},
-            // (HIP only) UD-Q4_K_XL's: 47 layers Q4_K / Q5_1, 4 Q4_K / Q8_0, and the one Q5_K layer
+            // K-quant pairs: HIP, and the two Q5_K gate/up pairs on Turing with STRATA_PF_FUSED_SM75_KQ=1
             {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, "Q4_K / Q5_1"},         {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, "Q4_K / Q8_0"},
             {GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, "Q5_K / Q5_1"},         {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, "Q5_K / Q8_0"},
             // the Coder IQ1_M pack's other pairs (appended: the default timing set takes pairs 0, 1, 4, 3 by index)
