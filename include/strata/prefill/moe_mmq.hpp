@@ -53,6 +53,14 @@ void scale_down_rows(float* d, int64_t ld, const int32_t* bounds, int n, const f
 void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int ggml_type, int64_t cols,
                       int64_t ld, int64_t tokens, int k_used, void* stream);
 
+/// Scratch bytes for CUDA grouping of `rows` routed token/expert pairs (512 experts), or 0 if unsupported.
+size_t resident_route_workspace(int rows);
+/// Write the MMQ slot/src tables on the device in (row count, expert ID) order, keeping token/rank order within
+/// each expert. Download the 512 expert counts into pinned host memory for MMQ launch planning and wait for stream
+/// completion. Scratch must be a device allocation of at least resident_route_workspace(rows) bytes.
+bool resident_route(void* scratch, const int32_t* ids, int rows, int topk, int32_t* slot, int32_t* src,
+                    int32_t* counts_host, void* stream);
+
 constexpr int kGatherGroupMax = 16;
 /// STRATA_MMQ_DIRECT: each expert's own weight address (gate|up or down), in place of `w + z * expert_bytes` -
 /// expert z < n <= kGatherGroupMax starts at p[z].  The launch (tiles, stream-k split, fixup) is the same as

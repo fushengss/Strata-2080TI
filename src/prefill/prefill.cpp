@@ -118,6 +118,8 @@ size_t q8_bytes(int64_t, int64_t) { return 0; }
 void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*, float*) {}
 bool fp4_activations(int) { return false; }
 void quantize_scatter(const float*, const int32_t*, const int32_t*, void*, int, int64_t, int64_t, int64_t, int, void*) {}
+size_t resident_route_workspace(int) { return 0; }
+bool resident_route(void*, const int32_t*, int, int, int32_t*, int32_t*, int32_t*, void*) { return false; }
 Context::Context() {}
 Context::~Context() {}
 void Context::run(const Product&, void*) {}
@@ -1133,6 +1135,10 @@ struct Prefill::Impl {
     float *logits = nullptr, *w = nullptr, *GU = nullptr, *Dm = nullptr, *sgate = nullptr, *sup = nullptr,
           *shared = nullptr, *sg = nullptr;
     int32_t *ids = nullptr, *slot_dev = nullptr, *src_dev = nullptr;
+    void* resident_route_scratch = nullptr;
+    size_t resident_route_bytes = 0;
+    int32_t* resident_route_counts = nullptr;
+    bool resident_route_logged = false;
     uint16_t *Xs = nullptr, *Hh = nullptr, *sh_h = nullptr;
     float* Xr = nullptr;   // APR: Hadamard-rotated copy of `mixed` for the MMQ path
     // step 2b (MMQ): the activations quantized per layer, H in FP32 and its group's quantized rows, the identity
@@ -1392,6 +1398,7 @@ void Prefill::release() {
     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
+    if (impl_->resident_route_counts) cudaFreeHost(impl_->resident_route_counts);
     if (impl_->lm.dev) cudaFree(impl_->lm.dev);
     if (impl_->concurrent_ple_scratch) {
         cudaFree(impl_->concurrent_ple_scratch);
@@ -1959,6 +1966,21 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
               std::to_string(o.used >> 20) + " MiB taken, the failing buffer wanted " +
               std::to_string(o.failed_bytes >> 20) + " MiB)";
         return false;
+    }
+    if (detail::mmq_resident_sort_flag(std::getenv("STRATA_MMQ_GPU_ROUTE")) &&
+        detail::mmq_resident_sort_requested() && cache && host_res && g.n_expert == 512 &&
+        T >= (size_t) stream_all_min() && T <= (size_t) INT32_MAX / K && !force_pageable()) {
+        const size_t bytes = mmq::resident_route_workspace((int) (T * K));
+        if (bytes > 0 && cudaMalloc(&m.resident_route_scratch, bytes) == cudaSuccess) {
+            if (cudaHostAlloc((void**) &m.resident_route_counts, 512 * sizeof(int32_t), cudaHostAllocDefault) == cudaSuccess) {
+                m.resident_route_bytes = bytes;
+                m.owned.push_back(m.resident_route_scratch);
+            } else {
+                cudaFree(m.resident_route_scratch);
+                m.resident_route_scratch = nullptr;
+            }
+        }
+        (void) cudaGetLastError();
     }
     { int wd = 0; if (cudaGetDevice(&wd) == cudaSuccess) warm_gemm_libraries(wd); else (void) cudaGetLastError(); }
     return true;
@@ -3621,6 +3643,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        const size_t route_bytes = m.resident_route_scratch && stream_all && lay0.native && !m.pp && !on_routes
+            ? mmq::resident_route_workspace((int) (T * K)) : 0;
+        const bool route_gpu = route_bytes > 0 && route_bytes <= m.resident_route_bytes;
         // the CPU share: this chunk takes the pool if no other stage of a layer split has it now (released at the end
         // of the chunk, after the last layer's CPU thread is joined)
         struct PoolHold {
@@ -4707,14 +4732,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     } else {
                         // group the (token, k) pairs by expert on the host
                         pt.mark(kPfHostGroup, cs);
+                        static const char* dump_moe = std::getenv("STRATA_DUMP_MOE_INPUT");
+                        const bool gpu_grouped = route_gpu && !dump_moe && no_peer &&
+                            detail::mmq_resident_sort_eligible(true, use_mmq, lay.native, m.cache != nullptr,
+                                m.host_res ? m.host_res + (size_t) l * m.g->n_expert : nullptr,
+                                m.g->n_expert, stream_all, seq_start[(size_t) l] == seq_start[(size_t) l + 1]);
                         // (the sync below also orders this layer's writes of slot/src/bounds after the previous
                         // layer's kernels that read them)
                         const bool grp_mapped = m.grp_host != nullptr;
                         int32_t* ids_h = grp_mapped ? m.grp_host : m.ids_host.data();
                         int32_t* slot_h = grp_mapped ? m.grp_host + m.grp_tk : m.slot_host.data();
                         int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
-                        if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
-                        else if (m.up_ring.d2h_sync(m.ids_host.data(), m.ids, (size_t) T * K * 4, m.cs) != cudaSuccess) {
+                        if (!gpu_grouped && grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
+                        else if (!gpu_grouped && m.up_ring.d2h_sync(m.ids_host.data(), m.ids, (size_t) T * K * 4, m.cs) != cudaSuccess) {
                             err = "prefill: the routed ids' download failed";   // #1996
                             return false;
                         }
@@ -4770,7 +4800,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // work), not the host: the watchdog's report says so (only its text changes)
                         core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
                                           l, p0);
-                        cudaStreamSynchronize(m.cs);
+                        if (gpu_grouped) {
+                            if (!mmq::resident_route(m.resident_route_scratch, m.ids, (int) (T * K), (int) K,
+                                                     m.slot_dev, m.src_dev, m.resident_route_counts, m.cs)) {
+                                err = "prefill: GPU resident MMQ routing failed";
+                                return false;
+                            }
+                            std::copy_n(m.resident_route_counts, m.g->n_expert, m.cnt.begin());
+                            if (!m.resident_route_logged) {
+                                std::fprintf(stderr, "strata prefill: CUDA%d resident MMQ routes grouped on GPU, row-count sorted\n", m.device);
+                                m.resident_route_logged = true;
+                            }
+                        } else {
+                            cudaStreamSynchronize(m.cs);
+                        }
                         core::progress_at("reading the prompt (batched): layer", l, p0);
                         if (on_routes) on_routes(l, ids_h, T * K);   // 149-prefetch: the RAM policy's prompt seed
                         if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
@@ -4832,11 +4875,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (!shared_expert()) return false;
                             pt.mark(kPfHostGroup, cs);
                         }
-                        std::fill(m.cnt.begin(), m.cnt.end(), 0);
-                        for (int64_t i = 0; i < T * K; ++i) {
-                            const int32_t e = ids_h[(size_t) i];
-                            if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
-                            ++m.cnt[(size_t) e];
+                        if (!gpu_grouped) {
+                            std::fill(m.cnt.begin(), m.cnt.end(), 0);
+                            for (int64_t i = 0; i < T * K; ++i) {
+                                const int32_t e = ids_h[(size_t) i];
+                                if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
+                                ++m.cnt[(size_t) e];
+                            }
                         }
                         // STRATA_PREFILL_ROUTED_STREAM: this layer's routing to the issuer (it drops the unrouted entries
                         // it has not issued yet; the walk below gives every unrouted entry back without reading it)
@@ -4955,7 +5000,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                         if (!zc.empty()) is_zc.assign((size_t) m.g->n_expert, 0);
-                        {
+                        if (!gpu_grouped) {
                             int32_t r = 0;
                             for (const auto& [s, e] : zc) {
                                 is_zc[(size_t) e] = 1;
@@ -4978,13 +5023,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (on_cpu[(size_t) e]) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
                             m.off[(size_t) m.g->n_expert] = r;
                             rows_local -= rows_cpu;
-                        }
-                        std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
-                        for (int64_t i = 0; i < T * K; ++i) {
-                            const int32_t e = ids_h[(size_t) i];
-                            const int32_t p = fill[(size_t) e]++;
-                            slot_h[(size_t) i] = p;
-                            src_h[(size_t) p] = (int32_t) (i / K);
+                            std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
+                            for (int64_t i = 0; i < T * K; ++i) {
+                                const int32_t e = ids_h[(size_t) i];
+                                const int32_t p = fill[(size_t) e]++;
+                                slot_h[(size_t) i] = p;
+                                src_h[(size_t) p] = (int32_t) (i / K);
+                            }
                         }
                         // the experts, in id order: resident ones from VRAM, the others through the staging ring
                         std::vector<int32_t> order, order_peer;
@@ -5004,15 +5049,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const bool sort_all = detail::mmq_resident_sort_requested();
                         const bool sort_full = !sort_all && use_mmq && mmq_plan().group_sort[(size_t) l] &&
                                                order.size() >= (size_t) MMQ_GROUP;
-                        if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty(), use_mmq, lay.native,
+                        if (gpu_grouped) {
+                            detail::mmq_resident_sort_experts(m.cnt, m.off, order, order.size());
+                        } else if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty(), use_mmq, lay.native,
                                 m.cache != nullptr, m.host_res ? m.host_res + (size_t) l * m.g->n_expert : nullptr,
                                 m.g->n_expert, stream_all, !stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]))
                             detail::mmq_resident_sort_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order, slot_h, src_h,
                                                            detail::mmq_resident_sort_span(order.size(), MMQ_GROUP, sort_full));
-                        if (grp_mapped) {
+                        if (!gpu_grouped && grp_mapped) {
                             copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
                             copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
-                        } else {
+                        } else if (!gpu_grouped) {
                             if (m.up_ring.h2d(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, m.cs) != cudaSuccess ||   // #1996
                                 m.up_ring.h2d(m.src_dev, m.src_host.data(), (size_t) T * K * 4, m.cs) != cudaSuccess) {
                                 err = "prefill: the routing tables' upload failed";
@@ -5021,7 +5068,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         // Diagnostics: STRATA_DUMP_MOE_INPUT=path, STRATA_DUMP_MOE_LAYER=l - the first chunk's MoE input
                         // of layer l ({T, N, K} int64, T x N floats, T x K expert ids) for testing products on real rows
-                        static const char* dump_moe = std::getenv("STRATA_DUMP_MOE_INPUT");
                         static bool dumped_moe = false;
                         if (dump_moe && !dumped_moe && l == std::atoi(std::getenv("STRATA_DUMP_MOE_LAYER") ? std::getenv("STRATA_DUMP_MOE_LAYER") : "0")) {
                             dumped_moe = true;

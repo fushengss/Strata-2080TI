@@ -12,10 +12,17 @@
 
 #include "strata/prefill/mmq_kq_abi.hpp"
 
+#if !defined(__HIPCC__)
+#include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
+#include <cub/device/device_radix_sort.cuh>
+#endif
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 
 namespace strata::prefill::mmq {
 namespace {
@@ -62,6 +69,96 @@ void ck(cudaError_t e, const char* what) {
 }
 
 int64_t pad512(int64_t n) { return (n + 511) / 512 * 512; }
+
+#if !defined(__HIPCC__)
+constexpr int kRouteExpertBits = 9;
+constexpr int kRouteExperts = 1 << kRouteExpertBits;
+constexpr int kRouteRowBits = 22;   // one sentinel expert beyond the 512 valid IDs
+constexpr uint32_t kRouteRowMask = (1u << kRouteRowBits) - 1;
+constexpr int kRouteThreads = 128;
+constexpr int kRouteKeysPerThread = kRouteExperts / kRouteThreads;
+
+size_t route_radix_offset(int rows) {
+    const size_t bytes = (2 * static_cast<size_t>(rows) + 2 * kRouteExperts) * sizeof(uint32_t);
+    return (bytes + 255) / 256 * 256;
+}
+
+size_t route_radix_bytes(int rows, cudaStream_t stream) {
+    size_t bytes = 0;
+    const uint32_t* in = nullptr;
+    uint32_t* out = nullptr;
+    const auto status = cub::DeviceRadixSort::SortKeys(nullptr, bytes, in, out, rows, kRouteRowBits, 32, stream);
+    return status == cudaSuccess ? bytes : 0;
+}
+
+__global__ void pack_route_rows(const int32_t* ids, uint32_t* keys, int rows) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows) return;
+    const uint32_t id = static_cast<uint32_t>(ids[i]);
+    const uint32_t expert = id < kRouteExperts ? id : kRouteExperts;
+    keys[i] = (expert << kRouteRowBits) | static_cast<uint32_t>(i);
+}
+
+__device__ int route_first_row(const uint32_t* keys, int rows, int expert) {
+    const uint32_t key = static_cast<uint32_t>(expert) << kRouteRowBits;
+    int lo = 0, hi = rows;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (keys[mid] < key) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+// The first radix pass groups rows by expert and preserves their input order. Sort the small expert table
+// separately by (count, ID), and compute how far each expert's contiguous run moves in the reordered rows.
+__global__ void sort_route_experts(const uint32_t* keys, int rows, int32_t* counts, int32_t* shift) {
+    using Sort = cub::BlockRadixSort<uint32_t, kRouteThreads, kRouteKeysPerThread>;
+    using Scan = cub::BlockScan<int32_t, kRouteThreads>;
+    __shared__ union {
+        Sort::TempStorage sort;
+        Scan::TempStorage scan;
+    } storage;
+    __shared__ int starts[kRouteExperts + 1];
+    for (int e = threadIdx.x; e <= kRouteExperts; e += kRouteThreads)
+        starts[e] = route_first_row(keys, rows, e);
+    __syncthreads();
+
+    uint32_t pairs[kRouteKeysPerThread];
+#pragma unroll
+    for (int i = 0; i < kRouteKeysPerThread; ++i) {
+        const int e = threadIdx.x * kRouteKeysPerThread + i;
+        const int count = starts[e + 1] - starts[e];
+        counts[e] = count;
+        pairs[i] = (static_cast<uint32_t>(count) << kRouteExpertBits) | static_cast<uint32_t>(e);
+    }
+    Sort(storage.sort).Sort(pairs);
+    __syncthreads();
+
+    int32_t sizes[kRouteKeysPerThread], offsets[kRouteKeysPerThread];
+#pragma unroll
+    for (int i = 0; i < kRouteKeysPerThread; ++i) sizes[i] = pairs[i] >> kRouteExpertBits;
+    Scan(storage.scan).ExclusiveSum(sizes, offsets);
+#pragma unroll
+    for (int i = 0; i < kRouteKeysPerThread; ++i) {
+        const int e = pairs[i] & (kRouteExperts - 1);
+        shift[e] = offsets[i] - starts[e];
+    }
+}
+
+__global__ void write_route_tables(const uint32_t* keys, int rows, int topk, const int32_t* shift,
+                                   int32_t* slot, int32_t* src) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows) return;
+    const uint32_t key = keys[i];
+    const int expert = key >> kRouteRowBits;
+    if (expert >= kRouteExperts) return;
+    const int pair = key & kRouteRowMask;
+    const int out = i + shift[expert];
+    slot[pair] = out;
+    src[out] = pair / topk;
+}
+#endif
 
 // ... plus, in the same launch, the expert's 16-byte NVFP4 tail (tail -> tail_dst) and the zeroed MMQ tails after
 // the group's last slot (nz uint4 after ab_dst's and c_dst's copies): one launch per expert instead of a kernel,
@@ -303,6 +400,48 @@ void quantize_nvfp4_w4a4(const float* x, const int32_t* ids, void* xq, float* ys
                          int64_t ld, int64_t rows, int64_t padded, cudaStream_t s);
 
 bool built() { return true; }
+
+size_t resident_route_workspace(int rows) {
+#if defined(__HIPCC__)
+    (void) rows;
+    return 0;
+#else
+    if (rows <= 0 || static_cast<uint32_t>(rows) > kRouteRowMask) return 0;
+    const size_t radix = route_radix_bytes(rows, nullptr);
+    return radix ? route_radix_offset(rows) + radix : 0;
+#endif
+}
+
+bool resident_route(void* scratch, const int32_t* ids, int rows, int topk, int32_t* slot, int32_t* src,
+                    int32_t* counts_host, void* stream) {
+#if defined(__HIPCC__)
+    (void) scratch; (void) ids; (void) rows; (void) topk; (void) slot; (void) src; (void) counts_host; (void) stream;
+    return false;
+#else
+    if (!scratch || !ids || !slot || !src || !counts_host || rows <= 0 || static_cast<uint32_t>(rows) > kRouteRowMask ||
+        topk <= 0 || rows % topk != 0) return false;
+    const auto cs = static_cast<cudaStream_t>(stream);
+    size_t radix_bytes = route_radix_bytes(rows, cs);
+    if (!radix_bytes) return false;
+    auto* keys = static_cast<uint32_t*>(scratch);
+    auto* sorted = keys + rows;
+    auto* counts = reinterpret_cast<int32_t*>(sorted + rows);
+    auto* shift = counts + kRouteExperts;
+    auto* radix = static_cast<uint8_t*>(scratch) + route_radix_offset(rows);
+    constexpr int threads = 256;
+    const int blocks = (rows + threads - 1) / threads;
+    pack_route_rows<<<blocks, threads, 0, cs>>>(ids, keys, rows);
+    if (cudaGetLastError() != cudaSuccess ||
+        cub::DeviceRadixSort::SortKeys(radix, radix_bytes, keys, sorted, rows, kRouteRowBits, 32, cs) != cudaSuccess)
+        return false;
+    sort_route_experts<<<1, kRouteThreads, 0, cs>>>(sorted, rows, counts, shift);
+    write_route_tables<<<blocks, threads, 0, cs>>>(sorted, rows, topk, shift, slot, src);
+    if (cudaGetLastError() != cudaSuccess ||
+        cudaMemcpyAsync(counts_host, counts, kRouteExperts * sizeof(int32_t), cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+        cudaStreamSynchronize(cs) != cudaSuccess) return false;
+    return std::accumulate(counts_host, counts_host + kRouteExperts, 0) == rows;
+#endif
+}
 
 Nvfp4Mode nvfp4_mode() {
     static const Nvfp4Mode m = [] {

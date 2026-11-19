@@ -48,15 +48,10 @@ inline bool mmq_resident_sort_eligible(bool requested, bool use_mmq, bool native
     return true;
 }
 
-// Preconditions are established by the existing caller: IDs were range-checked and counted;
-// order contains each positive-count expert once in ID order; off has count.size()+1 entries;
-// routes fits its original int32 offsets, and slot/src each have routes writable entries.
 // After sorting, off[e] is an expert-indexed START, not an ID-prefix end at off[e+1].
 // Only order[0, span) is sorted (span >= order.size(): all of it); the entries after it keep their positions.
-inline void mmq_resident_sort_rows(const int32_t* ids, int64_t routes, int32_t k,
-                                   const std::vector<int32_t>& count, std::vector<int32_t>& off,
-                                   std::vector<int32_t>& order, int32_t* slot, int32_t* src,
-                                   size_t span = SIZE_MAX) {
+inline void mmq_resident_sort_experts(const std::vector<int32_t>& count, std::vector<int32_t>& off,
+                                      std::vector<int32_t>& order, size_t span) {
     std::stable_sort(order.begin(), order.begin() + (ptrdiff_t) std::min(span, order.size()), [&](int32_t a, int32_t b) {
         return count[(size_t) a] != count[(size_t) b]
             ? count[(size_t) a] < count[(size_t) b] : a < b;
@@ -68,6 +63,15 @@ inline void mmq_resident_sort_rows(const int32_t* ids, int64_t routes, int32_t k
         cursor += count[(size_t) e];
     }
     off.back() = cursor;
+}
+
+// IDs were range-checked and counted, order contains every positive-count expert once in ID order,
+// off has count.size()+1 entries, and slot/src each have routes writable entries.
+inline void mmq_resident_sort_rows(const int32_t* ids, int64_t routes, int32_t k,
+                                  const std::vector<int32_t>& count, std::vector<int32_t>& off,
+                                  std::vector<int32_t>& order, int32_t* slot, int32_t* src,
+                                  size_t span = SIZE_MAX) {
+    mmq_resident_sort_experts(count, off, order, span);
     std::vector<int32_t> fill(off.begin(), off.end() - 1);
     // Preserve token-major/rank-major traversal, hence the original within-expert row order.
     for (int64_t i = 0; i < routes; ++i) {
