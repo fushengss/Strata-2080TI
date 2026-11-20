@@ -1,0 +1,190 @@
+Unapplied candidate: skip redundant zero-fill in synchronous KV capture
+2026-11-08; base bf5a8e5b24b1973efbae747a109f5a970b25e09d
+Patch: /Users/fu/project/HAI/Strata/bench/results/2026-11-08-prefill-interleave/park-overwrite-candidate.patch
+SHA256: 3bd93d01522dbefea675362fb8a4963d282c6389ff8f9e606588f1c5085b1032
+Engine worktree remains unmodified. No remote commands or GPU work performed.
+
+Why this comes before background park
+====================================
+Current source synchronously clears newly allocated snapshot KV bytes, then
+immediately overwrites them. This candidate removes only that redundant write.
+It does not alter source synchronization, streams, lifetime, cache publication,
+retained-prefix accounting, prefill layout, or scheduler execution.
+Independent STRATA_PARK_OVERWRITE=1 enables it; absent/0 retains the old behavior.
+Default-off is for a controlled same-binary comparison. Safety does not rely on
+the environment variable; performance does need measurement before selection.
+
+Exact evidence in /Users/fu/project/HAI/Strata-decode-head:
+- include/strata/core/conversation_buffer.hpp:65 passes an explicit zero to
+  resize_impl; :75/:84 initialize added bytes. resize_for_overwrite at :100-102
+  uses an existing default-init allocator and leaves added bytes untouched.
+- src/core/conversation_snapshot.cpp:318-320 computes keep and checks that it
+  does not exceed OLD buffer size. At :342 and :361 the synchronous path resizes;
+  at :343-345/:363-365 it transfers the entire interval [keep, new_size).
+- Because keep <= old_size and keep <= new_size, every newly added byte is in
+  the transfer interval. Shrink introduces no added bytes. Same-size capture
+  introduces no added bytes. Kept pages remain unchanged; the moving partial
+  page and indexer's spare row are still recopied as before.
+- src/core/conversation_state.cpp:532 retains its device-wide source sync;
+  :533 creates a LOCAL captured image; only :618 assigns it to the caller.
+  Partial-copy/null-source/bad_alloc failures do not execute that assignment.
+
+Failure details
+===============
+A failed direct conversation_kv_save may leave its supplied temporary KV object
+partially mutated, just as before; callers must already honor false. It must
+not be reinterpreted as a successful image. The engine's snapshot save owns that
+temporary and discards it on any false/exception. No uninitialized tail is
+published by conversation_snapshot_save or inserted into ConversationCache.
+Retained storage moved into the local capture can be discarded on failure;
+this is existing behavior, not a new preservation promise for consumed reuse.
+
+transfer returns true for n==0 before checking source, which is correct: no new
+bytes exist there. For n>0 it rejects null source/destination before memcpy.
+The overwrite candidate retains that validation. The added host fixture makes
+the draft key source null after successful main-layer copies, and checks that
+the caller's existing output object remains unchanged.
+
+Files and observability
+=======================
+src/core/conversation_snapshot.cpp: one default-off flag/helper, two resize sites,
+and an added trace counter. Existing async staging already uses overwrite resize
+and keeps its prior behavior. The fallback of a VRAM slot also uses the helper
+because that path is synchronous and has the same [keep,size) contract.
+src/core/conversation_state.cpp: forwards the new trace counter and prints
+overwrite_added_bytes in the existing STRATA_PARK_TRACE line.
+src/core/conversation_validation_test.cpp: focused host-backend tests below.
+CMakeLists.txt: on-flag variants of existing snapshot and host transfer tests.
+
+Scope detail: the helper is in conversation_kv_save, so direct temporary saves
+also use it, not just conversation cache parking. This includes main/slot MTP
+KV transfers in generate.cpp:14355/14414 even when SLOT_COPY_DIRECT is enabled.
+These callers check false before restoring the temporary image. Qualification
+must include admission, cancellation and slot reuse; a performance difference
+cannot automatically be attributed only to the park interval.
+
+overwrite_added_bytes is bytes whose redundant zero fill was skipped, not bytes
+saved from the required snapshot copy, not GPU bytes, and not time saved. It is
+zero when disabled or no new bytes were needed. Like the existing KV trace at
+conversation_state.cpp:591, it covers that stage's main layers only: the draft
+KV save at :598 happens afterward. On a fresh main-layer capture the on counter
+must be positive; off must be zero. Do not sum duplicate trace interpretations.
+
+Validation prepared / actually performed
+========================================
+PASS: git apply --check against clean bf5 source.
+PASS: three copied candidate .cpp files pass local Clang C++20 syntax checking
+using the project's Metal compatibility headers. For the host-transfer test,
+the shim lacks cudaErrorInvalidValue/cudaErrorUnknown, so compile-only aliases
+were supplied. This is not a CUDA build or a runtime parity test.
+Source hash manifest: park-overwrite-candidate.json.
+Reproducible patch generator: prepare-park-overwrite-patch.py.
+Copied review sources: park-overwrite-review-src/ (outside the frozen tree).
+
+Linux host gates to run after applying in a separate review/build checkout:
+  cmake --build <build> --target conversation_transfer_test conversation_validation_test
+  ctest --test-dir <build> -R '^conversation_(validation_test|transfer_test(_overwrite)?)$' --output-on-failure
+The transfer test wraps CUDA APIs with a host memcpy backend and has
+CUDA_VISIBLE_DEVICES=-1; it does not need a GPU. Both baseline and overwrite
+must run in fresh processes because the flag is read once.
+
+The expanded transfer fixture verifies:
+- Existing full/incremental capture and exact reused-byte accounting.
+- Fresh capture vs retained prefix for 1,5,9,17,65 tokens, covering shrink,
+  same extent, growth, partial pages and indexer spare rows; every KV payload
+  compared, across F16/int8/Q4 and 256/512-expert/PLE/zero-main-QSA fixtures.
+- Failure at EVERY transfer position of a fresh capture, including after some
+  KV parts have been written. Caller output is a sentinel that must stay intact.
+- Missing draft source after local allocations must not publish any snapshot.
+The old sole failure test failed the first transfer (running checkpoint state),
+so it did not establish the critical new-KV-tail failure behavior by itself.
+
+GPU gate, separate from performance:
+  ctest --test-dir <build> -R '^conversation_snapshot_test(_overwrite)?$' --output-on-failure
+Existing GPU suite covers F16/int8/Q4 and supported hybrid layouts, resident/
+stream/ring modes, page boundaries, main/draft state, growth/rewind, restore and
+session-file byte equality. Then complete real-engine cache restore/reuse,
+cancel, BYIELD and long-context exact output/state gates. No GPU test run here.
+
+Diagnostic and selection plan
+=============================
+First use current frozen v3 with STRATA_PARK_TRACE on for a separate diagnostic
+reproduction of a long park. Do not use that run as the throughput comparison.
+Capture the sequential eight stage lines and whole park time. Compare the sum
+of KV resize, required KV copy, checkpoint copy, live state, joins and sync.
+Residual time includes the later-stage OUTER sync, last-stage draft KV, host
+metadata/allocations and publication; current trace does not separately time all
+those. It would be wrong to call all residual time repeated device sync.
+
+Only after diagnostic evidence should root build this independent candidate.
+Same binary/flags except OVERWRITE 0/1; verify counter=0 vs >0 on cold capture.
+Keep selected interleave/P1/P2, prefill split/chunk and clocks fixed. Measure
+whole park duration, peer gaps, admission TTFT and complete-run output rate,
+then cold/warm 100k prefill controls. Removing zero-fill can move page faults
+from resize into copy, so resize alone getting faster is not sufficient.
+No measured speedup or prefill-regression conclusion exists for this patch.
+
+Subsequent diagnostic supplied by root (not independently timed here): a
+59,939-token park took 1180.6 ms; eight-stage KV resize summed about 536.9 ms,
+KV copy 123.7 ms, checkpoint copies 369 ms, live states 97 ms. This supports
+testing this bounded candidate but does NOT imply 536.9 ms will disappear.
+First-touch faults may move to the required copy. Keep the complete interval
+comparison and separate cache/slot-copy attribution.
+
+Checkpoint-copy review: conversation_copy.hpp:168-175 allocates with reserve
+then inserts source bytes in slices; :200-207 reuses capacity with clear/reserve
+then insert. There is no explicit resize-zero followed by a second overwrite in
+these copy helpers. Live checkpoint state at conversation_state.cpp:301-302
+does use ordinary vector resize followed by D2H, but removing its initialization
+needs a different storage contract or pool. That is outside this first patch.
+
+Comparison with other snapshot optimizations
+===========================================
+1. Removing the redundant OUTER per-stage cudaDeviceSynchronize at
+   generate.cpp:12344 is another small possible patch: snapshot_save itself
+   synchronizes the same device at conversation_state.cpp:532 before copying.
+   Between them the caller only constructs view/part and the callee validates
+   host metadata. Keep this separate from the overwrite candidate. An already
+   idle device's second sync may be cheap; it cannot explain 1.34 s without data.
+
+2. Do not globally replace snapshot sync with an existing event. Independent
+   readiness review is in park-producer-readiness-independent-review.txt.
+   Prefill normal tail waits its streams, but early cancellation differs;
+   verifier ev_commit covers its own commit, and owner MTP has other producers.
+   None alone proves all main GDN/PLE/indexer/host KV and owner-draft sources
+   ready. A worker overlap API needs an explicit all-source readiness contract
+   plus immutability until copy completion; that remains a larger change.
+
+3. Host-authoritative KV is not automatically a CPU pointer. layer.cpp:924-934
+   gets host allocation h and device alias d, then builds st.host.* from d.
+   A direct std::memcpy from those fields is not justified by their names.
+   CPU copying needs a validated CPU alias and offset, or an explicit host-base
+   field retained at initialization. It must still wait for GPU mirror writes.
+   This could avoid CUDA transfer-call overhead for host-to-host parts, but
+   idx_pooled/live state still require device copies. No copy speed assumed.
+
+4. Whole-snapshot pinning adds locked RAM and allocation cost while much KV is
+   already host-to-host. It is not the first option. A bounded reusable pinned
+   D2H slab may help if trace identifies device state copy as dominant, but adds
+   another memcpy, persistent ownership and RAM-accounting requirements.
+   Existing PARK_ASYNC's stage/buffers and CKPT_ASYNC/GATHER are global; merely
+   enabling them does not create eight independent safe capture contexts.
+
+5. Preallocated pageable buffers can move first-touch off the admission path,
+   but consume memory while idle and must count against the cache budget/RAM
+   floor. Current ready checkpoint pool explicitly excludes a layer split at
+   generate.cpp:12154-12157. ConversationBuffer already retains stable payload
+   addresses and limited geometric spare capacity; reuse already avoids copying
+   full unchanged pages. This is not a new unused opportunity on every turn.
+
+6. Moving outgoing checkpoints instead of duplicating them could remove real
+   host bytes if trace shows checkpoint copies dominate. Current park_drops is
+   limited to n_st==0 at generate.cpp:12325-12333; PP8 checkpoints are split and
+   restored by MergeBack at 12209-12214. Extending moves needs a transaction that
+   preserves main checks on allocation/copy failure and when the incoming path
+   borrows/falls back/cancels. It is more invasive than overwrite resize.
+
+If these bounded changes leave visible stalls, the previously documented single
+worker + pump design remains the next continuity candidate. Neither lower park
+cost nor interleaving promises full GPU occupancy: host memory/PCIe work and
+PP8 with a limited number of independent sequences still constrain useful work.

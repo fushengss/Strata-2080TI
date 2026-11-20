@@ -1,0 +1,2145 @@
+{
+  "version": "nsys-schema-numeric-1",
+  "bytes": 484917248,
+  "read_only": true,
+  "content_strings_exported": false,
+  "tables": [
+    {
+      "name": "ANALYSIS_DETAILS",
+      "columns": [
+        {
+          "name": "globalVid",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "duration",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "startTime",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "stopTime",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ANALYSIS_DETAILS (\n    -- Details about the analysis session.\n\n    globalVid                   INTEGER   NOT NULL,                    -- Serialized GlobalId.\n    duration                    INTEGER   NOT NULL,                    -- The total time span of the entire trace (ns).\n    startTime                   INTEGER   NOT NULL,                    -- Trace start timestamp in nanoseconds.\n    stopTime                    INTEGER   NOT NULL                     -- Trace stop timestamp in nanoseconds.\n)"
+    },
+    {
+      "name": "ANALYSIS_FILE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "filename",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "contentId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "globalPid",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ANALYSIS_FILE (\n    -- Analysis file content\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- ID reference value.\n    filename                    TEXT,                                  -- File path\n    contentId                   INTEGER,                               -- REFERENCES StringIds(id) -- File content\n    globalPid                   INTEGER   NOT NULL                     -- Serialized GlobalId.\n)"
+    },
+    {
+      "name": "CUDA_GRAPH_NODE_EVENTS",
+      "columns": [
+        {
+          "name": "start",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "end",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "eventClass",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "globalTid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "nameId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "graphNodeId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "originalGraphNodeId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE CUDA_GRAPH_NODE_EVENTS (\n    start                       INTEGER   NOT NULL,                    -- Event start timestamp (ns).\n    end                         INTEGER   NOT NULL,                    -- Event end timestamp (ns).\n    eventClass                  INTEGER   NOT NULL,                    -- REFERENCES ENUM_NSYS_EVENT_CLASS(id)\n    globalTid                   INTEGER,                               -- Serialized GlobalId.\n    nameId                      INTEGER   NOT NULL,                    -- REFERENCES StringIds(id) -- Function name\n    graphNodeId                 INTEGER   NOT NULL,                    -- Graph node ID.\n    originalGraphNodeId         INTEGER                                -- Reference to the original graph node ID, if cloned node.\n)",
+      "rows": 165338,
+      "start_numeric_range": [
+        1794074794722298970,
+        1794074803401391228
+      ],
+      "end_numeric_range": [
+        1794074794722298970,
+        1794074803401391228
+      ]
+    },
+    {
+      "name": "CUPTI_ACTIVITY_KIND_CUDA_EVENT",
+      "columns": [
+        {
+          "name": "deviceId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "contextId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "greenContextId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "streamId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "correlationId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "globalPid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "eventId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "eventSyncId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE CUPTI_ACTIVITY_KIND_CUDA_EVENT (\n    deviceId                    INTEGER   NOT NULL,                    -- Device ID.\n    contextId                   INTEGER   NOT NULL,                    -- Context ID.\n    greenContextId              INTEGER,                               -- Green context ID.\n    streamId                    INTEGER   NOT NULL,                    -- Stream ID.\n    correlationId               INTEGER,                               -- Correlation ID of the event record API to which this result is associated.\n    globalPid                   INTEGER,                               -- Serialized GlobalId.\n    eventId                     INTEGER   NOT NULL,                    -- Event ID for which the event record API is called.\n    eventSyncId                 INTEGER                                -- CUDA Event Sync ID to link event record API to related synchronization APIs.\n)",
+      "rows": 22125
+    },
+    {
+      "name": "CUPTI_ACTIVITY_KIND_KERNEL",
+      "columns": [
+        {
+          "name": "start",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "end",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "deviceId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "contextId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "greenContextId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "streamId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "correlationId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "globalPid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "demangledName",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "shortName",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "mangledName",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "launchType",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "cacheConfig",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "registersPerThread",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "gridX",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "gridY",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "gridZ",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "blockX",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "blockY",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "blockZ",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "staticSharedMemory",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "dynamicSharedMemory",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "localMemoryPerThread",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "localMemoryTotal",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "gridId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "sharedMemoryExecuted",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "graphNodeId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "sharedMemoryLimitConfig",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (\n    start                       INTEGER   NOT NULL,                    -- Event start timestamp (ns).\n    end                         INTEGER   NOT NULL,                    -- Event end timestamp (ns).\n    deviceId                    INTEGER   NOT NULL,                    -- Device ID.\n    contextId                   INTEGER   NOT NULL,                    -- Context ID.\n    greenContextId              INTEGER,                               -- Green context ID.\n    streamId                    INTEGER   NOT NULL,                    -- Stream ID.\n    correlationId               INTEGER,                               -- REFERENCES CUPTI_ACTIVITY_KIND_RUNTIME(correlationId)\n    globalPid                   INTEGER,                               -- Serialized GlobalId.\n    demangledName               INTEGER   NOT NULL,                    -- REFERENCES StringIds(id) -- Kernel function name w/ templates\n    shortName                   INTEGER   NOT NULL,                    -- REFERENCES StringIds(id) -- Base kernel function name\n    mangledName                 INTEGER,                               -- REFERENCES StringIds(id) -- Raw C++ mangled kernel function name\n    launchType                  INTEGER,                               -- REFERENCES ENUM_CUDA_KERNEL_LAUNCH_TYPE(id)\n    cacheConfig                 INTEGER,                               -- REFERENCES ENUM_CUDA_FUNC_CACHE_CONFIG(id)\n    registersPerThread          INTEGER   NOT NULL,                    -- Number of registers required for each thread executing the kernel.\n    gridX                       INTEGER   NOT NULL,                    -- X-dimension grid size.\n    gridY                       INTEGER   NOT NULL,                    -- Y-dimension grid size.\n    gridZ                       INTEGER   NOT NULL,                    -- Z-dimension grid size.\n    blockX                      INTEGER   NOT NULL,                    -- X-dimension block size.\n    blockY                      INTEGER   NOT NULL,                    -- Y-dimension block size.\n    blockZ                      INTEGER   NOT NULL,                    -- Z-dimension block size.\n    staticSharedMemory          INTEGER   NOT NULL,                    -- Static shared memory allocated for the kernel (B).\n    dynamicSharedMemory         INTEGER   NOT NULL,                    -- Dynamic shared memory reserved for the kernel (B).\n    localMemoryPerThread        INTEGER   NOT NULL,                    -- Amount of local memory reserved for each thread (B).\n    localMemoryTotal            INTEGER   NOT NULL,                    -- Total amount of local memory reserved for the kernel (B).\n    gridId                      INTEGER   NOT NULL,                    -- Unique grid ID of the kernel assigned at runtime.\n    sharedMemoryExecuted        INTEGER,                               -- Shared memory size set by the driver.\n    graphNodeId                 INTEGER,                               -- REFERENCES CUDA_GRAPH_NODE_EVENTS(graphNodeId)\n    sharedMemoryLimitConfig     INTEGER                                -- REFERENCES ENUM_CUDA_SHARED_MEM_LIMIT_CONFIG(id)\n)",
+      "rows": 4503208,
+      "start_numeric_range": [
+        1794074805038659653,
+        1794074818596137620
+      ],
+      "end_numeric_range": [
+        1794074805038662245,
+        1794074818596205587
+      ]
+    },
+    {
+      "name": "CUPTI_ACTIVITY_KIND_MEMCPY",
+      "columns": [
+        {
+          "name": "start",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "end",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "deviceId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "contextId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "greenContextId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "streamId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "correlationId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "globalPid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "bytes",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "copyKind",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "deprecatedSrcId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "srcKind",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "dstKind",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "srcDeviceId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "srcContextId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "dstDeviceId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "dstContextId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "migrationCause",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "graphNodeId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "virtualAddress",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "copyCount",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (\n    start                       INTEGER   NOT NULL,                    -- Event start timestamp (ns).\n    end                         INTEGER   NOT NULL,                    -- Event end timestamp (ns).\n    deviceId                    INTEGER   NOT NULL,                    -- Device ID.\n    contextId                   INTEGER   NOT NULL,                    -- Context ID.\n    greenContextId              INTEGER,                               -- Green context ID.\n    streamId                    INTEGER   NOT NULL,                    -- Stream ID.\n    correlationId               INTEGER,                               -- REFERENCES CUPTI_ACTIVITY_KIND_RUNTIME(correlationId)\n    globalPid                   INTEGER,                               -- Serialized GlobalId.\n    bytes                       INTEGER   NOT NULL,                    -- Number of bytes transferred (B).\n    copyKind                    INTEGER   NOT NULL,                    -- REFERENCES ENUM_CUDA_MEMCPY_OPER(id)\n    deprecatedSrcId             INTEGER,                               -- Deprecated, use srcDeviceId instead.\n    srcKind                     INTEGER,                               -- REFERENCES ENUM_CUDA_MEM_KIND(id)\n    dstKind                     INTEGER,                               -- REFERENCES ENUM_CUDA_MEM_KIND(id)\n    srcDeviceId                 INTEGER,                               -- Source device ID.\n    srcContextId                INTEGER,                               -- Source context ID.\n    dstDeviceId                 INTEGER,                               -- Destination device ID.\n    dstContextId                INTEGER,                               -- Destination context ID.\n    migrationCause              INTEGER,                               -- REFERENCES ENUM_CUDA_UNIF_MEM_MIGRATION(id)\n    graphNodeId                 INTEGER,                               -- REFERENCES CUDA_GRAPH_NODE_EVENTS(graphNodeId)\n    virtualAddress              INTEGER,                               -- Virtual base address of the page/s being transferred.\n    copyCount                   INTEGER                                -- The total number of memcopy operations traced in this record. In CUDA MemcpyBatchAsync APIs, multiple memcpy operations may be batched together for optimization purposes based on certain heuristics.\n)",
+      "rows": 345707,
+      "start_numeric_range": [
+        1794074805039780409,
+        1794074818595612712
+      ],
+      "end_numeric_range": [
+        1794074805039782361,
+        1794074818595616168
+      ]
+    },
+    {
+      "name": "CUPTI_ACTIVITY_KIND_MEMSET",
+      "columns": [
+        {
+          "name": "start",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "end",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "deviceId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "contextId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "greenContextId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "streamId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "correlationId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "globalPid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "value",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "bytes",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "graphNodeId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "memKind",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE CUPTI_ACTIVITY_KIND_MEMSET (\n    start                       INTEGER   NOT NULL,                    -- Event start timestamp (ns).\n    end                         INTEGER   NOT NULL,                    -- Event end timestamp (ns).\n    deviceId                    INTEGER   NOT NULL,                    -- Device ID.\n    contextId                   INTEGER   NOT NULL,                    -- Context ID.\n    greenContextId              INTEGER,                               -- Green context ID.\n    streamId                    INTEGER   NOT NULL,                    -- Stream ID.\n    correlationId               INTEGER,                               -- REFERENCES CUPTI_ACTIVITY_KIND_RUNTIME(correlationId)\n    globalPid                   INTEGER,                               -- Serialized GlobalId.\n    value                       INTEGER   NOT NULL,                    -- Value assigned to memory.\n    bytes                       INTEGER   NOT NULL,                    -- Number of bytes set (B).\n    graphNodeId                 INTEGER,                               -- REFERENCES CUDA_GRAPH_NODE_EVENTS(graphNodeId)\n    memKind                     INTEGER                                -- REFERENCES ENUM_CUDA_MEM_KIND(id)\n)",
+      "rows": 52514,
+      "start_numeric_range": [
+        1794074805038759955,
+        1794074818595430540
+      ],
+      "end_numeric_range": [
+        1794074805038761235,
+        1794074818595432076
+      ]
+    },
+    {
+      "name": "CUPTI_ACTIVITY_KIND_RUNTIME",
+      "columns": [
+        {
+          "name": "start",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "end",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "eventClass",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "globalTid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "correlationId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "nameId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "returnValue",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "callchainId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (\n    start                       INTEGER   NOT NULL,                    -- Event start timestamp (ns).\n    end                         INTEGER   NOT NULL,                    -- Event end timestamp (ns).\n    eventClass                  INTEGER   NOT NULL,                    -- REFERENCES ENUM_NSYS_EVENT_CLASS(id)\n    globalTid                   INTEGER,                               -- Serialized GlobalId.\n    correlationId               INTEGER,                               -- ID used to identify events that this function call has triggered.\n    nameId                      INTEGER   NOT NULL,                    -- REFERENCES StringIds(id) -- Function name\n    returnValue                 INTEGER   NOT NULL,                    -- Return value of the function call.\n    callchainId                 INTEGER                                -- REFERENCES CUDA_CALLCHAINS(id)\n)",
+      "rows": 156628,
+      "start_numeric_range": [
+        1794074805038527888,
+        1794074818596142663
+      ],
+      "end_numeric_range": [
+        1794074805038530216,
+        1794074818596809304
+      ]
+    },
+    {
+      "name": "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION",
+      "columns": [
+        {
+          "name": "start",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "end",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "deviceId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "contextId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "greenContextId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "streamId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "correlationId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "globalPid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "deprecatedSyncType",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "syncType",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "eventId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "eventSyncId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE CUPTI_ACTIVITY_KIND_SYNCHRONIZATION (\n    start                       INTEGER   NOT NULL,                    -- Event start timestamp (ns).\n    end                         INTEGER   NOT NULL,                    -- Event end timestamp (ns).\n    deviceId                    INTEGER   NOT NULL,                    -- Device ID.\n    contextId                   INTEGER   NOT NULL,                    -- Context ID.\n    greenContextId              INTEGER,                               -- Green context ID.\n    streamId                    INTEGER   NOT NULL,                    -- Stream ID.\n    correlationId               INTEGER,                               -- Correlation ID of the synchronization API to which this result is associated.\n    globalPid                   INTEGER,                               -- Serialized GlobalId.\n    deprecatedSyncType          INTEGER,                               -- Deprecated, use syncType instead. For older report, REFERENCES ENUM_CUPTI_SYNC_TYPE(id)\n    syncType                    INTEGER   NOT NULL,                    -- REFERENCES ENUM_CUPTI_SYNC_TYPE(id)\n    eventId                     INTEGER   NOT NULL,                    -- Event ID for which the synchronization API is called.\n    eventSyncId                 INTEGER                                -- CUDA Event Sync ID to link the synchronization API to associated event record API.\n)",
+      "rows": 121099,
+      "start_numeric_range": [
+        1794074805040541053,
+        1794074818596134419
+      ],
+      "end_numeric_range": [
+        1794074805040543622,
+        1794074818596136079
+      ]
+    },
+    {
+      "name": "DIAGNOSTIC_EVENT",
+      "columns": [
+        {
+          "name": "timestamp",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "timestampType",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "source",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "severity",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "text",
+          "declared_type": "TEXT",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "globalPid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE DIAGNOSTIC_EVENT (\n    timestamp                   INTEGER   NOT NULL,                    -- Event timestamp (ns).\n    timestampType               INTEGER   NOT NULL,                    -- REFERENCES ENUM_DIAGNOSTIC_TIMESTAMP_SOURCE(id)\n    source                      INTEGER   NOT NULL,                    -- REFERENCES ENUM_DIAGNOSTIC_SOURCE_TYPE(id)\n    severity                    INTEGER   NOT NULL,                    -- REFERENCES ENUM_DIAGNOSTIC_SEVERITY_LEVEL(id)\n    text                        TEXT      NOT NULL,                    -- Diagnostic message text\n    globalPid                   INTEGER                                -- Serialized GlobalId.\n)"
+    },
+    {
+      "name": "ENUM_CUDA_DEV_MEM_EVENT_OPER",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_CUDA_DEV_MEM_EVENT_OPER (\n    -- CUDA device mem event operation labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_CUDA_FUNC_CACHE_CONFIG",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_CUDA_FUNC_CACHE_CONFIG (\n    -- CUDA function cache config labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_CUDA_KERNEL_LAUNCH_TYPE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_CUDA_KERNEL_LAUNCH_TYPE (\n    -- CUDA kernel launch type labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_CUDA_MEMCPY_OPER",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_CUDA_MEMCPY_OPER (\n    -- CUDA memcpy operation labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_CUDA_MEMPOOL_OPER",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_CUDA_MEMPOOL_OPER (\n    -- CUDA mempool operation labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_CUDA_MEMPOOL_TYPE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_CUDA_MEMPOOL_TYPE (\n    -- CUDA mempool type labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_CUDA_MEM_KIND",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_CUDA_MEM_KIND (\n    -- CUDA memory kind labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_CUDA_SHARED_MEM_LIMIT_CONFIG",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_CUDA_SHARED_MEM_LIMIT_CONFIG (\n    -- CUDA shared memory limit config labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_CUDA_UNIF_MEM_ACCESS_TYPE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_CUDA_UNIF_MEM_ACCESS_TYPE (\n    -- CUDA unified memory access type labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_CUDA_UNIF_MEM_MIGRATION",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_CUDA_UNIF_MEM_MIGRATION (\n    -- CUDA unified memory migration cause labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_CUPTI_STREAM_TYPE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_CUPTI_STREAM_TYPE (\n    -- CUPTI stream type labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_CUPTI_SYNC_TYPE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_CUPTI_SYNC_TYPE (\n    -- CUPTI synchronization type labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_DIAGNOSTIC_SEVERITY_LEVEL",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_DIAGNOSTIC_SEVERITY_LEVEL (\n    -- Diagnostic message severity level labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_DIAGNOSTIC_SOURCE_TYPE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_DIAGNOSTIC_SOURCE_TYPE (\n    -- Diagnostic message source type labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_DIAGNOSTIC_TIMESTAMP_SOURCE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_DIAGNOSTIC_TIMESTAMP_SOURCE (\n    -- Diagnostic message timestamp source lables\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_NSYS_EVENT_CLASS",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_NSYS_EVENT_CLASS (\n    -- Nsys event class labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_NSYS_EVENT_TYPE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_NSYS_EVENT_TYPE (\n    -- Nsys event type labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_NSYS_GENERIC_EVENT_FIELD_ETW_FLAGS",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_NSYS_GENERIC_EVENT_FIELD_ETW_FLAGS (\n    -- Nsys generic event field ETW map info flag labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_NSYS_GENERIC_EVENT_FIELD_ETW_PROPERTY",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_NSYS_GENERIC_EVENT_FIELD_ETW_PROPERTY (\n    -- Nsys generic event field ETW property flag labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_NSYS_GENERIC_EVENT_FIELD_ETW_TYPE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_NSYS_GENERIC_EVENT_FIELD_ETW_TYPE (\n    -- Nsys generic event field ETW type labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_NSYS_GENERIC_EVENT_FIELD_TYPE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_NSYS_GENERIC_EVENT_FIELD_TYPE (\n    -- Nsys generic event field type labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_NSYS_GENERIC_EVENT_GROUP",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_NSYS_GENERIC_EVENT_GROUP (\n    -- Nsys generic event group labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_NSYS_GENERIC_EVENT_SOURCE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_NSYS_GENERIC_EVENT_SOURCE (\n    -- Nsys generic event source labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_SAMPLING_THREAD_STATE",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_SAMPLING_THREAD_STATE (\n    -- Sampling thread state labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_SCHEDULING_THREAD_BLOCK",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_SCHEDULING_THREAD_BLOCK (\n    -- Scheduling thread block labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "ENUM_STACK_UNWIND_METHOD",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "label",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ENUM_STACK_UNWIND_METHOD (\n    -- Stack unwind method labels\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- Enum numerical value.\n    name                        TEXT,                                  -- Enum symbol name.\n    label                       TEXT                                   -- Enum human name.\n)"
+    },
+    {
+      "name": "META_DATA_CAPTURE",
+      "columns": [
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "value",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE META_DATA_CAPTURE (\n    -- information about nsys capture parameters\n\n    name                        TEXT      NOT NULL,                    -- Name of meta-data record\n    value                       TEXT                                   -- Value of meta-data record\n)"
+    },
+    {
+      "name": "META_DATA_EXPORT",
+      "columns": [
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "value",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE META_DATA_EXPORT (\n    -- information about nsys export process\n\n    name                        TEXT      NOT NULL,                    -- Name of meta-data record\n    value                       TEXT                                   -- Value of meta-data record\n)"
+    },
+    {
+      "name": "OSRT_API",
+      "columns": [
+        {
+          "name": "start",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "end",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "eventClass",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "globalTid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "nameId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "returnValue",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "nestingLevel",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "callchainId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE OSRT_API (\n    -- OS runtime libraries traced to gather information about low-level userspace APIs.\n\n    start                       INTEGER   NOT NULL,                    -- Event start timestamp (ns).\n    end                         INTEGER   NOT NULL,                    -- Event end timestamp (ns).\n    eventClass                  INTEGER   NOT NULL,                    -- REFERENCES ENUM_NSYS_EVENT_CLASS(id)\n    globalTid                   INTEGER,                               -- Serialized GlobalId.\n    nameId                      INTEGER   NOT NULL,                    -- REFERENCES StringIds(id) -- Function name\n    returnValue                 INTEGER   NOT NULL,                    -- Return value of the function call.\n    nestingLevel                INTEGER,                               -- Zero-base index of the nesting level.\n    callchainId                 INTEGER   NOT NULL                     -- REFERENCES OSRT_CALLCHAINS(id)\n)",
+      "rows": 17602,
+      "start_numeric_range": [
+        1794074805013730408,
+        1794074818594137442
+      ],
+      "end_numeric_range": [
+        1794074805013730408,
+        1794074819197620764
+      ]
+    },
+    {
+      "name": "OSRT_CALLCHAINS",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "symbol",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "module",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "kernelMode",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "thumbCode",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "unresolved",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "specialEntry",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "originalIP",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "unwindMethod",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "stackDepth",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 2
+        }
+      ],
+      "schema_sql": "CREATE TABLE OSRT_CALLCHAINS (\n    -- Callchains attached to OSRT events, depending on selected profiling settings.\n\n    id                          INTEGER   NOT NULL,                    -- Part of PRIMARY KEY (id, stackDepth).\n    symbol                      INTEGER   NOT NULL,                    -- REFERENCES StringIds(id) -- Function name\n    module                      INTEGER   NOT NULL,                    -- REFERENCES StringIds(id) -- Module name\n    kernelMode                  INTEGER,                               -- True if kernel mode.\n    thumbCode                   INTEGER,                               -- True if thumb code.\n    unresolved                  INTEGER,                               -- True if the symbol was not resolved.\n    specialEntry                INTEGER,                               -- True if artifical entry added during processing callchain.\n    originalIP                  INTEGER,                               -- Instruction pointer value.\n    unwindMethod                INTEGER,                               -- REFERENCES ENUM_STACK_UNWIND_METHOD(id)\n    stackDepth                  INTEGER   NOT NULL,                    -- Zero-base index of the given function in call stack.\n\n    PRIMARY KEY (id, stackDepth)\n)"
+    },
+    {
+      "name": "PROCESSES",
+      "columns": [
+        {
+          "name": "globalPid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "pid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE PROCESSES (\n    -- Names and identifiers of processes captured in the report.\n\n    globalPid                   INTEGER,                               -- Serialized GlobalId.\n    pid                         INTEGER,                               -- The process ID.\n    name                        TEXT                                   -- The process name.\n)"
+    },
+    {
+      "name": "PROFILER_OVERHEAD",
+      "columns": [
+        {
+          "name": "start",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "end",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "globalTid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "nameId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "returnValue",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE PROFILER_OVERHEAD (\n    start                       INTEGER   NOT NULL,                    -- Event start timestamp (ns).\n    end                         INTEGER   NOT NULL,                    -- Event end timestamp (ns).\n    globalTid                   INTEGER,                               -- Serialized GlobalId.\n    nameId                      INTEGER   NOT NULL,                    -- REFERENCES StringIds(id) -- Function name\n    returnValue                 INTEGER   NOT NULL                     -- Return value of the function call.\n)",
+      "rows": 928,
+      "start_numeric_range": [
+        1794074805014902312,
+        1794074818503457043
+      ],
+      "end_numeric_range": [
+        1794074805015662454,
+        1794074818504145619
+      ]
+    },
+    {
+      "name": "ProcessStreams",
+      "columns": [
+        {
+          "name": "globalPid",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "filenameId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "contentId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ProcessStreams (\n    globalPid                   INTEGER   NOT NULL,                    -- Serialized GlobalId.\n    filenameId                  INTEGER   NOT NULL,                    -- REFERENCES StringIds(id) -- File name\n    contentId                   INTEGER   NOT NULL                     -- REFERENCES StringIds(id) -- Stream content\n)"
+    },
+    {
+      "name": "StringIds",
+      "columns": [
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 1
+        },
+        {
+          "name": "value",
+          "declared_type": "TEXT",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE StringIds (\n    -- Consolidation of repetitive string values.\n\n    id                          INTEGER   NOT NULL   PRIMARY KEY,      -- ID reference value.\n    value                       TEXT      NOT NULL                     -- String value.\n)"
+    },
+    {
+      "name": "TARGET_INFO_CUDA_CONTEXT_INFO",
+      "columns": [
+        {
+          "name": "nullStreamId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "hwId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "vmId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "processId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "deviceId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "contextId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "parentContextId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "isGreenContext",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE TARGET_INFO_CUDA_CONTEXT_INFO (\n    nullStreamId                INTEGER   NOT NULL,                    -- Stream ID.\n    hwId                        INTEGER   NOT NULL,                    -- Hardware ID.\n    vmId                        INTEGER   NOT NULL,                    -- VM ID.\n    processId                   INTEGER   NOT NULL,                    -- Process ID.\n    deviceId                    INTEGER   NOT NULL,                    -- Device ID.\n    contextId                   INTEGER   NOT NULL,                    -- Context ID.\n    parentContextId             INTEGER,                               -- For green context, this is the parent context id.\n    isGreenContext              INTEGER                                -- Is this a Green Context?\n)"
+    },
+    {
+      "name": "TARGET_INFO_CUDA_DEVICE",
+      "columns": [
+        {
+          "name": "gpuId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "cudaId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "pid",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE TARGET_INFO_CUDA_DEVICE (\n    gpuId                       INTEGER,                               -- GPU ID.\n    cudaId                      INTEGER   NOT NULL,                    -- CUDA device ID.\n    pid                         INTEGER   NOT NULL                     -- Process ID.\n)"
+    },
+    {
+      "name": "TARGET_INFO_CUDA_STREAM",
+      "columns": [
+        {
+          "name": "streamId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "hwId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "vmId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "processId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "contextId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "priority",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "flag",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE TARGET_INFO_CUDA_STREAM (\n    streamId                    INTEGER   NOT NULL,                    -- Stream ID.\n    hwId                        INTEGER   NOT NULL,                    -- Hardware ID.\n    vmId                        INTEGER   NOT NULL,                    -- VM ID.\n    processId                   INTEGER   NOT NULL,                    -- Process ID.\n    contextId                   INTEGER   NOT NULL,                    -- Context ID.\n    priority                    INTEGER   NOT NULL,                    -- Priority of the stream.\n    flag                        INTEGER   NOT NULL                     -- REFERENCES ENUM_CUPTI_STREAM_TYPE(id)\n)"
+    },
+    {
+      "name": "TARGET_INFO_GPU",
+      "columns": [
+        {
+          "name": "vmId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "id",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "busLocation",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "isDiscrete",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "l2CacheSize",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "totalMemory",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "memoryBandwidth",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "clockRate",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "smCount",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "pwGpuId",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "uuid",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "luid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "chipName",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "cuDevice",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "ctxswDevPath",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "ctrlDevPath",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "revision",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "nodeMask",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "constantMemory",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxIPC",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxRegistersPerBlock",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxShmemPerBlock",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxShmemPerBlockOptin",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxShmemPerSm",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxRegistersPerSm",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "threadsPerWarp",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "asyncEngines",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxWarpsPerSm",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxBlocksPerSm",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxThreadsPerBlock",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxBlockDimX",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxBlockDimY",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxBlockDimZ",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxGridDimX",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxGridDimY",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "maxGridDimZ",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "computeMajor",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "computeMinor",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "smMajor",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "smMinor",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE TARGET_INFO_GPU (\n    vmId                        INTEGER   NOT NULL,                    -- Serialized GlobalId.\n    id                          INTEGER   NOT NULL,                    -- Device ID.\n    name                        TEXT,                                  -- Device name.\n    busLocation                 TEXT,                                  -- PCI bus location.\n    isDiscrete                  INTEGER,                               -- True if discrete, false if integrated.\n    l2CacheSize                 INTEGER,                               -- Size of L2 cache (B).\n    totalMemory                 INTEGER,                               -- Total amount of memory on the device (B).\n    memoryBandwidth             INTEGER,                               -- Amount of memory transferred (B).\n    clockRate                   INTEGER,                               -- Clock frequency (Hz).\n    smCount                     INTEGER,                               -- Number of multiprocessors on the device.\n    pwGpuId                     INTEGER,                               -- PerfWorks GPU ID.\n    uuid                        TEXT,                                  -- Device UUID.\n    luid                        INTEGER,                               -- Device LUID.\n    chipName                    TEXT,                                  -- Chip name.\n    cuDevice                    INTEGER,                               -- CUDA device ID.\n    ctxswDevPath                TEXT,                                  -- GPU context switch device node path.\n    ctrlDevPath                 TEXT,                                  -- GPU control device node path.\n    revision                    INTEGER,                               -- Revision number.\n    nodeMask                    INTEGER,                               -- Device node mask.\n    constantMemory              INTEGER,                               -- Memory available on device for __constant__ variables (B).\n    maxIPC                      INTEGER,                               -- Maximum instructions per count.\n    maxRegistersPerBlock        INTEGER,                               -- Maximum number of 32-bit registers available per block.\n    maxShmemPerBlock            INTEGER,                               -- Maximum optin shared memory per block.\n    maxShmemPerBlockOptin       INTEGER,                               -- Maximum optin shared memory per block.\n    maxShmemPerSm               INTEGER,                               -- Maximum shared memory available per multiprocessor (B).\n    maxRegistersPerSm           INTEGER,                               -- Maximum number of 32-bit registers available per multiprocessor.\n    threadsPerWarp              INTEGER,                               -- Warp size in threads.\n    asyncEngines                INTEGER,                               -- Number of asynchronous engines.\n    maxWarpsPerSm               INTEGER,                               -- Maximum number of warps per multiprocessor.\n    maxBlocksPerSm              INTEGER,                               -- Maximum number of blocks per multiprocessor.\n    maxThreadsPerBlock          INTEGER,                               -- Maximum number of threads per block.\n    maxBlockDimX                INTEGER,                               -- Maximum X-dimension of a block.\n    maxBlockDimY                INTEGER,                               -- Maximum Y-dimension of a block.\n    maxBlockDimZ                INTEGER,                               -- Maximum Z-dimension of a block.\n    maxGridDimX                 INTEGER,                               -- Maximum X-dimension of a grid.\n    maxGridDimY                 INTEGER,                               -- Maximum Y-dimension of a grid.\n    maxGridDimZ                 INTEGER,                               -- Maximum Z-dimension of a grid.\n    computeMajor                INTEGER,                               -- Major compute capability version number.\n    computeMinor                INTEGER,                               -- Minor compute capability version number.\n    smMajor                     INTEGER,                               -- Major multiprocessor version number.\n    smMinor                     INTEGER                                -- Minor multiprocessor version number.\n)"
+    },
+    {
+      "name": "TARGET_INFO_SESSION_START_TIME",
+      "columns": [
+        {
+          "name": "utcEpochNs",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "utcTime",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "localTime",
+          "declared_type": "TEXT",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE TARGET_INFO_SESSION_START_TIME (\n    utcEpochNs                  INTEGER,                               -- UTC Epoch timestamp at start of the capture (ns).\n    utcTime                     TEXT,                                  -- Start of the capture in UTC.\n    localTime                   TEXT                                   -- Start of the capture in local time of target.\n)"
+    },
+    {
+      "name": "TARGET_INFO_SYSTEM_ENV",
+      "columns": [
+        {
+          "name": "globalVid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "devStateName",
+          "declared_type": "TEXT",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "name",
+          "declared_type": "TEXT",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "nameEnum",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "value",
+          "declared_type": "TEXT",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE TARGET_INFO_SYSTEM_ENV (\n    globalVid                   INTEGER,                               -- Serialized GlobalId.\n    devStateName                TEXT      NOT NULL,                    -- Device state name.\n    name                        TEXT      NOT NULL,                    -- Property name.\n    nameEnum                    INTEGER   NOT NULL,                    -- Property enum value.\n    value                       TEXT      NOT NULL                     -- Property value.\n)"
+    },
+    {
+      "name": "ThreadNames",
+      "columns": [
+        {
+          "name": "nameId",
+          "declared_type": "INTEGER",
+          "not_null": true,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "priority",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        },
+        {
+          "name": "globalTid",
+          "declared_type": "INTEGER",
+          "not_null": false,
+          "primary_key_ordinal": 0
+        }
+      ],
+      "schema_sql": "CREATE TABLE ThreadNames (\n    nameId                      INTEGER   NOT NULL,                    -- REFERENCES StringIds(id) -- Thread name\n    priority                    INTEGER,                               -- Priority of the thread.\n    globalTid                   INTEGER                                -- Serialized GlobalId.\n)"
+    }
+  ]
+}

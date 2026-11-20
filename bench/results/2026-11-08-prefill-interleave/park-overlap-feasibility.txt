@@ -1,0 +1,232 @@
+Conversation-cache park overlap: source-only feasibility review
+Date: 2026-11-08, Asia/Taipei
+Source: /Users/fu/project/HAI/Strata-decode-head
+Frozen HEAD: bf5a8e5b24b1973efbae747a109f5a970b25e09d
+Scope: design only; no engine edits, GPU work, remote commands, or performance claim.
+
+Recommendation
+==============
+The smallest plausible candidate is ONE snapshot worker saving the main session's
+eight stages in their existing order, while the main thread only pumps already
+admitted private batch slots. It is not safe to put eight existing
+conversation_snapshot_save calls on eight threads. The latter requires isolating
+global snapshot transactions first and is a larger change.
+
+The worker candidate is conditional, not yet cleared to implement or deploy:
+1. Freeze and quiesce all main-session sources before restarting the pump.
+2. Give the worker its own error/result; keep all cache publication and source
+   restoration behind a join barrier.
+3. Freeze tier mutation, retain the CUDA-free doorbell service and resident PLE
+   prepublication, and recheck actual residency/no loans at the park boundary.
+4. Add an explicit source-ready snapshot entry point; preserve the old default
+   device-synchronization contract. Repeated device-wide synchronization inside
+   a worker would unnecessarily wait for live decode streams.
+5. Apply the separate streamed-KV audit's configuration boundaries. Expert
+   residency alone does not establish that long-context KV has no host-dependent
+   waits. The independent review found no additional KV blocker for the current
+   int8 stream path; this is not approval of snapshot-helper concurrency.
+
+The candidate targets output continuity during park, not a guarantee of shorter
+park wall time, higher tokens/s, 100% GPU use, or unchanged prefill throughput.
+All of those need same-binary A/B. Existing full v3/h4 A/B remains the priority.
+
+Observed stall and its limits
+============================
+/Users/fu/project/HAI/Strata/bench/results/2026-11-08-prefill-interleave/qualification-v3-on-off1/01-on/engine.log:334
+records a 59,939-token park taking 1343.8 ms, snapshot_bytes=1402574080,
+reused_kv_bytes=0. Its next line starts read_id=5; that reader lasts 5875.702 ms
+and returns read_ok=0 for the intentionally cancelled admission (line 336).
+The same run has a 1127.5 ms park at line 404. The earlier
+remaining-gap-source-audit.txt ties ordered logs to the approximately 1.797 s
+peer output gap, but native stderr lacks per-line epoch timestamps. It is strong
+evidence that park dominates that gap, not proof that all gap time is park.
+
+Do not divide 1.402 GB by 1.344 s and call it D2H throughput. With streamed int8
+KV, conversation_snapshot.cpp:80-90 chooses the authoritative host pools for
+K/V/scales; idx_pooled remains a device pointer. Snapshot size also includes
+running state, checkpoint copies, and allocation. STRATA_PARK_TRACE separates
+join/sync/checkpoint/live-state/begin/KV attributes/resize/copy at
+conversation_state.cpp:591. First classify the cost before a bandwidth redesign.
+
+Source independence that makes a single worker plausible
+========================================================
+All paths below are under /Users/fu/project/HAI/Strata-decode-head/.
+
+src/program/generate.cpp:15459 drains target groups and settles slot draft chains
+before a new admission. The request also joins checkpoint DMA at 16095 and waits
+for the main verifier commit at 16111. A new route should explicitly establish
+readiness on EVERY stage and the owner MTP, rather than assuming the first
+verifier's wait proves every source complete.
+
+src/program/generate.cpp:12372 constructs ParkSource from live/live_imgs/checks,
+main ss, each stages[k]->ss, and owner mtp.kv_state(). It does not point at the
+active batch slots. Slots get separate cudaMalloc/session_init allocations at
+6937-6962; init_slots binds those per-stage slot objects at 11679-11695.
+src/core/session.cpp:95-123 carves private running GDN state, QSA states/buffers,
+and ple_hist from each session's allocation; qsa_state_init creates the relevant
+KV state per session. Slot MTP loads against each slot session at
+generate.cpp:7218-7244 and shares the owner's weights, not its private KV state.
+
+src/core/verify.cpp:1427 selects slot_ss while batch_rec_ is true. Batch PLE uses
+the slot history at 1585; GDN conv/recurrence use sx.gdn_state at 1723-1732 and
+1764-1795; deferred commit writes slot state and slot ple_prev at 4297-4333 and
+4395-4403. The main session's shared compute scratch is still used by the
+verifier, but snapshot reads sequence state, not that compute scratch. Snapshot
+targets are validated at conversation_state.cpp:62-76. This distinction must
+stay explicit: “separate slot SessionState” does not mean every referenced
+weight or scratch allocation is separate.
+
+The pump/verdict code at generate.cpp:148xx-15440 changes BSlot ids, counters,
+cached status, private slot state and sampling state. It does not execute
+park_current, copy_from_slot, copy_to_slot, or conversation snapshot APIs. Keep
+that restricted execution set during the job. copy_from_slot (14365),
+copy_to_slot (14314), park_slot (14435), checkpoints, restores, cache eviction,
+VRAM commands, new BGENs and solo decode must wait until the snapshot joins.
+
+Why eight existing snapshot calls are not thread-safe
+====================================================
+src/core/conversation_snapshot.cpp:215-229 defines one global ParkAsync.
+conversation_park_async_begin at 595-604 resets active/items/used/slot/tag
+without a lock covering the complete begin/save/launch transaction. It does
+this even when STRATA_PARK_ASYNC is off. conversation_kv_save reads that
+transaction state. The pending-future join mutex is not a transaction mutex.
+VramKv management and KvSaveTrace at 249-252 are also global mutable state.
+
+src/core/conversation_state.cpp:172-187 defines global CkptAsync and VramSlots.
+checkpoint_save at 305-332 mutates staging device, capacity, buffers, stream and
+VRAM tags outside a whole-transaction lock. CkptGather at 222-239 has a mutex,
+so it is safe through that helper but serializes cards. Its single device/cap
+can force allocation/free when switching cards (242-248).
+
+src/core/conversation_copy.hpp:54-103 does use exclusive thread-local,
+per-device nonblocking copy handles, with a mutex-protected reusable handle
+pool. That only solves copy-handle ownership; it does not make the global
+snapshot transaction above independent. queued=false copy_nonblocking waits
+for the calling thread's stream (140-152). queued=true operations must be
+joined/ordered on that SAME worker's TLS stream. A main-thread sync does not
+join a worker's copy stream. Likewise main copy_stream_ready does not prove
+the worker has warmed handles; main's checked-out handles are not in the pool.
+
+The independent historical_peak review agrees on these global/TLS constraints.
+Therefore eight-way snapshot capture needs a per-job/per-device SnapshotContext
+for park/checkpoint/gather/trace/VRAM bookkeeping, or a deliberately isolated
+synchronous context path. One global lock would make it safe but erase the
+intended stage parallelism. This is not the lower-risk first change.
+
+Streamed-KV follow-up
+====================
+The independent review is recorded in
+/Users/fu/project/HAI/Strata/bench/results/2026-11-08-prefill-interleave/streamed-kv-overlap-independent-review.txt.
+It finds private main/slot host KV initialization in src/core/layer.cpp:918-947;
+qsa_state_init at 879-904 shares RoPE cos/sin only. The batch path resolves and
+attends the per-slot state at src/core/verify.cpp:2129-2141. The current stream
+resolver in src/kernels/cuda/kv_stream.cu:85-180 uses bounded GPU work and direct
+mapped-host reads; launch ordering at 230-233 stays on one GPU stream, without
+a main-thread ready callback. Thus no additional host-pump wait was identified
+for current long-context int8 KV. The review also distinguishes global split
+indexer scratch from normal prefill's active>0 route. It excludes the optional
+STRATA_IDX_FP16_CHECK debug branch and arbitrary multiple readers. A new park
+candidate must retain those boundaries and its own source-freeze/copy barriers.
+
+Proposed single-worker boundaries
+================================
+A. Main thread prepares while already drained.
+   - Default-off independent flag; first scope is main-session park_current in
+     strict resident piped MTP only. Keep idle-slot park/restore unchanged.
+   - Recheck actual ar_live on all stages, full host_res, resident owner draft,
+     no mtp_room/actual pf_parts loan, no pending/ajob/peer/remote tier/fs_swap/
+     growth, and idle lookahead. Read eligibility at 17536-17567 is a model,
+     but it executes AFTER park and cannot be assumed true earlier.
+   - Settle every source producer, including owner draft, old checkpoint/park
+     DMA and all source devices, BEFORE launching new decode windows.
+   - Prepare cache reuse, eviction/admission, checkpoint split and metadata
+     ownership under the main thread. Freeze those objects until join. Prefer
+     passing an owned job/result rather than capturing request-stack references
+     in the existing park_source lambda. Its current err is the same outer
+     string used by pump (12335/12347), hence directly threading it is a race.
+   - For an initial narrow route, require legacy PARK_ASYNC/CKPT_ASYNC and their
+     VRAM slots off, or explicitly join ALL of their pending work before worker
+     completion. A worker returning after launch is not a completed snapshot.
+
+B. Worker captures; main only pumps and handles safe control messages.
+   - Worker uses an explicit device guard for stage 0 and each later stage,
+     local std::string error, local reuse counters and local image/stage images.
+   - Snapshot API needs an explicit source-ready option/private entry point.
+     Existing conversation_snapshot_save unconditionally calls sync at
+     conversation_state.cpp:532; sync is cudaDeviceSynchronize at 32-35.
+     generate.cpp:12344 adds another device sync for each later stage. Preserve
+     those defaults; only a caller that owns immutable, already-ready sources
+     may skip them. Worker copy-stream completion is still mandatory.
+   - A persistent worker or pre-pump handshake warms THAT worker's per-device
+     copy handles. Ordinary host vector growth/page faults remain possible;
+     stream creation/allocator/device-barrier costs must be measured separately.
+   - Reuse/extract the CUDA-free Doorbells RAII at generate.cpp:17645-17703,
+     external_serve, and resident PLE prepublication at verify.cpp:4684-4699.
+     The latter currently depends on CONCURRENT_MTP + external_serve + ar_on;
+     a park flag alone would not activate it. Do not publish b_running early.
+   - Suppress adaptive tier mutation for the entire job using a scoped host
+     phase guard. pa_due currently tests in_prompt_read at 15109-15118;
+     apply_pending is a no-op only with peer excluded and pending empty at
+     12970-12972. Do not allow these conditions to change mid-job.
+   - Pump may consume BSTOP and mark a slot stopped as the reader path does.
+     STOP sets the incoming request's atomic flag on the stdin thread at
+     13721-13780; finish/join the outgoing snapshot before acting on cancellation
+     or restoring sources. Preserve BYIELD/BGEN/VRAM/QUIT queue order rather
+     than executing them during capture. BYIELD has no “read chunk” to stop in
+     this phase and should be carried into admission/read handling.
+
+C. Join before publishing or changing source state.
+   - Worker stores result and done with release/acquire synchronization. A
+     scoped destructor joins on normal completion, exceptions and pump errors.
+     Never detach the job or destroy image vectors while a copy may use them.
+   - On pump failure stop launching groups, retain required doorbell service,
+     let capture finish or report an explicit worker stall; then unwind in a
+     defined order. On snapshot allocation failure preserve baseline behavior:
+     discard the unpublished image and continue without caching. CUDA errors
+     propagate after the join, not through a racing shared err.
+   - Global progress counters are atomic (include/strata/core/progress.hpp),
+     but decode beats can hide a stuck snapshot worker. Add a job-phase/time
+     diagnostic or independent worker heartbeat rather than treating arbitrary
+     pump progress as evidence that snapshot copying still moves.
+   - Publish conversations.put only after complete stage images, with existing
+     post-capture RAM-floor/accounting checks. Merge checkpoints deterministically.
+     Then drain/settle remaining decode work before restore, main-SS zero/read,
+     copy_from_slot or copy_to_slot. Keep doorbells alive through the required
+     final drain and restore external_serve/host-phase flags on every exit.
+
+Patch scope and qualification
+=============================
+Likely scope: generate.cpp park job/preparation/publication plus reusable
+resident host-phase/doorbell lifetime; conversation_state.hpp/.cpp explicit
+source-readiness contract; a small guard helper and CPU tests. A permanent
+copy-worker helper is optional. No GEMM/attention kernel or prefill layer split
+change is intrinsically needed for this candidate. Snapshot source-ready APIs
+need a careful review because they weaken a synchronization precondition only
+for the new caller. Eight-way capture instead touches conversation_snapshot,
+checkpoint/gather/VRAM context and destruction ownership as well.
+
+Before GPU qualification verify the proposed route remains within the reviewed
+streamed-KV and indexer configuration. Use existing snapshot parity/restore
+fixtures (src/core/conversation_snapshot_test.cpp and
+tools/test_conversation_cache_parity.py), copy-handle ownership checks in
+src/core/conversation_copy_streams_test.cpp, fault injection
+STRATA_TEST_COPY_FAIL_AT, cold first-use, repeated park/reuse, cache eviction,
+cancel during capture, queued BYIELD and sampled/penalty peers. Compare complete
+normal output hash and usage, plus restored-state/hash where available.
+
+Route evidence should include park ID, source tokens, immutable/source-ready
+checks, stage count, begin/end monotonic timestamps, capture/publish/drain times,
+copy bytes by host/device path, worker error/cancel status, pool dispatch delta,
+and outputs actually emitted before worker completion. In the current piped
+MTP path pipe_rows increments beside each accepted output BT emission
+(generate.cpp:15027-15032; ordinary piped path:15184-15188), including native
+special/EOS tokens. It is not the number of raw verification rows, nor API
+visible-content tokens. Name this counter native BT outputs and retain client
+timestamps to establish visible continuity. Exclude final drain from overlap proof.
+
+For performance compare the same binary with the new flag off/on, unchanged
+prefill split/chunk and selected P1/P2 settings. Measure peer p95/p99/max gaps,
+long admission TTFT/read time, whole-run accepted output throughput, GPU per-card
+activity and copy/CPU-memory pressure, plus cold/warm 100k prefill-only controls.
+Do not use traced runs as the headline speed comparison, and do not infer a
+benefit from this design or the earlier on-only 1343.8 ms observation.

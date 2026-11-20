@@ -1,0 +1,122 @@
+{
+  "outcome": "PASS_FOR_FREEZE_AND_FRESH_PAIRED_BUDGET_QUALIFICATION",
+  "blocking_findings": [],
+  "review_scope": "Local-only review of revised v7 normal-EOS contract and finite1024 budget cohort; no source/harness/service/remote/GPU mutation.",
+  "reviewed_python_files": {
+    "admission_smoke.py": {
+      "sha256": "6d8f5881b7b33f77ef90dc3896a24c59680c7b57fc9b826bf41512aa647ee9b8",
+      "same_as_v6": true
+    },
+    "budget_correctness.py": {
+      "sha256": "0aa3b2099100ee6b0687d7839dffe520ff9fe8634efa3d48581fb5c5ee0631da",
+      "same_as_v6": false
+    },
+    "byield_offline_tests.py": {
+      "sha256": "4f425c30ec94580e72b7594eaef3acc0241acac6148174f53e208808f0fe6331",
+      "same_as_v6": true
+    },
+    "byield_smoke.py": {
+      "sha256": "94056525baa83ea03bb8030690d5de0a9a293258c00cbc9b0e65f1f971ca573e",
+      "same_as_v6": true
+    },
+    "c8_check.py": {
+      "sha256": "5a8648e8324b719bc264e0ef2501e01d638f7c0203bb6c68d470ec91cf4b706d",
+      "same_as_v6": true
+    },
+    "calibrate_fixtures.py": {
+      "sha256": "010b1e7e9e07aaef6117c4d64f2acd5ed042f8f8643fd898b9f36afddc291d16",
+      "same_as_v6": true
+    },
+    "cancel_read_proof.py": {
+      "sha256": "9d7ab1638eb11e96b46206d3940a99f0b7f2149540bdc1ccc24fd2291dc15a8a",
+      "same_as_v6": true
+    },
+    "compare_interleave.py": {
+      "sha256": "fbf34628ce99e31cad98ac704342447921fc0be4d627a984e5d94a53a1519d6f",
+      "same_as_v6": true
+    },
+    "correctness.py": {
+      "sha256": "b5a7786792e6632f426e3c2fe664cfaf7b37fed8931de0f230960e37fa8a0865",
+      "same_as_v6": true
+    },
+    "cross_interleave_compatibility.py": {
+      "sha256": "b6bdf1e37d38f268d636967f68cb1cbfd5991ae1f569223c76d3da7aaaea5ad0",
+      "same_as_v6": true
+    },
+    "finite_mixed.py": {
+      "sha256": "a797d6aba9077b8b77bae396d520556b786036077ca7b3ebb98f2b0d8e5b9b39",
+      "same_as_v6": true
+    },
+    "fixture_prompts.py": {
+      "sha256": "ae83903025468d01fa383848499cb419434d2bbba812dbd40b8c7344587a1f34",
+      "same_as_v6": true
+    },
+    "interleave_evidence.py": {
+      "sha256": "e5874612fbbfef511797cb2ccf62b442370b05e058141a0b264e5fc3b669386e",
+      "same_as_v6": true
+    },
+    "long_concurrency_check.py": {
+      "sha256": "3eb1e3995fc5e92e2327fe38387ea5d38466589eb8550219f83405351177f967",
+      "same_as_v6": true
+    },
+    "offline_tests.py": {
+      "sha256": "7e3e5a447a2da6e23c4fdf0c834d12e6a800c1b151d6ef78239054c19488b60e",
+      "same_as_v6": true
+    },
+    "prefill_check.py": {
+      "sha256": "6822ff7f3cd58fcf3a4e58a237ba7f23d41b68c8f27ca4a84297a3e4c77cff15",
+      "same_as_v6": true
+    },
+    "prefill_interleave_check.py": {
+      "sha256": "59acc323449673ae96781c7560612ff0ebe73332cafce780a478e47a4299ee56",
+      "same_as_v6": true
+    },
+    "runner_interleave.py": {
+      "sha256": "85b0ecd56209f420b8781360ead2bb858a87b2673e953de090b3aed9cf90ca04",
+      "same_as_v6": true
+    },
+    "stall_metrics.py": {
+      "sha256": "09b664e45c5bc417ad1d590f314dee82edbbb964b99d9ff4819c6901607ae005",
+      "same_as_v6": true
+    },
+    "stream_client.py": {
+      "sha256": "1f3c62913ed9a6fe7cd53aaded7b4990289c093079243906620a88a04987d38a",
+      "same_as_v6": true
+    }
+  },
+  "tests": [
+    {
+      "command": "python3 -B budget_correctness.py --self-test",
+      "returncode": 0
+    },
+    {
+      "command": "Load v6/v7 fixture functions with identical fixture ID and frozen core, compare all fields except max_tokens",
+      "returncode": 0,
+      "result": "Exactly4 max_tokens384->1024; every other fixture field equal."
+    },
+    {
+      "command": "AST parse20 Python files; byte compare all20 v6/v7 Python files",
+      "returncode": 0,
+      "result": "Only budget_correctness.py changed."
+    },
+    {
+      "command": "Frozen core usage_comparison with matched EOS900 and mismatched900/901 actual completions",
+      "returncode": 0,
+      "result": "Matched accepted, mismatch rejected."
+    }
+  ],
+  "contract": [
+    "Exactly four budget fixtures increase max output384->1024; their prompts, seeds, temperatures,64/128 reasoning budgets and templates remain unchanged.",
+    "Normal stop may complete1..1024; length must complete1024. All three integer logical usage fields must be consistent and prompt count positive. Each actual output count/finish reason is recorded.",
+    "Existing nine complete responses, wrap marker and bounded continuation reuse, recovery identity, intentional cancellation and native route requirements remain.",
+    "Frozen overlap gate uses common first-output/last-output SSE interval>=0.1s with>=2deltas per each of four lanes; HTTP lifetime alone is not overlap.",
+    "Cross-arm comparator continues exact request hash, output/reasoning hashes, finish reason and actual logical token counts for normal responses.",
+    "Other19 Python files, including finitev6 and BYIELD3072, are byte-identical."
+  ],
+  "limits": [
+    "Fresh paired v7 budget runs are required; earlier failed artifact remains failed.",
+    "Lengthening cap makes a real overlap interval more likely but cannot guarantee it. The unchanged real-overlap gate must pass on each arm.",
+    "This is a correctness-qualification fixture, not a performance benchmark; no speedup claim follows.",
+    "CPU tests do not establish GPU correctness, actual100k behavior or deployment eligibility."
+  ]
+}

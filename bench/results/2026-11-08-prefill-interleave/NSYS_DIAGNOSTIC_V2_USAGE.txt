@@ -1,0 +1,20 @@
+Nsight helper v2 — local preparation only, no remote launch
+
+Use nsys_diagnostic_v2.py after timed qualification, with the lifecycle/privacy/interpretation rules in NSYS_DIAGNOSTIC_USAGE.txt unchanged. Original nsys_diagnostic.py remains frozen. The diagnostic still imports the individually bound h6/h7 clients/runner; it does not import or modify the new combined incremental harness.
+
+New options:
+  --engine-sha256 <frozen SHA> selects and verifies the exact --exe and actual process.
+  Default is v3 45eaa612cbdda74d0bcaf6302e37807ae9cd9c4fe8b1c633282564d379cad8b6.
+  The additional allowed v4 is92822929f1f60ecd80c64ce04fa47a44a6d789b0e4ca028ef5be5e39fecab20c.
+  --snapshot-overwrite 0|1 defaults0;1 requires v4. It changes the private diagnostic config only.
+  --arm off|on still selects concurrent-MTP0|1. For the combined candidate choose --arm on --snapshot-overwrite1; both-off uses off/0.
+
+Every report records selected engine SHA and both requested flags, then independently verifies actual executable/library maps and /proc/<engine>/environ flags. Libraryfb67, server40c5, baseconfigf752, layer split, prefill settings, P1=1 and async=0 remain bound. The existing runner constructs the independent config with reasoning_budget_engine_cap=true, matching qualification runs. Default dry-run performs no launch, file write, network or GPU access.
+
+Example dry-run for the final combined candidate:
+  python3 nsys_diagnostic_v2.py --workload c8 --arm on --snapshot-overwrite 1 \
+    --engine-sha256 92822929f1f60ecd80c64ce04fa47a44a6d789b0e4ca028ef5be5e39fecab20c --seconds 15
+
+To execute later, root must additionally supply --execute, a NEW private --out, the actual --exe path of that verified v4 binary and --harness pointing to the copied frozen h6/h7 directory. The exact v4 path is intentionally not guessed here. Existing GPU processes or8080/8092 listeners cause refusal; the script will not stop an existing workload. No Nsight collection should run concurrently with timed A/B or incremental qualification.
+
+This helper's successful local checks do not establish real Nsight injection compatibility. A real report must still contain engine CUDA API/node data on the8cards. A15second diagnostic explains observed activity/gaps; it provides no uninstrumented performance improvement claim or GPU-saturation promise.

@@ -1,0 +1,63 @@
+Incremental v1 checkpoint fallback: independent read-only audit
+
+Observed failed run: final-qualification-v3-incremental-on-off1/01-on.
+engine.log270: seed prompt100006, reused0, output64, seven checkpoints.
+engine.log275: seed parked100071 tokens (do not equate held state with API usage).
+engine.log355: restored98304 tokens (checkpoint).
+engine.log356–357: reader from98304, tokens2548, four active slots,330 native BT
+before completion, read_ok1/pump_ok1.
+engine.log361: new prompt100859 = reused98304 + read2555, normal initial output.
+API first increment completed64 with finish length; prompt/cache/native counts
+agree. Old strict >=99k/~1k qualification correctly failed; this is not evidence
+of an engine read failure.
+
+Exact arithmetic: net prompt growth853; replayed old tail100006−98304=1702;
+actual read853+1702=2555. Reader2548 excludes the final short header/window7.
+98304 is12*8192 chunks AND6*16384 periodic checkpoint intervals; the engine
+default prompt_cache_every is16384, not8192 (generate.cpp948).
+
+Source anchors under /Users/fu/project/HAI/Strata-decode-head:
+include/strata/core/conversation_cache.hpp226–237 only accepts the ENTIRE saved
+state's ids as a strict shorter prefix of the incoming prompt. It cannot restore
+an arbitrary LCP halfway through recurrent/GDN state. best()306–319 compares
+live state and every available checkpoint and chooses the deepest valid one.
+src/program/generate.cpp12665–12688 saves periodic checkpoints at completed
+actual chunk boundaries;18059–18066 and18207–18209 additionally save the last
+turn boundary before the new assistant header.
+
+V1 appends words inside the original user message, before that user's im_end.
+The old near100k turn-boundary checkpoint thus no longer matches; the deepest
+older periodic checkpoint does. Reclassifying its2555 read as a1k read would be
+wrong. A separately declared branch-edit workload could accept expected98304
+with explicit replayed-tail accounting, but that is a different workload.
+
+Preferred agent-like v2: [original user, actual assistant content, new user],
+repeated cumulatively. Keep actual assistant output in bounded process memory
+and save hashes/counts only. This preserves the original user+closing marker
+and therefore the old turn-boundary checkpoint near100k, even if full live
+state cannot be reused. The observed7-token short header suggests the initial
+turn checkpoint near99999, but runtime native restored/cache counts must prove
+the value. Keep >=99k and actual fresh~1k gates rather than assuming success.
+
+Full-live token equality is not guaranteed: serve/chat_template.jinja108 trims
+message content,119–122 varies historical reasoning,158 writes im_end, and
+177–179 emits the new assistant empty-thinking prefix. Current model template
+is loaded separately (server.py10232+), so default-template source evidence
+is not a verification of the remote template. server.py5804–5818 renders and
+retokenizes messages. src/program/generate.cpp18858–18875 and19427–19452 commit
+a verify window before capping emitted outputs;19621 installs consumed state.
+The100071 held state versus100070 API total is consistent with extra committed
+window rows; no evidence permits calling that extra token an inserted EOS.
+
+No raw-token continuation route was found in public chat/messages handlers:
+server.py8316–8325 dispatches structured messages, _openai8621–8625 converts
+messages, and encode_prompt renders them. Count_tokens8885–8892 is stateless
+store=False. A v2 probe should count five initial bodies before generation and
+count each new actual conversation immediately before its injection. A/B must
+compare every resulting request hash, output hash, finish, actual usage/cache/
+fresh counts. Do not claim all eight dynamic request bodies existed before the
+run. No unknown assistant content may be invented.
+
+No engine, remote or GPU changes. Local default-template execution was not
+performed because system Python lacks jinja2; conclusions above are static
+source review plus the real numeric log/API evidence.

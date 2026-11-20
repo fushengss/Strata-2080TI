@@ -1,0 +1,81 @@
+Deployment helper implementation review and verification plan
+
+Current status: local implementation and CPU PASS; pending independent reviewer
+and both actual complete paired runs. No deployment execute, remote, service or
+GPU operation was performed. The helper is default dry-run.
+
+Approved mapping is explicit: freeze1a47c446... = v1 core8 only, freeze75a15bb3...
+= v2 incremental only. Each run must independently complete its own planned
+on/off pair, with complete parent and both arms, rc0 records in planned order,
+registered successful comparison and full suite proofs. The union must be
+exactly nine suites without overlap. Failed v1 incremental and partial arms
+cannot qualify. v2 extra template/client plan metadata is allowed; complete
+29-file frozen package including the template is verified exactly.
+
+Gates use explicit require, never assert. Runtime identities are fixed to engine
+45eaa612/libfb67bffc/basef752a214/server40c5e9df/calibrationb036e3ad. Exact frozen
+harness bytes, finite completion timestamps, actual mapped library and process
+flags, requested/serving8 slots, residency and owned3.80GiB prefill buffers,
+reader/source proofs, all19 comparison identity checks and all underlying suite
+results must pass. Full normalized configuration SHA must match across all four
+arms. Only CONCURRENT_MTP varies; PARK_OVERWRITE stays0. Manual performance
+acceptance remains outside the helper. Frozen-harness generated reports are
+validated; this does not independently recompute every raw output hash.
+
+CPU tests passed under normal Python and python -O: positive complete pair,
+positive two-pair union,32 negative cases (incompletion/identity/order/profile/
+source evidence/comparison failures, changed harness, missing/duplicate runs,
+cross-run config mismatch, rollback bytes and release replacement), private
+backup modes and immutable release publication. AST passes with0 assert nodes.
+All test paths are temporary synthetic fixtures; no actual config is read.
+
+Backup retains exact original bytes, exclusive0600 creation under corrected0700
+private parent and hash verification. New release files are verified temporary
+copies then exclusively published readonly0555; a differing existing release
+is refused. Config stays0600, fsynced then atomically replaced; parent directory
+is fsynced. Receipt destination is proven writable before replacement. Only exe
+and CONCURRENT_MTP change; parsed old/new normalization equality preserves all
+model/prefill/layers/authentication/server fields. Original helper is preserved
+as deploy_concurrent_prefill.py.pre-review. A post-replace receipt or service
+failure still requires operator rollback; config replacement is not health.
+
+Invocation requires repeated --qualified-run and --freeze in corresponding order:
+--qualified-run CORE_RUN --freeze incremental-harness-v1-freeze.json
+--qualified-run INCREMENTAL_RUN --freeze incremental-harness-v2-freeze.json
+--out NEW_RECEIPT_DIRECTORY
+Without --execute this prints the intended two-field change and requirements;
+it performs no network, GPU, service or configuration operations.
+
+Postdeployment checks (root performs; this document does not execute):
+1. Start the existing service with the same supervisor/arguments and private
+   configuration. Verify only exe+overlap differ from original parsed config,
+   base key/model/prefill/group/layer settings unchanged. Keep APIkey out oflogs.
+2. Identify exact owned engine PID and /proc/PID/exe -> new release/strata;
+   hash equals45eaa612...; /proc/PID/maps must show adjacent new-release
+   libstrata_kq.so and its contentfb67bffc... . Inspect actual process env for
+   CONCURRENT_MTP1, TARGET_HEAD1, ASYNC_SAMPLE0, MTP_HEAD1, batch/piped MTP1,
+   head GPUs2,4/3,5 and other fixed baseline values. PARK must be absent/off;
+   chosen45ea binary predates overwrite feature. Do not rebuild HEAD e0a93.
+3. Private authenticated status: loaded, requested=serving=8, no stray request
+   after smoke. Startup numeric evidence: all eight slot devices, all expert
+   pairs resident, per-card3.80GiB owned prompt buffers, unchanged split and
+   head routes. Startup flag alone does not establish actual overlap.
+4. Bounded owned correctness/routing smoke after baseline configuration health:
+   complete requests with normal usage/finish; include active peers+eligible
+   prompt so begin/end source lines prove actual overlap, read_ok1/pump_ok1,
+   positive strict in-read BT and dispatch_delta0. This is health/routing, not
+   another throughput A/B. Check engine CUDA errors and worker cleanup.
+5. Save only numeric health/process/hash/flag receipt, no prompts/outputs/keys.
+
+Rollback on startup/identity/health failure:
+- Stop only the new owned service/descendants using the existing supervisor;
+  ensure no owned engine remains before changing runtime config.
+- Verify private pre-concurrent-prefill.json has exact SHAf752a214... . Copy its
+  original bytes into same-directory0600 temp, flush+fsync, os.replace(BASE),
+  then fsync(BASE.parent). Verify BASE SHA equalsf752a214... (not reserialized
+  semantic equality). Keep backup and both immutable release directories.
+- Start original service; verify actual original executable from backup
+  (selected P1 engine8b27e040...), adjacentfb67bffc library, eight slots and
+  original flags/own prefill/residency. Record rollback health and final config
+  hash without exposing backup contents. Do not treat config replacement alone
+  as a restored healthy service.

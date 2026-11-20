@@ -1,0 +1,160 @@
+Concurrent prefill/decode priorities and bounded scheduling: source review
+2026-11-08; /Users/fu/project/HAI/Strata-decode-head HEAD bf5a8e5b24b1973efbae747a109f5a970b25e09d
+No source changes, builds, remote operations, or inference performed for this review.
+
+Conclusions
+===========
+STRATA_PIPED_CONCURRENT_PRIO=0 is an existing, numerically non-semantic stream
+creation choice, but is unlikely to be a strong fairness control on this exact
+PW_WITH_BATCH/pipelined-MTP setup. It does not lower the main batch graph launch
+stream, which is already default priority. There is no existing prefill-priority
+flag and no existing safe reader-phase pump duty-cycle setting.
+
+Making prefill high priority or refusing decode launch whenever its stage's
+prefill stream is busy can reintroduce prolonged decode silence. Neither
+establishes a bounded fairness contract. “Useful occupancy” is constrained by
+independent work and shared memory/PCIe/SM resources, not just priority values.
+The present numerical results must distinguish whole native prompt_ms from
+reader compute/transfer time before any remedy is selected.
+
+All relative source anchors below are under the absolute source root above.
+
+Exact PRIO behavior
+===================
+src/core/verify.cpp:1204-1210 reads CONCURRENT and CONCURRENT_MTP at stream
+creation. If either is nonzero and CONCURRENT_PRIO is absent/nonzero,
+make_stream requests highest device priority. With PRIO=0 it falls through to
+STRATA_GRAPH_PRIO's optional hierarchy, otherwise default priority (:1218-1225).
+The choice is static for the process and affects stream creation at startup,
+including verifiers that later handle solo work, not only a particular read.
+
+make_stream creates copy_ (:1240), cs_ only without ext_stream (:1244-1245), and
+sh_cs_ (:1246). side_/side2_ use make_stream only with GRAPH_PRIO enabled;
+otherwise they are default streams directly (:1296-1302).
+
+In this setup --pipeline-windows 2 + STRATA_PW_WITH_BATCH=1 is retained for the
+solo path (qualification-v3-on-off1/01-on/engine.log:17,183). At
+src/program/generate.cpp:11314-11334 it creates one DEFAULT nonblocking pl_stream
+per GPU and sets it on both parity verifiers. The primary verifier is also the
+one used by piped batch groups. Verifier::init therefore reuses that default
+external cs_ rather than creating a high-priority cs_.
+
+Additionally capture_batch and deferred save/commit instantiate their graphs
+without an explicit node-priority flag (verify.cpp:4050,4171,4242; default flags
+argument is zero). GRAPH_PRIO's explicit UseNodePriority handling at :2915-2917
+is in the ordinary window capture path. Thus changing the priority of a shared
+expert capture stream is not evidence that current batch graph kernels change
+their launch priority. The copy stream can differ, but all-resident batch_serve
+skips CPU expert-pool uploads. PRIO0 may have little active work to affect here.
+
+OFF (both concurrent flags zero) ignores CONCURRENT_PRIO's value. If legacy
+CONCURRENT were independently enabled, that exception must be included in an
+A/B manifest. Fix all other priority/node-priority/PW flags when comparing.
+
+Independent streams unaffected by CONCURRENT_PRIO:
+- MTP body: src/core/mtp.cpp:482-492 uses STRATA_MTP_PRIORITY, normally highest.
+- Shared MTP head shards: src/core/mtp_head.cpp:195-198 use MTP_PRIORITY too.
+- Selected P1 target head helper: src/core/decode_head.cpp:151 creates a default
+  nonblocking stream, independent of both priority settings.
+- Prefill stage compute: generate.cpp:5291 creates default main_stream and
+  :5804 creates default later-stage st.stream. sp.init receives those at
+  :11075/:11089. Prefill::Impl stores the passed stream at
+  src/prefill/prefill.cpp:1750, without overriding its priority.
+- Prefill copy/PLE/KV streams are separate defaults at prefill.cpp:1806,
+  :1909 and :3274. Helpers have their own streams and strict reader eligibility
+  excludes helper paths; this is not a general statement about every backend.
+
+MTP_PRIORITY=0 would be a more active existing resource-priority change, but it
+affects owner/slot drafters and head shards across all work, including OFF and
+solo decode. It needs its own matched correctness/C8/solo/mixed study. It is
+not a narrow reader-only switch and is not proposed as a free improvement.
+
+Existing scheduling controls
+============================
+The resident reader loop calls pump(true) whenever batch slots/inflight work
+exist (generate.cpp:17761-17767); it does not throttle launch by time or token
+budget. pump(false) is an existing internal operation that still advances
+already-started groups and commits but starts no new stage-0 group
+(:15218-15235). It is used by drain, not exposed as a reader fairness env.
+
+CONCURRENT_MIN (:17525-17530) chooses whether a whole read overlaps at all.
+Below the threshold it falls back to serial prefill and restores peer silence.
+CONCURRENT_UNPIN (:17596-17638) controls CPU placement; it is not GPU fairness.
+TEST_BELL_SLEEP_US (:17683-17701) delays doorbell service and is a diagnostic
+knob, not a defensible way to budget compute. The old READ_PIECE/DECODE_ONLY
+path changes the read/drain schedule and was already rejected on measurements.
+No existing bounded duty/cadence option was found in the piped pump/reader path.
+
+Prefill high-priority proposal: feasible code, no fairness guarantee
+================================================================
+There is no runtime setting for this today. Creating main_stream/st.stream with
+higher priority would be a small source change, but these streams also serve
+main-session initialization/solo paths; it is not purely a prefill-only API.
+A truly dedicated high-priority prefill stream needs ownership and producer/
+consumer ordering reviewed across callbacks, handoffs, checkpoints and draft
+prefill. Default/nonblocking stream mode and all event ordering must remain.
+
+Priority is not a quota. During long prefill, successive chunks can keep a
+stage's queue populated; preferential scheduling can defer its target windows
+until later chunks complete. A single held target stage delays every group
+behind it and MTP readiness for the next round. Therefore it can trade lower
+prefill time for longer peer gaps, including the behavior we are fixing.
+Independent high-priority MTP work still competes, and priority does not remove
+shared bandwidth or memory pressure. No zero-regression promise is justified.
+
+“Only fill idle stages” proposal: what would be needed
+====================================================
+Prefill exposes no cross-thread stage-busy/compute-complete getter today.
+Impl::cs is private. next_run_ and handoff events govern dependencies between
+prefill stages; they are not a safe existing public scheduler status API.
+run_impl has host gather/IO/staging intervals as well as GPU work, so an atomic
+bool covering the whole host run would falsely exclude useful GPU idle time.
+
+A CUDA stream query, if exposed, would only observe the work currently queued.
+The prefill host thread may enqueue its next kernel immediately after the query.
+It is therefore an advisory backoff signal, not proof that a decode body cannot
+overlap prefill. To enforce mutual exclusion requires a shared launch arbiter
+and complete stage-lifetime contract; merely checking an event is insufficient.
+
+Hard gating also risks starvation through many continuous chunks. An admitted
+decode group must keep making progress through later stages, commit, sampling,
+and MTP chains; blocking those while waiting for a quiet prefill stage can turn
+the pipeline into another long stop. Any gating needs an age/deadline escape.
+
+If a new bounded candidate is needed, the narrowest scheduler starting point is
+reader-phase admission control for NEW stage-0 groups only, using pump(may_start)
+while continuing all in-flight progress every iteration. A small configurable
+in-flight budget or injection interval, with round-robin groups and a hard age
+limit, could reduce competing decode work without repeated prefill drain or
+chunk changes. This is a design to measure, not an existing knob or guaranteed
+benefit. It trades decode rate/latency against prefill interference and requires
+route counts, per-peer max gaps and complete output correctness validation.
+
+Timing interpretation and next measurement
+==========================================
+Native prompt_ms starts at generate.cpp:16094, BEFORE park_current at
+:16435/:16450/:16456, and ends at :18233 after read/checkpoints/refill/head restore.
+It includes park and restore/setup cost; it is not isolated prefill computation.
+The initial input-line pipeline drain at :15459 is earlier and accounted
+separately. Native admission logs can provide read/window/checkpoint/other split
+at :19910-19913. read_id end.read_ms measures the actual concurrent worker
+window, and excludes the final drain in the strict overlap counter.
+
+Reducing park can improve native prompt_ms and API TTFT even if overlapping
+read itself is slower. Report that honestly. Conversely when the relevant
+park is much shorter than the observed increase, it cannot explain or offset
+all contention. Do not subtract a 1.34 s park from another request whose park
+was only a few hundred ms.
+
+Priority before new scheduling code:
+1. Complete current paired exact/gap/TTFT/whole-run and 100k measurements.
+2. Separate diagnostic PARK_TRACE (and phase timeline where available) to
+   identify resize/copy/checkpoint/sync cost in the particular admission.
+3. Independently test the small default-off overwrite candidate, if trace
+   supports the duplicated-zero-fill opportunity. Keep prefill geometry fixed.
+4. If contention remains material, measure a bounded stage-0 injection policy
+   or separate matched MTP-priority experiment. Do not use a weak PRIO0 result
+   to infer that all GPU scheduling alternatives were tested.
+5. A 4096 vs 8192 prefill chunk comparison changes fill/drain and GEMM efficiency;
+   it is a separate experiment, not a free scheduling fix. Keep layer split
+   unchanged and rerun solo/mixed prefill controls if such tuning is authorized.

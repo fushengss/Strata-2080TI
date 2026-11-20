@@ -1,0 +1,220 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 62d54360..0c689710 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -819,6 +819,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     target_link_libraries(conversation_snapshot_test PRIVATE strata_engine)
+     add_test(NAME conversation_snapshot_test COMMAND conversation_snapshot_test)
+     set_tests_properties(conversation_snapshot_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
++    add_test(NAME conversation_snapshot_test_overwrite COMMAND conversation_snapshot_test)
++    set_tests_properties(conversation_snapshot_test_overwrite PROPERTIES
++      ENVIRONMENT "STRATA_PARK_OVERWRITE=1;STRATA_PARK_ASYNC=0;STRATA_CKPT_ASYNC=0" SKIP_RETURN_CODE 77 TIMEOUT 120)
+     # the same test with a GDN state over 1 MiB and the opt-in background checkpoint copy (STRATA_CKPT_ASYNC=1), alone and with
+     # recent states kept in VRAM (STRATA_CKPT_VRAM_SLOTS): every checkpoint, capture and restore must give the same bytes
+     add_test(NAME conversation_snapshot_test_ckpt_async COMMAND conversation_snapshot_test)
+@@ -841,6 +844,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+       target_link_libraries(conversation_transfer_test PRIVATE strata_engine)
+       add_test(NAME conversation_transfer_test COMMAND conversation_transfer_test)
+       set_tests_properties(conversation_transfer_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
++      add_test(NAME conversation_transfer_test_overwrite COMMAND conversation_transfer_test)
++      set_tests_properties(conversation_transfer_test_overwrite PROPERTIES
++        ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;STRATA_PARK_OVERWRITE=1;STRATA_PARK_ASYNC=0;STRATA_CKPT_ASYNC=0" TIMEOUT 120)
+     endif()
+   endif()
+ 
+diff --git a/docs/CONCURRENT_MTP_READ.md b/docs/CONCURRENT_MTP_READ.md
+index e4ec3a7b..b935976d 100644
+--- a/docs/CONCURRENT_MTP_READ.md
++++ b/docs/CONCURRENT_MTP_READ.md
+@@ -9,9 +9,12 @@ decode-budget pieces. This candidate has no measured performance claim yet.
+ This flag is sufficient to request the path; `STRATA_PIPED_CONCURRENT` and
+ `STRATA_PIPED_READ_PIECE` are not required. The existing
+ `STRATA_PIPED_CONCURRENT_MIN`, `_PRIO`, and `_UNPIN` controls still apply.
+-Verifier streams request high priority unless `_PRIO=0`. GPU stream priority
+-does not guarantee preemption or latency; solo and mixed prefill performance
+-must both be measured.
++Verifier-owned streams request high priority unless `_PRIO=0`. An externally
++supplied pipeline stream keeps its original priority: with `--pipeline-windows
++2`, the main verifier graphs use those default-priority streams. MTP and output
++head streams have their own creation rules. GPU stream priority does not
++guarantee preemption or latency; solo and mixed prefill performance must both
++be measured.
+ 
+ ## Eligibility and lifetime
+ 
+@@ -106,3 +109,26 @@ describe their individual states. An `end` line alone does not prove that
+ the final drain, admission, or request completed successfully. Validation
+ must also check completed outputs and usage, cancellation and slot reuse,
+ absence of engine errors, solo 100k prefill, and mixed-stream output gaps.
++
++## Synchronous snapshot buffer experiment
++
++`STRATA_PARK_OVERWRITE=1` separately opts into allocating synchronous K/V
++snapshot buffers without first clearing bytes that the following transfer
++overwrites. It is off by default. Before growing a buffer, the snapshot path
++checks that the reusable prefix fits the old buffer; all bytes after that
++prefix are copied before the image can be published. A failed transfer leaves
++the caller's output image unchanged. Streams, synchronization and snapshot
++ownership remain the same.
++
++This applies to all synchronous `conversation_kv_save` callers, including the
++temporary K/V images used when moving MTP state between the main session and a
++slot. It does not change the existing asynchronous park paths or remove
++checkpoint copies. The overwrite variant therefore needs the same output,
++cancellation, slot reuse and yield/resume validation as the reader experiment.
++
++With `STRATA_PARK_TRACE`, `overwrite_added_bytes` counts new bytes allocated by
++this path in the current stage's main-layer K/V saves. The trace is printed
++before the draft-layer save, so it is not the complete park's byte count.
++Removing a clear can move first-touch page faults into the subsequent copy;
++the old resize time is not a prediction of time saved. Compare complete park
++time and end-to-end request latency on the same hardware and workload.
+diff --git a/src/core/conversation_snapshot.cpp b/src/core/conversation_snapshot.cpp
+index 0e4c440b..9b5adf7d 100644
+--- a/src/core/conversation_snapshot.cpp
++++ b/src/core/conversation_snapshot.cpp
+@@ -248,13 +248,27 @@ bool on_device(const void* p) {
+ }
+ // STRATA_PARK_TRACE: where conversation_kv_save's time goes since the park's begin (ms): the pointer-attribute
+ // queries, the host buffer resizes and the copies (into the stage, or the synchronous ones).  Read by the park trace.
+-struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; };
++struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; size_t overwrite_added = 0; };
+ KvSaveTrace& kv_save_trace() { static KvSaveTrace t; return t; }
+ bool park_trace_on() {
+     static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr;
+     return on;
+ }
+ 
++// Opt-in A/B: synchronous saves overwrite every added byte, too. The caller has
++// checked keep <= the old size; only [keep, n) is copied, preserving its prefix.
++// On transfer failure snapshot_save discards its local captured image.
++bool park_overwrite_on() {
++    static const bool on = [] { const char* v = std::getenv("STRATA_PARK_OVERWRITE"); return v != nullptr && v[0] == '1'; }();
++    return on;
++}
++void resize_snapshot_part(ConversationBuffer& out, size_t n) {
++    if (!park_overwrite_on()) { out.resize(n); return; }
++    const size_t added = n > out.size() ? n - out.size() : 0;
++    out.resize_for_overwrite(n);
++    if (park_trace_on()) kv_save_trace().overwrite_added += added;
++}
++
+ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
+     if (!n) return true;
+     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
+@@ -339,7 +353,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
+                             return true;
+                         })) return false;
+                 } else {
+-                    dst[i]->resize(sizes[i]);
++                    resize_snapshot_part(*dst[i], sizes[i]);
+                     if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
+                             return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                         })) return false;
+@@ -358,7 +372,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
+                             (st.kv_mode == 0 || on_device(src[i]));
+         const auto t1 = tick();
+         if (staged) dst[i]->resize_for_overwrite(sizes[i]);
+-        else dst[i]->resize(sizes[i]);
++        else resize_snapshot_part(*dst[i], sizes[i]);
+         const auto t2 = tick();
+         const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
+                 const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
+@@ -587,9 +601,10 @@ void conversation_park_join() {
+     }
+ }
+ 
+-void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms) {
++void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms, size_t& overwrite_added) {
+     const KvSaveTrace& t = kv_save_trace();
+     attrs_ms = t.attrs; resize_ms = t.resize; copy_ms = t.copy;
++    overwrite_added = t.overwrite_added;
+ }
+ 
+ bool conversation_park_async_begin(size_t need) {
+diff --git a/src/core/conversation_state.cpp b/src/core/conversation_state.cpp
+index b02f066a..17508ef4 100644
+--- a/src/core/conversation_state.cpp
++++ b/src/core/conversation_state.cpp
+@@ -512,7 +512,7 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
+ }
+ 
+ // (conversation_snapshot.cpp) STRATA_PARK_TRACE: conversation_kv_save's time since the park's begin, by part (ms)
+-void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms);
++void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms, size_t& overwrite_added);
+ 
+ bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
+                                 const SessionState& ss, const ModelGeometry& g,
+@@ -587,11 +587,12 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
+         size_t kvb = 0;
+         for (const auto& k : captured.kv) kvb += k.bytes();
+         double attrs_ms = 0, resize_ms = 0, copy_ms = 0;
+-        conversation_kv_save_trace(attrs_ms, resize_ms, copy_ms);   // (the main layers' saves above)
++        size_t overwrite_added = 0;
++        conversation_kv_save_trace(attrs_ms, resize_ms, copy_ms, overwrite_added);   // (the main layers' saves above)
+         std::fprintf(stderr, "strata parktrace: joins %.1f ms, sync %.1f ms, %zu checkpoints copied %.1f ms, live state %.1f ms, "
+-                             "begin %.1f ms, K/V %zu MB %.1f ms (layer max %.2f, sum %.2f; attrs %.2f, resize %.2f, copy %.2f)\n",
++                             "begin %.1f ms, K/V %zu MB %.1f ms (layer max %.2f, sum %.2f; attrs %.2f, resize %.2f, copy %.2f; overwrite_added_bytes %zu)\n",
+                      ms(pj, p0), ms(p0, p1), captured.checkpoints.size(), ms(p1, p2), ms(p2, p3), ms(p3, p4), kvb >> 20,
+-                     ms(p4, now()), kv_max, kv_sum, attrs_ms, resize_ms, copy_ms);
++                     ms(p4, now()), kv_max, kv_sum, attrs_ms, resize_ms, copy_ms, overwrite_added);
+     }
+     // The draft's final cell may not have been computed when the output cap was
+     // reached. Refresh that page even when the main prefix continued unchanged.
+diff --git a/src/core/conversation_validation_test.cpp b/src/core/conversation_validation_test.cpp
+index c670ef13..a152f5e6 100644
+--- a/src/core/conversation_validation_test.cpp
++++ b/src/core/conversation_validation_test.cpp
+@@ -215,6 +215,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
+     SavedConversation full,incremental;
+     check(conversation_snapshot_save(full,view,ss,g,draft.st,error), "full capture through host transfer backend");
+     const size_t full_copies = copied_bytes;
++    const int full_copy_calls = copy_calls;
+     ConversationKvReuse reuse{full.kv,9,9};
+     size_t peak = 0, reused = 0;
+     check(conversation_snapshot_capture_bytes(reuse,view,ss,g,draft.st,peak,error), "incremental capture admission without transfers");
+@@ -238,6 +239,44 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
+     SavedConversation unpublished;
+     check(!conversation_snapshot_save(unpublished,view,ss,g,draft.st,error,std::move(reuse)), "incremental capture copy failure is reported");
+     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
++    // No-zero-fill capture must preserve a kept prefix and overwrite every new
++    // byte, whether an existing image shrinks, stays the same size, or grows.
++    reset();
++    const std::vector<ConversationImageKey> no_images;
++    const std::vector<ConversationCheckpoint> no_checkpoints;
++    for (int64_t tokens : {1,5,9,17,65}) {
++        std::vector<int32_t> ids((size_t) tokens);
++        for (int64_t i=0;i<tokens;++i) ids[(size_t) i]=(int32_t) i+1;
++        const ConversationView changed{ids,no_images,no_checkpoints,true};
++        SavedConversation fresh,kept;
++        check(conversation_snapshot_save(fresh,changed,ss,g,draft.st,error), "fresh extent capture");
++        ConversationKvReuse retained{full.kv,9,std::min<int64_t>(9,tokens)};
++        check(conversation_snapshot_save(kept,changed,ss,g,draft.st,error,std::move(retained)),
++              "retained capture after shrink, same extent or growth");
++        check(kept.kv.size()==fresh.kv.size(), "retained extent has every K/V layer");
++        for (size_t i=0;i<fresh.kv.size();++i)
++            check(kept.kv[i].k==fresh.kv[i].k && kept.kv[i].v==fresh.kv[i].v &&
++                  kept.kv[i].k_scale==fresh.kv[i].k_scale && kept.kv[i].v_scale==fresh.kv[i].v_scale &&
++                  kept.kv[i].pooled==fresh.kv[i].pooled, "every retained/new byte equals a fresh capture");
++    }
++    // Sweep past the running-state copies into every K/V transfer. A failed
++    // capture must leave even an existing output object entirely unpublished.
++    for (int at=1;at<=full_copy_calls;++at) {
++        reset(); fail_copy=at;
++        SavedConversation sentinel;
++        sentinel.live.ids={-7};
++        check(!conversation_snapshot_save(sentinel,view,ss,g,draft.st,error), "each capture transfer failure is reported");
++        check(sentinel.live.ids==std::vector<int32_t>{-7} && sentinel.kv.empty() && sentinel.live.gdn.empty(),
++              "partial copy never replaces the caller's image");
++    }
++    reset();
++    QsaState missing=draft.st;
++    missing.k_pool=nullptr; missing.k_q=nullptr; missing.k_q4=nullptr;
++    SavedConversation sentinel;
++    sentinel.live.ids={-7};
++    check(!conversation_snapshot_save(sentinel,view,ss,g,missing,error), "missing source fails after local allocation");
++    check(sentinel.live.ids==std::vector<int32_t>{-7} && sentinel.kv.empty() && sentinel.live.gdn.empty(),
++          "missing source cannot publish an unwritten K/V buffer");
+ #endif
+ }
+ }

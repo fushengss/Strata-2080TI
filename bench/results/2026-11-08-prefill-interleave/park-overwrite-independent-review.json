@@ -1,0 +1,25 @@
+{
+  "scope": "Independent static review only; unapplied patch against clean bf5a8e5b24b1973efbae747a109f5a970b25e09d. No source/remote/GPU mutation.",
+  "patch_sha256": "3bd93d01522dbefea675362fb8a4963d282c6389ff8f9e606588f1c5085b1032",
+  "outcome": "PASS_FOR_APPLY_BUILD_AND_CORRECTNESS_QUALIFICATION",
+  "blocking_findings": [],
+  "checks": {
+    "git_apply_check_returncode": 0,
+    "keep_within_old_and_new_extents": true,
+    "all_new_bytes_in_synchronous_copy_interval": true,
+    "snapshot_publication_after_all_success": true,
+    "known_direct_kv_save_callers_fail_before_restore": true,
+    "default_off_original_resize": true,
+    "sync_stream_lifetime_unchanged": true,
+    "host_failure_sweep_covers_baseline_full_capture_calls": true
+  },
+  "runtime_tests_run_by_reviewer": false,
+  "scope_note": "Flag affects synchronous conversation_kv_save generally, including main<->slot MTP temporary captures even with direct slot copying, not only parked ConversationCache images.",
+  "required_followups": [
+    "Compile actual CUDA targets and run host transfer/validation off/on variants.",
+    "Run GPU snapshot off/on byte parity across supported formats and streamed/ring cases.",
+    "Real engine cache continuation, cancel/recovery, BYIELD and long-context output parity before deployment.",
+    "Compare full park/admission and finite mixed outcome, not resize time alone; omitted zero-fill can move first page touches into copy."
+  ],
+  "trace_interpretation": "overwrite_added_bytes counts logical growth bytes whose explicit initialization is skipped, not copy bytes avoided, GPU traffic, elapsed savings or full process memory allocation. Existing trace covers main KV before draft KV save."
+}

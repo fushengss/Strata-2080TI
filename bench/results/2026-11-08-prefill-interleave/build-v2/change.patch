@@ -1,0 +1,570 @@
+diff --git a/docs/CONCURRENT_MTP_READ.md b/docs/CONCURRENT_MTP_READ.md
+new file mode 100644
+index 00000000..fff93115
+--- /dev/null
++++ b/docs/CONCURRENT_MTP_READ.md
+@@ -0,0 +1,95 @@
++# Concurrent prompt reads with piped MTP
++
++`STRATA_PIPED_CONCURRENT_MTP=1` is an experimental, default-off extension of
++the piped reader. A prompt runs on its existing prefill streams while the
++host continues to pump decoding slot groups. The prefill layer split and
++planned chunk geometry stay the same. A read is not divided into additional
++decode-budget pieces. This candidate has no measured performance claim yet.
++
++This flag is sufficient to request the path; `STRATA_PIPED_CONCURRENT` and
++`STRATA_PIPED_READ_PIECE` are not required. The existing
++`STRATA_PIPED_CONCURRENT_MIN`, `_PRIO`, and `_UNPIN` controls still apply.
++Verifier streams request high priority unless `_PRIO=0`. GPU stream priority
++does not guarantee preemption or latency; solo and mixed prefill performance
++must both be measured.
++
++## Eligibility and lifetime
++
++Each prompt part checks the live state after the normal pipeline drain:
++
++- CUDA, deferred-commit piped MTP, and `STRATA_SPLIT_MTP_BATCH=1`.
++- At least one active decoding slot. A solo prompt uses the existing path.
++- Every prefill stage owns its prompt region, with no borrowed buffers,
++  borrowed spill, active MTP room, or outstanding expert-cache loan.
++- Every verifier stage reports all experts resident, the host residency
++  table agrees, and the main drafter's expert weights remain resident.
++- No pending tier change, asynchronous tier worker, KV growth, peer path,
++  helper expert cache, remote expert work, or Foresight swap space.
++- One text prompt. Images and co-reads use the existing path.
++- A PLE stage with a native quantized key and no BF16 key uses the serial
++  path: that key's quantization scratch belongs to the shared weight table.
++- The old source restrictions remain: no prefill helper, DMA doorbell,
++  staging/recycled source buffers, or unknown source type.
++
++A failed check prints a fallback reason and uses the existing serial path.
++Before starting the reader, the host reserves the drafter's input records,
++the prompt upload rings, and the prompt MMQ contexts. A pinned reservation
++failure also falls back; it does not start a concurrent read. The prompt
++gets its own PLE fallback scratch, since the verifier uses the main session's
++PLE scratch. The fallback PLE kernels and arithmetic remain unchanged.
++
++These preparations do **not** reserve every internal MMQ/GEMM allocation.
++First-use or larger-shape workspaces and weight conversions may still cause
++device barriers. Cold first use, subsequent admissions, and small tails must
++be validated separately.
++
++## Why the prepared PLE flag is published early
++
++An all-resident batch graph can still wait for the mapped PLE-ready flag.
++Previously, the host set its `b_running_` flag only after launching the body,
++save, and head work. A concurrent reader's allocation barrier could block
++one of those CUDA calls while the body waited for PLE. The doorbell thread
++saw `b_running_ == false`, so it could not release that wait.
++
++Only during the new mode's external serving, and only for a resident PLE
++stage, `stage_batch` publishes the ready flag after its actual gather and
++flag reset, with the existing CPU/store fences, before any body launch.
++`b_running_` is still published at its original point. Nonresident expert
++waits and the default batch path are unchanged. Batch graphs do not use the
++solo inter-stage mapped handoff wait. Head and draft event waits retain their
++producer-before-consumer enqueue order.
++
++The reader is joined on normal, failure, and yield exits before its stop
++hook is removed. The doorbell owner then joins its thread and returns
++external serving to the normal pump. `BSTOP` marks a slot to stop; it does
++not promise to abort an in-progress prefill immediately. `BYIELD` retains
++the existing chunk-boundary behavior.
++
++## Runtime evidence
++
++The startup line reports that the flag was requested, not that an eligible
++read ran. Actual reads print paired `strata piped concurrent MTP: begin` and
++`end` lines with a monotonic `read_id` within that engine process. A rejected
++read prints `fallback ... reason=...`.
++
++`begin` includes the token interval (`from`, `tokens`), planned chunk,
++active-slot count, and owned/resident stage counts. Prompt parts can end at
++checkpoints; the final prompt token is normally handled by the first decode
++window. Do not equate one `tokens` field with the API's full prompt count.
++
++`end.read_ms` measures the reader's `Prefill::run` wall time, before the final
++decode drain. `decode_rows_before_done` is a conservative count of emitted
++native `BT` output tokens, including an emitted termination token: pumping
++starts only after the reader-start publication, and
++only a completed pump observed before the reader's done publication is
++counted. The ambiguous last pump and final drain are excluded. This count
++proves output progress during the read; it is not verification rows, a count
++of accepted drafts alone, API content tokens, or GPU occupancy. The old
++“decoded meanwhile” line includes the drain and is not this
++strict measure.
++
++`read_ok`, `pump_ok`, `stopped_at`, `admit_stop_requested`, and `yield_slot`
++describe their individual states. An `end` line alone does not prove that
++the final drain, admission, or request completed successfully. Validation
++must also check completed outputs and usage, cancellation and slot reuse,
++absence of engine errors, solo 100k prefill, and mixed-stream output gaps.
+diff --git a/include/strata/core/mtp.hpp b/include/strata/core/mtp.hpp
+index 66393cf1..09659971 100644
+--- a/include/strata/core/mtp.hpp
++++ b/include/strata/core/mtp.hpp
+@@ -123,7 +123,8 @@ public:
+     /// A prompt read beside running batch windows (STRATA_PIPED_CONCURRENT): the prompt pass's graphs captured and its
+     /// input records sized for chunks of up to n rows now, with nothing in flight.  On the read's thread a capture or
+     /// a free waits for the device, whose windows wait for the main thread's doorbell service (#31).
+-    bool reserve_prefill(int64_t n, std::string& err);
++    /// strict_uploads: a pinned-ring reservation failure returns false instead of the legacy warning and retry.
++    bool reserve_prefill(int64_t n, std::string& err, bool strict_uploads = false);
+     cudaStream_t stream() const { return cs_; }
+ 
+     /// Successful producer result, including a generated row that failed admission.
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 80a7006f..3cb36831 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -85,6 +85,11 @@ public:
+     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
+     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+     int64_t chunk() const;
++    /// Actual storage, not a configuration hint: concurrent resident decode must not read borrowed expert slots.
++    bool owns_prompt_buffers() const;
++    /// Reserve known pinned uploads and private PLE fallback scratch, and create MMQ contexts while decode is drained. MMQ/GEMM may still
++    /// grow internal workspaces lazily; callers must not leave GPU work waiting for an unpublished host flag.
++    bool prepare_concurrent_read(int64_t rows, std::string& err);
+ 
+     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
+     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
+diff --git a/include/strata/program/batch_read.hpp b/include/strata/program/batch_read.hpp
+index 8b417778..b209819f 100644
+--- a/include/strata/program/batch_read.hpp
++++ b/include/strata/program/batch_read.hpp
+@@ -30,7 +30,7 @@ inline int64_t batch_read_piece(bool batch, bool piped, bool layer_split, bool b
+ /// What a configuration has that keeps the concurrent read (STRATA_PIPED_CONCURRENT=1) off.
+ struct ConcurrentReadSetup {
+     bool prefill_help = false;      ///< STRATA_PREFILL_HELP: the idle stage's help allocates on the read's thread
+-    bool split_mtp_batch = false;   ///< STRATA_SPLIT_MTP_BATCH: the batched draft K/V frees there (a free waits)
++    bool split_mtp_batch = false;   ///< legacy path excludes STRATA_SPLIT_MTP_BATCH; the resident extension checks it separately
+     bool fs_slots = false;          ///< STRATA_FS_SLOTS (Foresight swap space): serving a doorbell makes a CUDA call
+     bool pcie_dma = false;          ///< --pcie-mode dma: the same (its copies)
+     bool helper_caches = false;     ///< --expert-cache-device1..3 (and --remote-expert-opt on them), a prompt source of
+@@ -53,6 +53,31 @@ inline const char* concurrent_read_off(const ConcurrentReadSetup& s) {
+     return nullptr;
+ }
+ 
++/// STRATA_PIPED_CONCURRENT_MTP: each read rechecks live ownership/residency, after the existing pipeline drain.
++/// The old concurrent-read configuration guards remain in force; only its split-MTP restriction may be bypassed
++/// after these checks. CUDA allocations can still introduce barriers, so prepared batch PLE must be published
++/// before launching a resident graph, rather than by a later host service call.
++struct ResidentConcurrentReadSetup {
++    bool cuda_backend = false, piped_mtp = false, split_mtp_batch = false, active_slots = false;
++    bool private_buffers = false, all_resident = false, no_loans = false, draft_resident = false;
++    bool stable_tier = false, text_only = false, single_prompt = false;
++};
++
++inline const char* resident_concurrent_read_off(const ResidentConcurrentReadSetup& s) {
++    if (!s.cuda_backend) return "backend";
++    if (!s.piped_mtp) return "not_piped_mtp";
++    if (!s.split_mtp_batch) return "split_mtp_disabled";
++    if (!s.active_slots) return "no_active_slots";
++    if (!s.private_buffers) return "shared_prompt_buffers";
++    if (!s.all_resident) return "nonresident_stage";
++    if (!s.no_loans) return "active_loan";
++    if (!s.draft_resident) return "draft_weights_not_resident";
++    if (!s.stable_tier) return "mutable_tier_or_kv";
++    if (!s.text_only) return "image_input";
++    if (!s.single_prompt) return "co_read";
++    return nullptr;
++}
++
+ /// Tokens of the next piece of a prompt read on the pipelined slot groups (--batch-groups > 1 on a layer split, #1906),
+ /// or 0 for "the whole rest in one run" (the opt-in is off).
+ ///   piece_tokens: STRATA_PIPED_READ_PIECE, rounded down to whole chunks (at least one, at most kPipedMaxChunks)
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index 07b7ef1d..31d143d4 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -1576,7 +1576,7 @@ static bool prefill_per_group_sync() {
+     return v;
+ }
+ 
+-bool MtpDrafter::reserve_prefill(int64_t n, std::string& err) {
++bool MtpDrafter::reserve_prefill(int64_t n, std::string& err, bool strict_uploads) {
+     const OnDevice on_device(device_);
+     if (prefill_per_group_sync()) {
+         for (int T = 1; T <= max_t_; ++T)
+@@ -1588,9 +1588,14 @@ bool MtpDrafter::reserve_prefill(int64_t n, std::string& err) {
+     if (n <= 0) return true;
+     // the records' pinned upload slots too (#1996's ring grows a slot at its first larger upload: a pinned free and
+     // allocation, which take the driver's lock)
+-    if (!pf_ring_.reserve((size_t) (n * per_row) * sizeof(int32_t)))
++    if (!pf_ring_.reserve((size_t) (n * per_row) * sizeof(int32_t))) {
++        if (strict_uploads) {
++            err = "mtp prefill: the pinned input records could not be reserved";
++            return false;
++        }
+         std::fprintf(stderr, "strata mtp: the prompt records' pinned upload slots could not be reserved (they grow at "
+                              "first use)\n");
++    }
+     if (pf_cap_ >= n * per_row) return true;
+     if (pf_dev_) cudaFree(pf_dev_);
+     pf_dev_ = nullptr;
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index ca089edd..06d9e21e 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -1203,8 +1203,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+ #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+         static const bool hi = [] {   // (STRATA_PIPED_CONCURRENT_PRIO=0: the default priority)
+             const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
++            const char* m = std::getenv("STRATA_PIPED_CONCURRENT_MTP");
+             const char* p = std::getenv("STRATA_PIPED_CONCURRENT_PRIO");
+-            return v != nullptr && std::atoi(v) != 0 && (p == nullptr || std::atoi(p) != 0);
++            return ((v != nullptr && std::atoi(v) != 0) || (m != nullptr && std::atoi(m) != 0)) &&
++                   (p == nullptr || std::atoi(p) != 0);
+         }();
+         int lo = 0, top = 0;
+         if (hi) {
+@@ -4684,6 +4686,18 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
+     *(volatile uint32_t*) h_flagA_ = 0;
+     *(volatile uint32_t*) h_flagB_ = 0;
+     std::atomic_thread_fence(std::memory_order_seq_cst);
++    // The resident concurrent reader can allocate a lazy MMQ/GEMM workspace. A device-wide allocation barrier
++    // must not wait for a graph whose PLE flag would only be raised after another CUDA launch returns and sets
++    // b_running_. stage_batch has already gathered every PLE row above; publish that prepared data before the
++    // first graph launch. Do not publish b_running_ early or change nonresident/default batch behavior.
++    static const bool concurrent_mtp = [] {
++        const char* v = std::getenv("STRATA_PIPED_CONCURRENT_MTP");
++        return v != nullptr && std::atoi(v) != 0;
++    }();
++    if (concurrent_mtp && ext_serve_.load(std::memory_order_acquire) && ar_on() && ss_->ple.ready() && ple_stage()) {
++        strata_store_fence();
++        *(volatile uint32_t*) h_flag_ = 1;
++    }
+     last_t_ = S;
+     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
+     row_base_ = hbase;   // the graphs' key (and nothing else) reads it until the next stage_batch
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 94307557..8d62a7f4 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -1228,6 +1228,7 @@ struct Prefill::Impl {
+     cudaStream_t ple_copy = nullptr;         // STRATA_PLE_COPY_STREAM: the raw rows' upload stream (null: on cs)
+     cudaEvent_t ple_raw_free = nullptr;      // cs has dequantized ple_raw_dev: the next chunk's upload may overwrite it
+     float* ple_norm = nullptr;
++    void* concurrent_ple_scratch = nullptr;  // opt-in reads: the verifier still uses ss.ple.scratch
+     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
+     uint64_t region_bytes = 0;
+     PrefillStats* stats = nullptr;
+@@ -1392,6 +1393,10 @@ void Prefill::release() {
+     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
+     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
+     if (impl_->lm.dev) cudaFree(impl_->lm.dev);
++    if (impl_->concurrent_ple_scratch) {
++        cudaFree(impl_->concurrent_ple_scratch);
++        impl_->concurrent_ple_scratch = nullptr;
++    }
+     if (impl_->lm.R_host) cudaFreeHost(impl_->lm.R_host);
+     if (impl_->lm.tab_host) cudaFreeHost(impl_->lm.tab_host);
+     if (impl_->lm.idsw_host) cudaFreeHost(impl_->lm.idsw_host);
+@@ -4024,7 +4029,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                     po.result = m.R + t * D;
+                     try {
+                         strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple.hist, ss.ple.w, po,
+-                                                   ss.ple.scratch, m.cs);
++                                                   m.concurrent_ple_scratch ? m.concurrent_ple_scratch : ss.ple.scratch, m.cs);
+                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
+                     strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
+                 }
+@@ -7483,7 +7488,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+                         po.result = m.R + t * D;
+                         try {
+                             strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ssp->ple_hist, m.ss->ple.w, po,
+-                                                       m.ss->ple.scratch, cs);
++                                                       m.concurrent_ple_scratch ? m.concurrent_ple_scratch : m.ss->ple.scratch, cs);
+                         } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
+                         strata::kernels::ple_history_advance(ssp->ple_hist, m.ple_norm, cs);
+                     }
+@@ -7832,6 +7837,51 @@ bool Prefill::drain_pipeline(std::string& err) {
+     return ok;
+ }
+ 
++bool Prefill::owns_prompt_buffers() const {
++    return impl_ != nullptr && impl_->region != nullptr && !impl_->borrowed && !impl_->borrow_spill &&
++           !ring_room_active_;
++}
++
++bool Prefill::prepare_concurrent_read(int64_t T, std::string& err) {
++    if (!owns_prompt_buffers() || T <= 0) {
++        err = "prefill: concurrent read needs private prompt buffers";
++        return false;
++    }
++    for (Prefill* p = this; p != nullptr; p = p->next_) {
++        if (!p->owns_prompt_buffers()) { err = "prefill: a stage does not own its prompt buffers"; return false; }
++        const Impl& m = *p->impl_;
++        // ple_block's native-key path also writes PleWeights::key_native_q8_1, which belongs to the shared
++        // weight table. Isolating the ordinary PLE scratch is not enough for that route. Keep it serial.
++        if (m.ss->ple.ready() && p->stage_lb_ <= 1 && (p->stage_le_ < 0 || p->stage_le_ > 1) &&
++            m.ss->ple.w.key_bf16 == nullptr && m.ss->ple.w.key_native_data != nullptr) {
++            err = "prefill: the native PLE key shares quantization scratch with decode";
++            return false;
++        }
++    }
++    if (!reserve_uploads(T)) {
++        err = "prefill: concurrent read upload reservation failed";
++        return false;
++    }
++    try {
++        for (Prefill* p = this; p != nullptr; p = p->next_) {
++            Impl& m = *p->impl_;
++            const core::OnDevice on_device(m.device);
++            if (m.ss->ple.ready() && p->stage_lb_ <= 1 && (p->stage_le_ < 0 || p->stage_le_ > 1) &&
++                !m.concurrent_ple_scratch &&
++                cudaMalloc(&m.concurrent_ple_scratch, strata::kernels::ple_block_scratch_bytes()) != cudaSuccess) {
++                (void) cudaGetLastError();
++                err = "prefill: concurrent read PLE scratch reservation failed";
++                return false;
++            }
++            if (mmq::built() && !m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
++        }
++    } catch (const std::exception&) {
++        err = "prefill: concurrent read MMQ context preparation failed";
++        return false;
++    }
++    return true;
++}
++
+ bool Prefill::reserve_uploads(int64_t T) {
+     bool ok = true;
+     if (impl_ != nullptr && T > 0) {
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index a00e265d..22714d9c 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -6828,6 +6828,10 @@ int main(int argc, char** argv) {
+     // each stage commits a group's window once the last stage has judged its proposals
+     // (Verifier::batch_launch_rows / batch_commit_rows)
+     bool piped_mtp = batch_mtp && !stages.empty() && batch_groups_for(true).mtp_piped;   // (final once the slots that fit are known, below)
++    const bool piped_concurrent_mtp = [] {
++        const char* v = std::getenv("STRATA_PIPED_CONCURRENT_MTP");
++        return v != nullptr && std::atoi(v) != 0;
++    }();
+     const bool piped_mtp_observe = [] {
+         const char* v = std::getenv("STRATA_PIPED_MTP_OBSERVE");
+         return v != nullptr && std::atoi(v) != 0;
+@@ -14841,6 +14845,10 @@ int main(int argc, char** argv) {
+         const int pmtp_rows_per_group = GS * pmtp_rows_per_slot;    // the group's slots
+         const bool pmtp = piped && piped_mtp && ver.deferred_commit_on() &&
+                           pmtp_rows_per_group <= batch_max_t();
++        if (piped_concurrent_mtp)
++            std::fprintf(stderr, "strata serve: STRATA_PIPED_CONCURRENT_MTP: enabled; resident own-buffer whole reads; "
++                                 "prepared PLE published before batch launch\n");
++        uint64_t concurrent_mtp_read_id = 0;
+         if (piped_mtp_head && !pmtp) {
+             std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP_HEAD requires the deferred-commit piped route\n");
+             return 1;
+@@ -17480,22 +17488,25 @@ int main(int argc, char** argv) {
+                 // them missing and compute those experts on the CPU, as between pieces.  A BYIELD ends the run at
+                 // its next chunk (Prefill::stop_at_chunk): the pipeline is drained there and the part read gives
+                 // way as below, or the read goes on from there.
+-                // Not where a read's thread allocates or frees (the idle stage's help, STRATA_PREFILL_HELP; the batched
+-                // draft K/V, STRATA_SPLIT_MTP_BATCH: a free waits for the device), where serving a doorbell makes a
++                // The legacy path excludes the batched draft K/V. STRATA_PIPED_CONCURRENT_MTP is a narrower opt-in
++                // for resident piped MTP with private prompt buffers: checked again for every read below. It prepares
++                // known uploads before starting and publishes prepared PLE before any batch graph can wait for it.
++                // Internal MMQ/GEMM pools may still allocate lazily; those barriers can cost time.
++                // Not with the idle stage's help (STRATA_PREFILL_HELP), where serving a doorbell makes a
+                 // CUDA call (--pcie-mode dma, the Foresight swap space STRATA_FS_SLOTS, the helper caches), and where
+                 // the expert source recycles the buffers it hands out (the GGUF in place, an unbuffered source, the
+                 // I/O read-ahead: one thread at a time).  Pictures are read the usual way (their rows go up through
+                 // pinned slots of a size known only then).
+                 static const bool pr_conc = [&] {
+                     const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
+-                    if (v == nullptr || std::atoi(v) == 0) return false;
++                    if (!piped_concurrent_mtp && (v == nullptr || std::atoi(v) == 0)) return false;
+                     auto env_on = [](const char* k) {
+                         const char* x = std::getenv(k);
+                         return x != nullptr && std::atoi(x) != 0;
+                     };
+                     strata::program::ConcurrentReadSetup s;
+                     s.prefill_help = env_on("STRATA_PREFILL_HELP");
+-                    s.split_mtp_batch = env_on("STRATA_SPLIT_MTP_BATCH");
++                    s.split_mtp_batch = !piped_concurrent_mtp && env_on("STRATA_SPLIT_MTP_BATCH");
+                     s.fs_slots = env_on("STRATA_FS_SLOTS");
+                     s.pcie_dma = o.pcie_mode == "dma";
+                     // (--remote-expert-opt works only through a helper cache, so without one it does not count)
+@@ -17516,13 +17527,55 @@ int main(int argc, char** argv) {
+                     const char* v = std::getenv("STRATA_PIPED_CONCURRENT_MIN");
+                     return v != nullptr ? (int64_t) std::max(0LL, std::atoll(v)) : (int64_t) 0;
+                 }();
+-                if (piped && pr_conc && req_imgs.empty() && (b0 - a0) >= pr_conc_min) {   // (with no slot decoding it only watches for a BYIELD)
++                bool resident_read = false;
++                int concurrent_active_slots = 0, concurrent_own_buffers = 0, concurrent_resident_stages = 0;
++                if (piped_concurrent_mtp) {
++                    strata::program::ResidentConcurrentReadSetup s;
++#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
++                    s.cuda_backend = true;
++#endif
++                    s.piped_mtp = pmtp;
++                    const char* split = std::getenv("STRATA_SPLIT_MTP_BATCH");
++                    s.split_mtp_batch = split != nullptr && std::atoi(split) != 0;
++                    for (const auto& sl : bs) if (sl.active) ++concurrent_active_slots;
++                    s.active_slots = concurrent_active_slots > 0;
++                    if (sp.owns_prompt_buffers()) ++concurrent_own_buffers;
++                    for (const auto& st : stages) if (st->sp.owns_prompt_buffers()) ++concurrent_own_buffers;
++                    s.private_buffers = concurrent_own_buffers == n_pipe;
++                    for (int k = 0; k < n_pipe; ++k)
++                        if (stage_verifier(k).ar_live()) ++concurrent_resident_stages;
++                    s.all_resident = concurrent_resident_stages == n_pipe && !host_res.empty() &&
++                        std::none_of(host_res.begin(), host_res.end(), [](int32_t r) { return r < 0; });
++                    s.no_loans = !mtp_room_open;
++                    for (const auto& p : pf_parts) s.no_loans = s.no_loans && p.lent.empty();
++                    s.draft_resident = use_mtp && mtp.experts_resident();
++                    s.stable_tier = pending.empty() && !ajob && !kvg.on && !peer.valid() && !remote_opt &&
++                                    !remote_caches && !fs_swap;
++                    s.text_only = req_imgs.empty();
++                    s.single_prompt = co_set.empty();
++                    const char* why = strata::program::resident_concurrent_read_off(s);
++                    if (!why && !pr_conc) why = "unsupported_setup";
++                    if (!why && (b0 - a0) < pr_conc_min) why = "below_min_tokens";
++                    if (!why) {
++                        // A failed preparation is a serial fallback, not a half-prepared concurrent admission.
++                        // The optional strict mode preserves reserve_prefill's legacy warning-only behavior elsewhere.
++                        std::string prep_err;
++                        if (!mtp.reserve_prefill(C, prep_err, true)) why = "draft_reserve_failed";
++                        else if (!sp.prepare_concurrent_read(C, prep_err)) why = "prompt_prepare_failed";
++                    }
++                    resident_read = why == nullptr;
++                    if (why)
++                        std::fprintf(stderr, "strata piped concurrent MTP: fallback from=%lld tokens=%lld reason=%s\n",
++                                     (long long) a0, (long long) (b0 - a0), why);
++                }
++                if (piped && pr_conc && req_imgs.empty() && (b0 - a0) >= pr_conc_min &&
++                    (!piped_concurrent_mtp || resident_read)) {   // legacy mode also watches idle reads for a BYIELD
+                     // the drafter's prompt pass captures its graphs and grows its records at first use, and the
+                     // prompt path's pinned upload slots grow at their first larger upload: done here, with nothing in
+                     // flight (on the reader's thread a capture, an allocation or a free takes the driver's lock and
+                     // can wait for the device, #31)
+-                    if (use_mtp && !mtp.reserve_prefill(C, e)) return false;
+-                    if (!sp.reserve_uploads(C))
++                    if (!resident_read && use_mtp && !mtp.reserve_prefill(C, e)) return false;
++                    if (!resident_read && !sp.reserve_uploads(C))
+                         std::fprintf(stderr, "strata batch: the prompt path's pinned upload slots could not be "
+                                              "reserved (they grow at first use)\n");
+                     // where the read's thread and the doorbell thread run: on Linux a thread inherits its creator's
+@@ -17641,12 +17694,22 @@ int main(int argc, char** argv) {
+                     for (int64_t q0 = a0; q0 < b0;) {
+                         const auto tc = Clock::now();
+                         const int64_t rows0 = pipe_rows;
++                        const uint64_t read_id = resident_read ? ++concurrent_mtp_read_id : 0;
++                        if (resident_read)
++                            std::fprintf(stderr, "strata piped concurrent MTP: begin read_id=%llu from=%lld tokens=%lld "
++                                                 "chunk=%lld active_slots=%d stages=%d own_buffers=%d resident_stages=%d\n",
++                                         (unsigned long long) read_id, (long long) q0, (long long) (b0 - q0),
++                                         (long long) C_read, concurrent_active_slots, n_pipe, concurrent_own_buffers,
++                                         concurrent_resident_stages);
+                         // per stage, for the read's log line: its windows and the host time that set them up (the
+                         // PLE gather included, which waits while the prompt holds the table) - both this thread's
+                         std::vector<std::pair<int64_t, double>> st0((size_t) n_pipe);
+                         for (int k = 0; k < n_pipe; ++k)
+                             st0[(size_t) k] = {stage_verifier(k).windows, stage_verifier(k).ms_host};
+                         std::atomic<bool> done{false};
++                        std::atomic<bool> started{false};
++                        Clock::time_point reader_started{}, reader_finished{};
++                        int64_t rows_before_done = 0;
+                         std::atomic<int> want_yield{-1};
+                         bool read_ok = true;
+                         std::string read_err;
+@@ -17657,6 +17720,8 @@ int main(int argc, char** argv) {
+                             conc_thread_cpus();
+                             try {   // (an exception leaving a std::thread ends the process: a failed read instead)
+                                 if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
++                                reader_started = Clock::now();
++                                started.store(true, std::memory_order_release);
+                                 read_ok = sp.run(ids.data() + q0, b0 - q0, q0, read_err);
+                             } catch (const std::exception& x) {
+                                 read_ok = false;
+@@ -17665,6 +17730,7 @@ int main(int argc, char** argv) {
+                                 read_ok = false;
+                                 read_err = "the prompt read failed";
+                             }
++                            reader_finished = Clock::now();
+                             done.store(true, std::memory_order_release);
+                             { std::lock_guard<std::mutex> lk(in_mu); }   // (the loop below may be waiting on in_cv)
+                             in_cv.notify_all();
+@@ -17682,8 +17748,16 @@ int main(int argc, char** argv) {
+                         bool pump_ok = true;
+                         size_t seen = 0;   // in_lines' length after the last look: a line that comes wakes the wait
+                         while (!done.load(std::memory_order_acquire)) {
++                            if (resident_read && !started.load(std::memory_order_acquire)) {
++                                std::this_thread::yield();
++                                continue;
++                            }
+                             const bool decoding = pump_ok && (batch_on() || pipe_inflight());
+                             if (decoding) pump_ok = pump(true);
++                            // A conservative output count: only a completed pump observed before the read's done
++                            // publication counts. Excludes the ambiguous final pump and the subsequent pipe_drain.
++                            if (resident_read && !done.load(std::memory_order_acquire))
++                                rows_before_done = pipe_rows - rows0;
+                             std::unique_lock<std::mutex> lk(in_mu);
+                             if (!decoding)   // nothing to pump: until the read ends or a line comes (both notify)
+                                 in_cv.wait_for(lk, std::chrono::milliseconds(2), [&] {
+@@ -17708,6 +17782,17 @@ int main(int argc, char** argv) {
+                         reader.join();   // (a failed window leaves the read to finish: it is not stopped mid-run)
+                         sp.stop_at_chunk = nullptr;
+                         in_prompt_read = false;
++                        if (resident_read) {
++                            const double overlap_ms = started.load(std::memory_order_acquire)
++                                ? std::chrono::duration<double, std::milli>(reader_finished - reader_started).count() : 0.0;
++                            const bool admit_stop = admit_slot >= 0 && admit_slot < (int) bs.size() && bs[(size_t) admit_slot].stop;
++                            std::fprintf(stderr, "strata piped concurrent MTP: end read_id=%llu read_ms=%.3f "
++                                                 "decode_rows_before_done=%lld read_ok=%d pump_ok=%d stopped_at=%lld "
++                                                 "admit_stop_requested=%d yield_slot=%d\n",
++                                         (unsigned long long) read_id, overlap_ms, (long long) rows_before_done,
++                                         (int) read_ok, (int) pump_ok, (long long) sp.stopped_at(),
++                                         (int) admit_stop, want_yield.load(std::memory_order_acquire));
++                        }
+                         if (!pump_ok || !pipe_drain()) {
+                             batch_fatal = true;
+                             e = "a pipelined batch window failed";
+diff --git a/tests/program/batch_read_test.cpp b/tests/program/batch_read_test.cpp
+index 2b2ad1a9..5c92c050 100644
+--- a/tests/program/batch_read_test.cpp
++++ b/tests/program/batch_read_test.cpp
+@@ -9,6 +9,8 @@
+ using strata::program::batch_read_piece;
+ using strata::program::concurrent_read_off;
+ using strata::program::ConcurrentReadSetup;
++using strata::program::ResidentConcurrentReadSetup;
++using strata::program::resident_concurrent_read_off;
+ using strata::program::piped_decode_budget_ms;
+ using strata::program::piped_read_lead_in;
+ using strata::program::piped_read_piece;
+@@ -59,6 +61,33 @@ int main() {
+         for (size_t j = i; j < std::size(each); ++j) s.*each[j] = true;
+         CHECK(same(concurrent_read_off(s), named[i]));
+     }
++    // The resident MTP extension fails closed for every live ownership/state requirement. None of these checks
++    // makes an unsupported legacy source safe: callers must also retain concurrent_read_off's source guards.
++    ResidentConcurrentReadSetup resident;
++    bool ResidentConcurrentReadSetup::*const required[] = {
++        &ResidentConcurrentReadSetup::cuda_backend, &ResidentConcurrentReadSetup::piped_mtp,
++        &ResidentConcurrentReadSetup::split_mtp_batch, &ResidentConcurrentReadSetup::active_slots,
++        &ResidentConcurrentReadSetup::private_buffers, &ResidentConcurrentReadSetup::all_resident,
++        &ResidentConcurrentReadSetup::no_loans, &ResidentConcurrentReadSetup::draft_resident,
++        &ResidentConcurrentReadSetup::stable_tier, &ResidentConcurrentReadSetup::text_only,
++        &ResidentConcurrentReadSetup::single_prompt};
++    for (auto f : required) resident.*f = true;
++    CHECK(resident_concurrent_read_off(resident) == nullptr);
++    const char* missing[std::size(required)] = {};
++    for (size_t i = 0; i < std::size(required); ++i) {
++        auto s = resident;
++        s.*required[i] = false;
++        missing[i] = resident_concurrent_read_off(s);
++        CHECK(missing[i] != nullptr);
++        for (size_t j = 0; j < i; ++j) CHECK(!same(missing[i], missing[j]));
++        // A failure earlier in the order wins, including when an admission changes more than one property.
++        for (size_t j = i; j < std::size(required); ++j) s.*required[j] = false;
++        CHECK(same(resident_concurrent_read_off(s), missing[i]));
++    }
++    CHECK(same(missing[3], "no_active_slots"));   // solo prefill must retain the existing single-run path
++    CHECK(same(missing[4], "shared_prompt_buffers"));
++    CHECK(same(missing[6], "active_loan"));
++    CHECK(same(missing[7], "draft_weights_not_resident"));
+     // piped_read_piece (#1906): off -> one run; whole chunks, at least one, at most 32
+     CHECK(piped_read_piece(0, 8192) == 0);
+     CHECK(piped_read_piece(-5, 8192) == 0);

@@ -1,0 +1,41 @@
+Independent Nsight helper — prepared locally, never launched on the GPU host
+
+nsys_diagnostic.py is default dry-run. It neither attaches to nor stops an existing service. Root must first finish the timed A/B and correctness gates, then explicitly create a separate maintenance diagnostic. Execution refuses occupied GPUs or open8080/8092. It starts only its own authenticated loopback8092 server under nsys launch and cleans up only recorded process birth identities. The production config, clocks, power caps, layer placement, prefill chunking and frozen harness files are unchanged.
+
+Frozen identities: engine45eaa612cbdda74d0bcaf6302e37807ae9cd9c4fe8b1c633282564d379cad8b6; libraryfb67bffc9ece81aa90ee22aa97fed40710c4d57ece6bceeb4ae023f9728a0661; server40c5e9dfc96ab208b6514bd2f5f48986afb3e01b3927f873cff8d358d62528c9; baseconfigf752a21492dedb98bda4fd4af7551999ed0a30516c8a9e5271f055e17f2a04dd. P1 remains1, async0. --arm on/off changes only the new overlap mode within the independent diagnostic configuration. A fresh random API key is kept only in memory and a0600 /dev/shm config, removed during cleanup; this does not change production credentials.
+
+Example, ONLY after root chooses the separate diagnostic and copies this helper to the host:
+
+python3 /srv/bench100k-20261108-prefill-interleave/nsys_diagnostic.py \
+  --execute --workload c8 --arm on --seconds 15 \
+  --harness /srv/bench100k-20261108-prefill-interleave/harness-v7 \
+  --exe /srv/Strata-decode-head-20261107/engine/strata.prefill-interleave3 \
+  --out /srv/bench100k-20261108-prefill-interleave/nsys-c8-on1
+
+The helper accepts a verified h6/h7 harness directory because all imported files are individually bound to their identical relevant hashes. Change the /srv benchmark directory to the actual copied directory. Server/Python/config defaults are the existing known paths and are verified by hash. There is no remote action hidden in the local default dry-run.
+
+For the C4 mixed diagnostic, change --workload mixed, choose a new --out and add:
+  --calibration /srv/bench100k-20261108-prefill-interleave/calibration.json
+The calibration must hashb036e3ad8523dcad87d8dce76ff236a624a6f19c9058313f74ad403bc4c091dd.
+
+Capture behavior:
+- The whole model load is injected but collection starts later, via installed2025.3.2 nsys launch/start/stop. This is not arbitrary-PID attach. No CUDA-profiler or NVTX hooks are added.
+- C8 uses the unchanged frozen c8_check workload,1024tokens each, and an in-process Client subclass only to observe readiness. Start is requested after all8streams have a first output and are still active. Its original completion/exclusivity/overlap gates remain.
+- Mixed uses unchanged finite primary bodies, prompts, sampling, budgets, calibration and phase schedule. It requests capture on the existing second-injection stdout marker immediately before the calibrated~60k injection. The workload is not paused for nsys startup; the earliest part of admission may precede collection. This is intentionally a diagnostic, not a modified timed harness.
+- Stop is requested12..15seconds after the nsys start request (or earlier if the entire workload ends). Start-request/return and stop-request/return wall+monotonic times are saved. Export/flush time is separate; the report establishes actual collected bounds. There is no claim that the full long read fits the window.
+- Frozen workloads finish normally after collection stops; on error/interruption the helper closes only its owned server/processes. It never resumes production automatically. A failed fixture or capture remains failed even if a partial trace exists.
+
+Trace configuration, checked against the saved installed help:
+  launch --trace=cuda,osrt --cuda-graph-trace=node --cuda-event-trace=false --wait=all --show-output=false
+  start --sample=none --cpuctxsw=none --output=<new private prefix>
+No CPU samples/context switches, GPU metrics, memory tracing or extra engine profiling flags are enabled. OSRT still records runtime calls; scheduling causality cannot be established without a separately justified context-switch trace. Node tracing itself can substantially alter schedule/latency, so this capture supplies no performance percentage, token-rate comparison or saturation claim.
+
+Privacy/ownership:
+The private shell redirects server stdout/stderr BEFORE Python/server startup. --show-output=false alone would still package output into nsys reports and is not relied on for privacy. Only a small noncredential environment allowlist is inherited; API keys never enter argv/env/NVTX. The output directory is0700 and files0600. The server wrapper records PID+birth tick, and cleanup signals those exact known server/engine identities only. A repeated SIGINT/SIGTERM during cleanup is ignored so it cannot skip config deletion. GPU power/clocks/governors are not changed.
+
+receipt.json contains safe config identity, startup/actual binary+library-map checks, requested capture times, actual workload coverage, native reader numeric evidence, own cleanup status and a temporary-key byte scan. The byte scan is not a decoder for compressed report payloads: keep raw nsys/server/client artifacts private. Only synthetic requests are issued, but the C8 frozen client includes synthetic bodies/outputs in its private result files. Share derived numeric tables, not the raw bundled report by default.
+
+Interpretation gate after a real capture:
+Require nonempty engine CUDA API and GPU kernel rows on all8relevant cards, not Python-only activity. Resolve graph/node correlation IDs and launch threads before separating verifier/MTP/target-head streams from reader/prefill streams; identical kernel names alone are insufficient. For one common bounded interval, merge kernel execution intervals per GPU, measure idle gaps and simultaneous decode/prefill activity, and inspect launch gaps, allocations, synchronization and copies near stalls. Summed kernel time or graph lifetime is not GPU active-union time, SM occupancy or FLOP utilization. The helper intentionally does not auto-export with unverified nsys export CLI or invent a SQLite schema; inspect the actual report first, then export/analyze using that installed tool's help.
+
+Local qualification only: --self-test, default dry-runs, all frozen-source hash checks, Python AST, installed-help option checks, and independent static review. No Nsight process, server, network request or GPU workload was launched during preparation. Runtime instrumentation compatibility remains to be verified by root's separate diagnostic.

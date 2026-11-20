@@ -1,0 +1,47 @@
+{
+  "kind": "review_only_not_executed",
+  "installed_help_option_check": "PASS",
+  "capture_optional": true,
+  "no_source_instrumentation_required": true,
+  "existing_process_attach": "No supported arbitrary PID CUDA attach established by supplied 2025.3.2 help. Reuse only an already-injected owned session; otherwise wait for a planned dedicated diagnostic restart. start-later delays a launched session, not retroactive injection.",
+  "commands_to_run_only_when_root_chooses_diagnostic": {
+    "launch_argv_template": [
+      "/usr/local/bin/nsys",
+      "launch",
+      "--session-new=<unique-owned-session>",
+      "--trace=cuda,osrt",
+      "--cuda-graph-trace=node",
+      "--cuda-event-trace=false",
+      "--osrt-threshold=10000",
+      "--wait=all",
+      "/bin/sh",
+      "<private-launch-wrapper>"
+    ],
+    "start_argv_template": [
+      "/usr/local/bin/nsys",
+      "start",
+      "--session=<unique-owned-session>",
+      "--sample=none",
+      "--cpuctxsw=process-tree",
+      "--output=<new-private-absolute-report-prefix>"
+    ],
+    "stop_argv_template": [
+      "/usr/local/bin/nsys",
+      "stop",
+      "--session=<unique-owned-session>"
+    ]
+  },
+  "time_box": "Start after model is ready and resident streams are already decoding; complete start, inject one synthetic actual~52k prompt, collect12\u201315s in independent diagnostic. Always stop on bounded timer/finally. If this cannot cover the full read, interpret only the captured interval.",
+  "not_a_performance_baseline": true,
+  "source_help_sha256": {
+    "nsys-profile-help.txt": "24e0e6fe320ffb3b4974f2a529358125e25770953287bcc50ef830fc4733e0c2",
+    "nsys-launch-help.txt": "94a6f91c5730313a035ab5d72bff6b2f23b71b8c79e9a90ece405e2c1d93df16",
+    "nsys-start-help.txt": "2b39fe463f4236c4e8e0c5f5486d4115fd66247d2de1bcca9085ed87418fc365",
+    "nsys-stop-help.txt": "81dba69c56508cef65c5e4727b81443c6f522f82f3f8fb79a9ea16ba01923b05"
+  },
+  "official_sources": [
+    "https://docs.nvidia.com/nsight-systems/ReleaseNotes/",
+    "https://docs.nvidia.com/nsight-systems/UserGuide/"
+  ],
+  "documentation_limit": "Versioned2025.3webarchive couldnotbe retrieved; installedhelp is the authority for actual argv. Latestwebdocs only corroborate highlevel workflow/attach limitations."
+}

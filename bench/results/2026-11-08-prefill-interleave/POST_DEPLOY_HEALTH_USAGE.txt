@@ -1,0 +1,33 @@
+Bounded postdeployment production health and routing check
+
+Default invocation performs no I/O or HTTP. This helper never starts/stops a service, signals a process, edits configuration, clears a cache, sends global cancellation or runs the exclusive8092 benchmark CLI. It checks the existing authenticated loopback8080 service. Deployment/paired validation and manual performance acceptance remain root/operator prerequisites.
+
+1. After deployment config replacement, BEFORE starting the new production server:
+   python3 -B post_deploy_health.py --cursor-only --out /NEW_PRIVATE_CURSOR_DIRECTORY
+This reads the existing private configuration only in memory to locate its append log. It saves startup-cursor.json with log inode/offset/time and config hash; it neither reads log contents nor changes the service. The cursor config hash must equal the deployed config, and the new server must have a birth time after this cursor. The existing append log must remain on the same inode and untruncated.
+
+2. Root starts the production server by its normal supervisor and waits until ready. Obtain its exact Python server PID. Then explicitly execute:
+   python3 -B post_deploy_health.py --execute \
+     --server-pid ACTUAL_SERVER_PID \
+     --deployment-receipt /ACTUAL_DEPLOY_DIRECTORY/receipt.json \
+     --cursor /NEW_PRIVATE_CURSOR_DIRECTORY/startup-cursor.json \
+     --harness /srv/bench100k-20261108-prefill-interleave/incremental-harness-v2 \
+     --freeze /srv/bench100k-20261108-prefill-interleave/incremental-harness-v2-freeze.json \
+     --out /NEW_PRIVATE_HEALTH_DIRECTORY
+Use the actual copied helper path. The helper binds exact v2 freeze75a15bb3, release45eaa612, adjacentlibfb67, basebackuppre-concurrent-prefill.json f752 and server40c5. It verifies that only exe+CONCURRENT1 changed from original config, the server argv uses that server/config, the PID owns8080 listener, one descendant engine uses exact release+mapped adjacent library, actual fixed flags/head routes/guards, and new-startup8slots/allresident/private3.80GiB buffers. All config/key/argv/environment contents remain in memory; only safe numeric/selected-flag evidence is stored.
+
+Workload
+Two stateless /v1/messages/count_tokens requests check frozen-client synthetic diary shapes before generation. No one-token probe is sent. One own short peer emits at most1024tokens. After its first visible content while still active, one new3k–6k actual-prompt request emits at most64tokens. Unique random early fixture tags avoid prefix reuse; injected cached count must be0 and actual API prompt usage must equal the stateless count. Both requests must finish normally with complete SSE, positive actual output within budget (length exactly budget; normal stop allowed), consistent three-part usage and native counts, answer-only channels. The peer must continue visible output through the injected request's first visible content. No repeat/refill or automatic retry occurs.
+
+Route proof and external traffic
+A fresh log inode+offset is captured before own requests and again immediately before injection. Only complete lines after the injection cursor are parsed, with a bounded8MiB read. A unique compatible large read must have begin/end/source on the same native read_id,8private/resident stages,active_slots>=1,read_ok=pump_ok=1,strict in-read BT>0,lookahead_idle1 anddispatch_delta0. Matching fallback/duplicate evidence or CUDA error rejects the check. Other unfinished read IDs or unrelated cancellations are not automatically attributed to this request.
+This native log format has no HTTP request ID. The receipt proves a fresh-window route with one compatible prompt shape, not a cryptographic per-request association in the presence of external traffic. Status samples record observed external-concurrency lower bounds. No global-idle requirement is imposed; absence of sampled external traffic does not prove exclusivity. If traffic causes timeout, queueing, co-read fallback, loss of a live peer, cache reuse or ambiguous evidence, the bounded check is inconclusive/fails rather than claiming success.
+
+Bounds, privacy and cleanup
+Per request total120s, first-output90s, silence45s; client scenario150s from construction, plus bounded count/preflight and20s own-connection cleanup. The count requests timeout15s each. SIGINT/SIGTERM only abort this client. Cleanup repeatedly re-snapshots only owned active sockets during its bounded join, covering a worker that registers/connects after the first snapshot. All owned sockets are shut down on error/timeout; no globalBSTOP,PIDkill or service action exists. New output directory0700; receipt0600. The frozen client writes only own numeric chunk counts/timestamps, hashes, usage and error kinds; no prompt/answer/tool strings/APIkey are saved. These files may contain legacy numeric rate fields, but this is health only, not a performance benchmark or speedup result. Receipt credential guard/scan verifies the in-memory key is absent from files.
+A passing receipt also requires no live own workers/connections, original config/server/frozen files unchanged and same server/engine births still alive. Config or startup-health failures are handled by root's separate rollback plan; this script does not roll back or restart anything.
+
+Offline review
+python3 -B post_deploy_health.py --self-test
+python3 -B -O post_deploy_health.py --self-test
+Current pure self-test: valid capped and naturalEOS completions;6invalid-output cases;11bad/missing/duplicate/fallback/source-route cases;3unrelated-config mutations; unrelated external unfinished read remains allowed; log cursor excludes old lines and incomplete trailing line. A late-registration fake-connection test confirms cleanup catches the new own socket and never touches a foreign one. No real HTTP/GPU/service execution.

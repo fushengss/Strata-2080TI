@@ -1,0 +1,33 @@
+C8 Nsight diagnostic: observed execution, not an unprofiled performance result
+Window UTC 2026-11-07T18:06:45.033701+00:00 to 2026-11-07T18:06:58.465155+00:00; 13.431454s inside the actual8-lane common SSE interval (23.280726s, 57.69% coverage).
+Engine PID164019, frozen v3 SHA45eaa612..., concurrent MTP read1, snapshot overwrite0. Same verified basef752/server40c5/libraryfb67. Receipt: qualified own C8 workload, clean exit, config unchanged, own processes removed.
+
+GPU | kernel union% | kernel+copy+memset union% | mean kernel node us | max observed kernel gap ms
+0 | 45.71 | 46.37 | 11.95 | 8.136
+1 | 39.73 | 40.27 | 9.97 | 9.257
+2 | 48.93 | 49.51 | 13.91 | 6.463
+3 | 45.43 | 45.97 | 11.35 | 7.801
+4 | 47.49 | 48.07 | 13.57 | 6.101
+5 | 44.97 | 45.52 | 11.15 | 7.461
+6 | 38.03 | 38.63 | 10.91 | 8.363
+7 | 54.46 | 55.03 | 11.24 | 9.349
+
+These unions merge concurrent streams on each card and clip to the stated wall interval. Mean card kernel coverage45.59%; memcpy/memset adds only0.54–0.66percentage points. This describes traced execution presence, not achieved compute, SM occupancy, bandwidth, or nvidia-smi activity%. GPU7 has the highest coverage; GPU6 and1 the lowest.
+3cards have observed kernels simultaneously for30.26% of this window,4cards37.53%,5cards16.98%. All8 never coincide in the observed trace. No observed kernel anywhere occupies only25.586ms total (0.1905%): longest internal such gap3.486ms; the4.959ms maximum touches the capture-window start. Thus this trace mostly shows per-card bubbles while some other cards are doing work, rather than long whole-machine pauses.
+Per-card gaps over100us account for92.8–95.0% of that card's no-kernel time. Merely counting the many sub-microsecond gaps would misdescribe the main unused intervals.
+
+Correlation and host observations
+All4,503,208 exported kernel rows belong to the owned engine; all have one unique observed runtime correlation row. Runtime CUDA events are from one serialized thread. One graph launch may map to many kernel nodes; it is not one-to-one. Within the window67,167 cudaGraphLaunch calls sum to12,191.633ms on that thread, median51.235us and p95 617.796us; all CUDA runtime union is12,625.240ms. cudaStreamSynchronize contributes75.646ms over1,083calls, far below graph launch time in this instrumented run.
+Among the152internal gaps selected as each card's longest20,150 have the next node's launch API begin after the gap started; all152 next API calls have not returned before the gap starts. Median next-launch-start to next-kernel-start38.779us (maximum5.698ms). These selected gaps show a lack of earlier next-graph submission for most samples. This is compatible with host submission/dependency scheduling, but does not identify why the host waits or prove the same bottleneck without instrumentation.
+Graph launch first-node minus API-end is often negative (29,800cases; median-14.544us): GPU work may start while a launch API is still active. Those values are retained, not clamped and falsely described as queue delay.
+
+Material limits
+Node-level profiling is intrusive here: explicit PROFILER_OVERHEAD intervals union602.082ms, and graph API timing includes unseparated driver/CUPTI costs. The helper cohort ran under instrumentation; no causal speedup, normal-service utilization percentage, or future optimization gain follows from these timings. Use the unprofiled A/B and incremental workload for deployment decisions.
+Nsight reports6incomplete CUPTI events dropped when GPU timestamps were not retrieved by profiling stop, plus incomplete-CUDA/OSRT warnings. The exact locations of those6events are unknown. Observed busy union is therefore a lower bound if any missing work intersects the window; an observed gap is not absolute proof of hardware idle. Counts from our extraction match all exported tables, so our transport/parser did not discard recorded events.
+CPU sampling and context switches were intentionally disabled. CUDA-event trace is off. No CPU scheduling attribution, complete cross-stream dependency graph, or absolute GPU utilization claim is supported. This short C8 decode workload also does not demonstrate the long-prefill overlap path.
+Use event timestamps normalized by the verified export option and helper SSE wall time. ANALYSIS_DETAILS header start/stop differs from GPU event epochs in this export, so it was not used to align or choose the measurement window.
+
+Verification and artifacts
+analyze_nsys_numeric.py --self-test: exact interval union/edge cases plus100seeded eight-card discrete-time ground-truth sweeps PASS. Full gzip CRC,64byte record framing, explicit PID/device identity, zero inverted activity intervals and exact raw-row counts against schema PASS.
+Raw report/SQLite remain private on the remote host. Only derived numeric rows and validated CUDA API identifiers were copied; no config/key, environment values, process names, API arguments or server output. All remote export/read queries finished before timed workload analysis; aggregation was local.
+nsys-c8-v3-on1-analysis.json contains full numeric gates, hashes, gap distributions and selected correlations. nsys_sqlite_schema.py, nsys_extract_numeric.py and analyze_nsys_numeric.py preserve the extraction/calculation.

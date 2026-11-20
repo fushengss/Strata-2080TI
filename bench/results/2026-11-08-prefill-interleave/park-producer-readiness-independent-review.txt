@@ -1,0 +1,21 @@
+Source-only producer-readiness review, HEAD bf5a8e5b24b1973efbae747a109f5a970b25e09d.
+No engine edits, remote actions or GPU tests.
+
+Conclusion: no existing general event proves every main-session/owner-draft producer complete for every park_source caller. Do not replace conversation_snapshot_save's device sync with an arbitrary verifier, KV-upload or drafter-chain event. A narrowly proven post-reader/post-drain path could use an explicit producer-fence contract in a later change; this is not implementation approval.
+
+Current snapshot boundaries:
+- src/core/conversation_state.cpp:517-532 joins the global checkpoint and previous park copies, validates capture bytes, then sync(error). sync:32-33 is cudaDeviceSynchronize. The snapshot includes live recurrent state, checkpoints, main QSA KV and optional draft KV(:544-599).
+- src/program/generate.cpp:12335 saves stage0;:12343-12347 switches each later device, explicitly cudaDeviceSynchronize, then calls snapshot_save which synchronizes that same device again. This is a real duplicate success-path sync; its cost is unmeasured, and replacing the outer sync alone does not remove snapshot's blocking copy or internal device sync.
+- park_current_body:12372-12379 selects main SS plus the owner MTP KV on its actual stage. park_slot:14469 has slot state instead. These paths must not share an assumed producer fence without matching their owners.
+
+Why current events are insufficient:
+- Verifier::pl_commit_async src/core/verify.cpp:5721-5740 records ev_commit after its commit graph on the verifier stream. It is a particular commit's completion, not a fence for Prefill streams or MTP. Other commit paths exist (:3895, commit_slots:4849); a last verifier output event is not a universal final state event.
+- MTP chain_launch src/core/mtp.cpp:2147 records ev_chain on its own stream. MtpDrafter::prefill may run without synchronization (include/strata/core/mtp.hpp:115-119), and its KV may also be written by Prefill::draft_kv on the prefill stream. A chain event does not cover these paths.
+- Prefill::draft_kv src/prefill/prefill.cpp:2270 first idles the owner MTP stream, appends its KV on m.cs(:2333-2347), and synchronizes m.cs before success(:2349-2352). Thus this path has a valid completed host boundary, not an exported universal draft event. The split on_chunk callback uses this or the default synchronized MTP prefill (generate:12631-12645).
+- Prefill kv_ready is only upload completion; normal run end synchronizes m.cs, m.copy and m.kv_copy(:6334-6348). stop_at_chunk breaks into that normal tail(:3391-3395); should_stop cancellation returns earlier(:3388), so cancellation must not inherit the successful-stop proof. KvDrain(:3284) protects its own KV-copy stream only.
+- conversation_copy.hpp:248-273 order_after_queued records a private COPY completion event and makes the legacy stream wait. Its direction is copy->legacy, the reverse of producer->snapshot; copy_stream_ready:108 only proves handle availability, not data readiness.
+
+Narrow future boundary worth proving:
+The concurrent reader is joined at generate:17793 and pipe_drain succeeds at:17811 before give_way at:17839. For a successful chunk stop, Prefill normal-tail synchronization plus the synchronized draft callback provide useful readiness facts. However give_way itself may park an OLD slot before copy_to_slot(:17457-17458); this is not automatically the newly prefetched main snapshot. A future optimized park must identify the exact source, join/checkpoint lifetime, owner MTP and every stage producer, keep them immutable until copies complete, and surface producer errors before publication. Prefer dedicated per-stage/source capture fences or an explicit already-quiescent API contract over reusing unrelated events. A single-worker park still needs the global helper/lifetime exclusions from park-copy-streams-independent-review.txt.
+
+No measured park, prefill, decode, latency or GPU-utilization improvement is claimed.

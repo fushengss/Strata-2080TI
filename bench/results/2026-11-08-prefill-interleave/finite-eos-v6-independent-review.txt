@@ -1,0 +1,19 @@
+Independent review: finite normal EOS, harness v6
+Outcome: PASS for freeze and fresh paired qualification; no blocking findings.
+
+Only finite_mixed.py, compare_interleave.py and offline_tests.py change from v5 among the 20 Python files. Fixture generator, frozen calibration, workload plan, stream client, prior silence metrics, all other production suites (including BYIELD strict length3072 and admission cancellation proof) remain unchanged. The finite plan function and request generation are untouched.
+
+finite_mixed.py:60-79 accepts complete, error-free SSE only. length must exhaust its unchanged max budget; stop must have an integer actual count in1..budget. Native predicted_n equals API completion_tokens, with all three logical usage fields consistent. Non-output completion, tool bytes and even zero-byte tool-id channels are rejected. This is a normal EOS contract, not permission to ignore truncation, cancellation, error or partial drain.
+
+finite_mixed.py:82-96 and189-194 add four-lane visible first/last coverage for baseline, mixed and recovery. The last content must reach each phase end even if HTTP closes later. Existing stall_metrics semantics and numbers remain unchanged; measured stalls inside those brackets remain visible to analysis.
+
+compare_interleave.py:23-37,39-70 retains exact request/output/channel hashes, finish reason and all three actual usage counts across arms. It additionally requires both visible-coverage qualifications and identical output contract. Actual counts, not configured maxima, remain the whole-case rate numerator. A natural EOS arm with different actual output, count or finish reason cannot support a performance comparison.
+
+Independent CPU verification: offline_tests.py rc0; byield_offline_tests.py rc0;20 Python files parsed. The fake HTTP pair includes resident2 stop2815 at max4096 and total15231; this is synthetic test coverage, not a measured model or GPU performance result. Negative tests reject unequal output/finish/counts, native prediction mismatch, errors, invalid stop/length ranges, zero-byte tool channels, early phase end and late HTTP drain after visible output has stopped. No network/GPU/service operations were performed.
+
+The prior failed run must remain failed. Freeze v6 and execute a fresh matched pair before selecting performance. This review does not qualify engine deployment, actual100k first use or tail behavior. First/last SSE content brackets demonstrate the finite visible cohort remains present through all phases; they do not prove continuously busy GPUs or per-token timing. Repeated/reversed matched runs are still needed for a stable gain claim.
+
+Reviewed code SHA256:
+finite_mixed.py a797d6aba9077b8b77bae396d520556b786036077ca7b3ebb98f2b0d8e5b9b39
+compare_interleave.py fbf34628ce99e31cad98ac704342447921fc0be4d627a984e5d94a53a1519d6f
+offline_tests.py 7e3e5a447a2da6e23c4fdf0c834d12e6a800c1b151d6ef78239054c19488b60e

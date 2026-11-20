@@ -1,0 +1,79 @@
+Deferred, unapplied reader-only stage-0 cadence proposal
+Base: bf5a8e5b24b1973efbae747a109f5a970b25e09d
+Patch: reader-admission-cadence-proposal.patch
+SHA256: 90fc95e8cf87a68320e1874025bc3eff9e393ea185eb2b8f49c1181947d0c69c
+This is an independent design/review artifact. It has not been applied, built
+for CUDA, remotely tested, selected or combined with the overwrite candidate.
+The user now accepts a modest mixed-prefill cost for concurrency efficiency;
+this policy is therefore deferred, not needed merely to erase that cost.
+
+Proposed knob
+=============
+STRATA_PIPED_CONCURRENT_ADMIT_US, default 0 (unchanged). Positive values are
+clamped to at most 20,000 us. Only an actual strict resident concurrent-MTP
+reader installs a local cadence object. Legacy concurrent reads, serial reads,
+idle reads, standalone decode and the final drain do not use it.
+
+The first group may launch immediately. Subsequent NEW stage-0 groups need
+the chosen interval since the previous successful batch launch RETURN. This
+timestamp is steady_clock monotonic host time, recorded just after
+batch_launch_rows succeeds, not a pre-check, GPU start, completion, target
+verdict, accepted token, or observed BT output. If no group is ready, no budget
+is consumed. No sleeps are introduced. All pump processing still runs each
+iteration; pump(false) only suppresses new stage-0 admissions.
+
+In-flight stages, pending commits, sampled logits, MTP poll/launch and normal
+round-robin group selection remain unchanged. The candidate does not cap the
+number of in-flight groups at one; that would discard much more PP8 parallelism.
+It does not query prefill GPU-idle state or claim to fill only unused cycles.
+
+Cancellation and fairness
+=========================
+An incoming STOP, active slot.stop, or consumed BYIELD bypasses the spacing
+restriction. BSTOP/BYIELD queue handling itself remains at the existing reader
+loop point. BYIELD still stops prefill at the existing chunk boundary; no new
+chunk/drain is inserted. After reader.join the active cadence pointer is cleared
+before final drain. RAII also clears it on every exceptional return; the next
+read starts with a fresh immediate-first budget. Only the main thread touches
+cadence state, so no cross-thread timestamp ownership is introduced.
+
+The interval bounds only additional ADMISSION ELIGIBILITY delay. It does not
+bound visible output gaps if stage 0 is busy, a draft is not ready, or queued
+GPU work is delayed. Existing round robin remains fair among ready groups
+assuming their GPU work completes. No guaranteed per-peer latency is claimed.
+
+Counters
+========
+A separate 'strata concurrent admission cadence:' line reports read_id,
+interval_us, checks, deferred_checks, stage0_submissions_loop,
+bypass_submissions, min_gap_us, max_gap_us.
+- checks/deferred_checks count pump-loop eligibility decisions, not groups,
+  skipped tokens or useful work lost.
+- submissions are successful host returns during the reader LOOP lifetime.
+  As in the existing loop a final pump can race done publication; these are
+  explicitly not strict-before-reader-done output counts. Final drain excluded.
+- gap values compare successive successful host return timestamps; bypasses
+  can produce gaps below interval. Native BT and client gap counters remain the
+  actual output evidence.
+
+Testing and interpretation
+==========================
+PASS: git apply --check --whitespace=error against frozen source.
+PASS: copied candidate header/test compiled locally with Clang C++20; full
+batch_read_test printed 'batch_read_test: ok'. Added cases cover default-off,
+first launch, unsuccessful eligibility consuming no budget, boundary equality,
+post-launch timestamp semantics, cancel/BYIELD bypass, clamp and fresh-read reset.
+No engine runtime, GPU or remote test performed.
+
+Only consider 0/10,000/20,000 us same-binary experiments after existing v3 and
+park work. Current cited ~58 native BT/s during a read corresponds to roughly
+29-58 successful groups/s if windows emit 1-2 outputs; 10 ms allows 100 groups/s
+and 20 ms allows 50 groups/s. Thus these settings might affect only bursts, or
+20 ms might throttle useful work. That is an estimate, not a measured group
+rate. Record actual submissions and interval binding before explaining results.
+
+Require complete sampled/penalty/reuse/cancel/BYIELD exactness; watch read-only
+phase duration, native/API throughput and each peer's maximum/p95/p99 gaps,
+not merely decreased prefill time. Keep prefill split/chunk, MTP depth and all
+other flags fixed. Reject this option if reduced group injection loses more
+useful throughput/continuity than its prefill improvement warrants.

@@ -1,0 +1,15 @@
+Independent review: harness v7 budget cohort
+Outcome: PASS for freeze and fresh paired budget qualification. No blocking findings.
+
+Reviewed final budget_correctness.py SHA256:
+0aa3b2099100ee6b0687d7839dffe520ff9fe8634efa3d48581fb5c5ee0631da
+
+The sole Python-file change from v6 is budget_correctness.py. Loading both fixture functions with the same fixture ID and frozen correctness.py proved that only the four max_tokens fields change384->1024; prompts, seeds, temperatures, reasoning budgets64/128, templates and all other fields match. The other19 Python files are byte-identical, including finitev6, BYIELD3072, cancellation proof and the frozen correctness core.
+
+The revised contract intentionally accepts normal EOS: stop requires integer actual completion1..cap; length requires actual==cap. All three logical usage fields must be integers with positive prompt count and exact total. Per-lane actual counts/finish reasons are recorded. The old all-nine complete-response gate, wrap markers, bounded prefix reuse, recovery identity, cancellation and piped-route proof remain active. This review binds the final normal-EOS implementation, not the earlier discarded strict-length draft.
+
+The frozen correctness.py:128-140 overlap gate uses the intersection of each lane's first and last actual content/reasoning SSE output, requires>=0.1s and>=2deltas per lane. It does not infer overlap from HTTP end. The budget comparator retains exact request/output/reasoning hashes, finish reasons and actual logical usages across arms, so different normal-EOS output lengths do not qualify as matched work.
+
+Independent verification: budget --self-test rc0;20 Python AST parses passed; fixture field comparison passed; actual usage900/901 mismatch rejected. Self-test accepts stop900 and rejects length900, zero/overcap/inconsistent usage, tool finish, missing lane, empty common SSE interval and one-delta-only overlap. No network, GPU or service operation was performed.
+
+Freeze and rerun the budget pair under v7. Keep the prior failed artifact failed. A1024 cap provides more room for late admission but cannot guarantee overlap; each real arm must still pass the gate. This is a correctness fixture and supplies no performance or deployment pass by itself.

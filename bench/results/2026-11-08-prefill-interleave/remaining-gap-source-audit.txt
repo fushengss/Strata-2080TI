@@ -1,0 +1,130 @@
+Read-only audit of v3 on admission: remaining output gap and PP8 occupancy
+Source: /Users/fu/project/HAI/Strata-decode-head, candidate bf5a8e5b24b1973efbae747a109f5a970b25e09d
+Run: /Users/fu/project/HAI/Strata/bench/results/2026-11-08-prefill-interleave/qualification-v3-on-off1/01-on
+No service/source edits, remote commands, or inference were performed for this audit.
+This is one on-arm qualification. No speedup or prefill non-regression claim follows from it.
+
+1. The 1.8-second gap is consistent with admission-time conversation parking.
+
+Observed client wall-clock evidence:
+  previous long request ends: 1794070131.1021106
+  next cold request starts:   1794070131.1159074
+  its deliberate HTTP close: 1794070132.5980177
+  peer 0 visible gap: 1794070131.2352498 -> 1794070133.0322618 = 1.7970121 s
+  peer 1 visible gap: 1794070131.2326756 -> 1794070133.0063740 = 1.7736983 s
+  peer 2 visible gap: 1794070131.2267444 -> 1794070132.9926927 = 1.7659483 s
+  peer 3 visible gap: 1794070131.2225144 -> 1794070132.9876776 = 1.7651632 s
+  UTC interval for peer 0: 2026-11-07 16:48:51.235 -> 16:48:53.032.
+Client anchors: admission/admission-peer-0.chunks.jsonl:233 and :234;
+admission/admission-cancel-cold.json:10 and :22.
+
+engine.log:334 records parking the previous 59939-token conversation in
+1343.8 ms, snapshot_bytes=1402574080, immediately before read_id=5 begins (:335).
+The worker read then takes 5875.702 ms (:336), while the request reports 7240 ms
+(:339). Their difference is about 1364.3 ms, versus the explicitly measured
+1343.8 ms park. This strongly identifies the park as the dominant pre-read cost.
+The four streams stop together, supporting an engine-wide scheduling gap rather
+than an isolated client stall. Snapshot bytes are logical saved-image size, not
+a measurement of physical PCIe bytes or bandwidth.
+
+Important limit: engine.log has ordering and phase durations but no wall-clock
+timestamp on every line. It does not directly bind the entire 1.797-second client
+interval to one native phase. About 0.45 seconds beyond the reported park remains
+unattributed; drain/refill, host setup, first-window launches and SSE timing are
+candidates, not measured shares. The HTTP cancel happens near the end of the park,
+not necessarily while the GPU reader is active.
+
+A second consistent observation: peer 0 has a 1.29855 s gap at
+1794070208.1517406 -> 1794070209.4502914; engine.log:404 later records another
+59939-token park of 1127.5 ms before a resumed short read (:438). This supports
+the same mechanism but also lacks exact native per-line wall-clock correlation.
+
+Code mechanism (absolute paths):
+  /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:15464
+    Incoming admission drains the target pipeline before processing the request.
+  /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:16455
+    A conversation switch calls park_current before read_part/concurrent reader.
+  /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:12176
+    park_source explicitly describes this silent request-stage snapshot stretch.
+  /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:12340
+    Later GPU stages are saved sequentially, each with cudaDeviceSynchronize
+    and conversation_snapshot_save; the host does not call pump in that loop.
+  /Users/fu/project/HAI/Strata-decode-head/src/core/conversation_snapshot.cpp:292
+    conversation_kv_save resizes host buffers and transfers saved KV parts.
+  /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:17730
+    Reader/pump overlap starts later, so the new feature does not cover parking.
+  /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:14314
+    copy_to_slot also precedes steady slot decode; engine.log:320 and :348 report
+    186.8/185.5 ms for the two full long admissions. This is a separate boundary
+    cost and should not be confused with the 1343.8 ms pre-read park.
+
+2. --split-chunks 2 is not a two-chunk in-flight limit.
+
+  /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:17109
+    lend returns immediately when pf_parts is empty (own prompt buffers).
+  /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:17114
+    --split-chunks changes the cap for borrowed-buffer layout; it is not a global
+    semaphore that permits only two chunks in an eight-stage pipeline.
+  engine.log:316 and :344 explicitly show chunk=8192 for tokens=59932, hence
+    eight chunks in these long reads (seven full chunks plus a smaller tail).
+  /Users/fu/project/HAI/Strata-decode-head/src/prefill/prefill.cpp:6229
+    A stage waits for only its direct successor's previous chunk, forwards the
+    current chunk, then continues; double handoff buffers do not cap the whole
+    pipeline at two chunks.
+
+3. C4 does not supply eight independent target windows.
+
+  /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:14840
+    GS=batch/groups=8/8=1. The workload has four active resident slots/groups.
+  /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:15232
+    A group cannot start a second target window while its first is in flight.
+  /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:15233
+    Stage 0 also waits for that group's MTP proposal chain to become ready.
+  /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:15164
+    A group advances through stages only after the prior stage completes;
+    terminal verdict and commit precede its next speculative step.
+
+Ignoring offloaded head/draft activity, four active groups can occupy at most four
+target stages at once. Additional empty groups do not create independent work.
+This is not a 50% bound on nvidia-smi utilization: draft/head kernels, prefill,
+copies, unequal stage times and waiting kernels contribute differently.
+
+Prefill also has finite fill/drain cost. An illustrative model with eight equal
+chunks and eight equal stages has average prefill stage occupancy
+8/(8+8-1)=53.3% over the whole prompt. Here the last chunk is shorter, stages have
+unequal work, and decode overlaps, so this formula is neither a prediction of
+the observed ~53.6% activity nor a bound on combined utilization. It explains
+why a finite request cannot spend its entire lifetime at a full pipeline.
+
+The GPU CSV samples every ~0.5 s and nvidia-smi activity itself uses rolling
+windows. Around the 1.8 s client gap several cards fall to 0-2% sampled activity
+and power is mostly ~75-98 W, consistent with broad idle time. These samples
+cannot resolve the exact park/drain/copy subphases or achieved FLOP/bandwidth use.
+
+4. Next profiling, separated from the performance A/B.
+
+First collect native and client timestamps on the same wall-clock for admission
+drain -> park -> state restore/reset -> reader begin/end -> final drain ->
+copy_to_slot -> first resumed BT. Existing progress reports already name parking;
+use that phase plus a monotonic-to-epoch anchor, not only total request TTFT.
+
+Existing diagnostics to inspect in a dedicated run:
+  STRATA_TRACE: drain and admission/checkpoint costs (generate.cpp:15466).
+  STRATA_PARK_TRACE: KV attribute queries, host resize and copy times; implementation
+    in conversation_snapshot.cpp:249 and report in conversation_state.cpp:589.
+    It must be verified that the chosen multi-stage save path emits the detail.
+  STRATA_P4_TIMING / STRATA_P4_TRACE: per-stage launch/completion, host launch
+    time, idle-with-ready-work versus starved, group in-flight count. See
+    /Users/fu/project/HAI/Strata-decode-head/include/strata/program/pipe_probe.hpp:1.
+  STRATA_PREFILL_TIMING: phase events and host setup/sync/chunk costs. See
+    /Users/fu/project/HAI/Strata-decode-head/src/prefill/prefill.cpp:3019.
+    Event intervals include queue/contention/wait time; they are not isolated
+    kernel execution times under concurrent work.
+
+If available, a bounded CUDA API/CPU-thread/GPU timeline should separate
+cudaDeviceSynchronize, D2H/H2D copies, host allocation/page faults, graph/module
+initialization and PLE gather mutex delay. Record the queue that is actually
+ready before choosing an optimization. Do not turn on extra chunks, async park,
+or a larger batch solely to raise an activity percentage; preserve correctness,
+cache lifetime and prefill throughput, and measure client gaps and whole-workload
+completion. This audit introduces no implementation or performance selection.

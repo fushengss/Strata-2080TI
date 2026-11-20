@@ -1,0 +1,361 @@
+
+usage: nsys start [<args>]
+
+	-b, --backtrace=
+
+	   Possible values are 'lbr', 'fp', 'dwarf', or 'none'.
+	   Select the backtrace method to use while sampling.
+	   Select 'none' to disable backtrace collection.
+	   Default is 'lbr'.
+
+	-c, --capture-range=
+
+	   Possible values are none, cudaProfilerApi, nvtx, hotkey.
+	   When '-c cudaProfilerApi' is used, profiling will start only when cudaProfilerStart API is
+	   invoked in the application.
+	   When '-c nvtx' is used, profiling will start only when the specified NVTX range is
+	   started in the application.
+	   When '-c hotkey' is used, profiling will start only when the hotkey
+	   set by '--hotkey-capture' is pressed in the application. This works for graphic apps only.
+	   Note that you must enable CUDA or NVTX tracing of the target application
+	   for '-c cudaProfilerApi' or '-c nvtx' to work.
+	   When '-capture-range none' is used, cudaProfilerStart/Stop APIs and hotkey will 
+	   be ignored and NVTX ranges will be ignored as collection start/stop triggers.
+	   Default is none.
+
+	--capture-range-end=
+
+	   Possible values are 'none', 'stop' or 'repeat[:N]'.
+	   Specify the desired behavior when a capture range ends. Applicable only when used along
+	    with --capture-range option.
+	   If 'none', capture range end will be ignored.
+	   If 'stop', collection will stop at capture range end. Any subsequent capture ranges will be
+	   ignored. Target app will continue running.
+	   If 'repeat[:N]', collection will stop at capture range end and subsequent capture ranges
+	   will trigger more collections. 
+	   Use the optional ':N' to specify max number of capture ranges to be honored. Any subsequent
+	   capture ranges will be ignored once N capture ranges are collected.
+	   Default is 'stop'.
+
+	--cpu-core-events=
+
+	   CPU Core events to sample.
+	   Possible values are (for example) '2,3,...'.
+	   Use the '--cpu-core-events=help' switch to see the full list of events.
+	   Multiple values can be selected, separated by commas only (no spaces).
+	   Requires root privileges or a paranoid level of 0 or less.
+	   Use the --event-sample switch to enable.
+
+	--cpuctxsw=
+
+	   Possible values are 'process-tree', 'system-wide', or 'none'.
+	   Trace OS thread scheduling activity. Select 'none' to disable tracing CPU context switches. 
+	   'system-wide' requires root privileges or a paranoid level of 0 or less.
+	   If CPU IP/backtrace sampling is enabled, --cpuctxsw equals the --sample setting.
+	   For example, if --sample=process-tree, then --cpuctxsw=process-tree.
+	   If --sample=none and a target application is launched, the default is 'process-tree',
+	   otherwise the default is 'none'.
+
+	--debug-symbols=
+
+	   Specify the paths to directories with symbol files.
+	   Multiple directories can be selected, separated by a colon (':') only (no spaces).
+
+	(Experimental) --enable=<plugin_name>[,arg1,arg2,...]
+
+	   Use the specified plugin.
+	   The option can be specified multiple times to enable multiple plugins.
+	   Plugin arguments are separated by commas only (no spaces).
+	   Commas can be escaped with a backslash '\'. The backslash itself can be
+	   escaped by another backslash '\\'. To include spaces in an argument,
+	   enclose the argument in double quotes '"'.
+	   To list all available plugins, use '--enable=help' command.
+
+	--event-sample=
+
+	   Enable event sampling.
+	   Possible values are 'system-wide' or 'none'.
+	   Select 'none' to disable event sampling.
+	   The default is 'none'.
+	   Use the '--cpu-core-events=help' and the '--os-events=help' switches to see the 
+	   full list of events.
+	   Requires root privileges or a paranoid level of 0 or less.
+	   If event sampling is enabled and no events are selected, 
+	   the CPU Core event 'Instructions Retired' is selected by default.
+
+	(Deprecated) --event-sampling-frequency=
+
+	   WARNING: This switch is no longer supported.
+	   Please use the event-sampling-interval switch instead.
+
+	--event-sampling-interval=
+
+	   The interval between each event sample collection.
+	   Minimum event sampling interval is '1' milliseconds.
+	   Maximum event sampling interval is '1000' milliseconds.
+	   The default is '10' milliseconds.
+
+	--export=<format>[,<format>...]
+
+	   Possible formats are: none sqlite hdf text json arrow arrowdir parquetdir
+	   Create additional output file(s) based on the data collected.
+	   If 'none' is selected, no additional files are created.
+	   Default is 'none'. This option can be given more than once.
+
+	-f, --force-overwrite=
+
+	   Possible values are 'true' or 'false'.
+	   If true, overwrite all existing result files with same output filename
+	   (QDSTRM, nsys-rep, SQLITE, HDF, TEXT, JSON, ARROW, ARROWDIR, PARQUETDIR).
+	   Default is 'false'.
+
+	--flush-on-cudaprofilerstop=
+
+           If set to 'true', any call to cudaProfilerStop() will
+           cause the CUDA trace buffers to be flushed. Note that the CUDA trace
+           buffers will be flushed when the collection ends, irrespective of the
+           value of this switch. Default value is 'true'.
+
+	--ftrace=
+
+	   Collect ftrace events.
+	   Argument should list events to collect as: subsystem1/event1,subsystem2/event2.
+	   To collect trace markers, set '--ftrace=ftrace/print'.
+	   Requires root privileges.
+	   Default is '' (no ftrace events are collected by default). System scope.
+
+	--ftrace-keep-user-config=
+
+	   Possible values are 'true' or 'false'.
+	   Skip initial ftrace setup and collect already configured events.
+	   Default is 'false' (nsys will reset the ftrace configuration).
+
+	--gpu-metrics-devices=
+
+	   Collect GPU Metrics from the specified devices.
+	   Possible values are:
+	     'none', 'cuda-visible', 'all',
+	   or a comma separated list of GPU IDs reported by '--gpu-metrics-devices=help' switch.
+	   Default is 'none'. System scope.
+
+	--gpu-metrics-frequency=
+
+	   Specify the sampling frequency for GPU Metrics.
+	   Minimum supported frequency is '10' (Hz).
+	   Maximum supported frequency is '200000' (Hz).
+	   Default is '10000'. System scope.
+
+	--gpu-metrics-set=
+
+	   Specify the metric set for GPU Metrics.
+	   The option argument must be one of aliases reported by '--gpu-metrics-set=help' switch.
+	   Default is the first metric set that supports all selected GPU. System scope.
+
+	--gpu-video-device=
+
+           Collect GPU video accelerator traces from specified devices.
+           The argument must be 'none' or one or more GPU IDs reported by '--gpu-video-device=help'.
+           Default is 'none'. System scope.
+
+	--gpuctxsw=
+
+	   Possible values are 'true' or 'false'.
+	   Trace GPU context switches. This switch requires CUDA driver r435.17 or higher.
+	   Default is 'false'. System scope.
+
+	-h, --help=[<tag>]
+
+	   Print the command's help menu. The switch can take one optional
+	   argument that will be used as a tag. If a tag is provided, only options
+	   relevant to the tag will be printed.
+	   The available help menu tags for this command are:
+
+	   backtrace, cpu, cuda, export, ftrace, gpu, interactive, metrics, network,
+	   nic, os, output, pmu, range, sample, sampling, session, stats, switch, symbol,
+	   symbols, and trace.
+
+	--ib-net-info-devices=
+
+           A comma-separated list of NICs names.
+           The NICs which ibdiagnet will use for networks discovery.
+           This option creates the ibdiagnet files to be used for
+           collecting network information.
+           Example value: 'mlx5_0,mlx5_1'.
+           If the --ib-net-info-output option is set then Nsight Systems will store the network information at this path.
+           Otherwise it will be created at a temporary path
+           and will be discarded after processing.
+           If more than one NIC was specified, only the last network information file be saved.
+           Note that this option should not be used together with
+           the --ib-net-info-files option.
+
+	--ib-net-info-files=
+
+           A comma-separated list of file paths.
+           Paths of an existing ibdiagnet db_csv files, containing networks information data.
+           Nsight Systems will read the networks information from these files.
+           Don't use '~' alias within the path.
+           Note that this option should not be used together with
+           the --ib-net-info-devices option.
+
+	--ib-net-info-output=
+
+           Sets the path of a directory into which
+           ibdiagnet network discovery data will be written.
+           Use this option together with the --ib-net-info-devices option.
+           Don't use '~' alias within the path.
+
+	(Experimental) --ib-switch-congestion-device=<IB switch GUID>[,<IB switch GUID>...]
+
+	   A comma-separated list of InfiniBand switch GUIDs.
+	   Collect InfiniBand switch congestion events from switches identified by
+	   the specified GUIDs.
+	   This switch can be used multiple times.
+	   Default is an empty list. System scope.
+	   Use the --ib-switch-congestion-nic-device, --ib-switch-congestion-percent,
+	   and --ib-switch-congestion-threshold-high switches to further control how
+	   congestion events are collected.
+
+	(Experimental) --ib-switch-congestion-nic-device=
+
+	   The name of the NIC (HCA) through which InfiniBand switches will be
+	   accessed. By default, the first active NIC will be used.
+	   One way to find a NIC's name is via the `ibstat -l` command.
+	   Example usage: --ib-switch-congestion-nic-device=mlx5_3
+
+	(Experimental) --ib-switch-congestion-percent=
+
+	   Percent of InfiniBand switch congestion events to be collected.
+	   This option enables reducing the network bandwidth consumed
+	   by reporting congestion events.
+	   Values are in the [1,100] range. Default value is 50.
+
+	(Experimental) --ib-switch-congestion-threshold-high=
+
+	   High threshold percentage for InfiniBand switch egress port queue size.
+	   When a packet enters an InfiniBand switch, its data is stored at an
+	   ingress port buffer. A pointer to the packet's data is inserted into
+	   the egress port's queue, from which the packet will be exiting the switch.
+	   At that point, the threshold given by this command line argument is compared
+	   to the egress queue data size. If the queue data size exceeds the threshold,
+	   a congestion event is reported.
+	   The threshold is given in percent of the ingress port size.
+	   An egress port queue can point data coming from multiple ingress port
+	   buffers, therefore the threshold can be bigger than 100%.
+	   Values are in the (1,1023] range, default value is 75 percent.
+
+	(Experimental) --ib-switch-metrics-device=<IB switch GUID>[,<IB switch GUID>...]
+
+	   A comma-separated list of InfiniBand switch GUIDs.
+	   Collect metrics from the specified InfiniBand switches.
+	   This switch can be used multiple times.
+	   Default is an empty list. System scope.
+
+	(Experimental) --ib-switch-metrics-nic-device=
+
+	   The name of the NIC (HCA) through which InfiniBand switches will be
+	   accessed for performance metrics samples. By default, the first active NIC
+	   will be used. One way to find a NIC's name is via the `ibstat -l` command.
+	   Example usage: --ib-switch-metrics-nic-device=mlx5_3
+
+	--nic-metrics=
+
+	   Possible values are 'true' or 'false'.
+	   Collect metrics from NIC/HCA devices.
+	   Default is 'false'. System scope.
+
+	-o, --output=
+
+	   Output report filename.
+	   Any %q{ENV_VAR} pattern in the filename will be substituted with the value of the 
+	   environment variable.
+	   Any %h pattern in the filename will be substituted with the hostname of the system.
+	   Any %p pattern in the filename will be substituted with the PID of the target process or
+	   the PID of the root process if there is a process tree.
+	   Any %n pattern in the filename will be substituted with the minimal positive integer that is 
+	   not already occupied.
+	   Any %% pattern in the filename will be substituted with %.
+	   Default is 'report%n'.
+
+	--os-events=
+
+	   OS events to sample.
+	   Possible values are (for example) '0,3,...'.
+	   Use the '--os-events=help' switch to see the full list of events.
+	   Multiple values can be selected, separated by commas only (no spaces).
+	   Use the --event-sample switch to enable.
+
+	-s, --sample=
+
+	   Possible values are 'process-tree', 'system-wide' or 'none'.
+	   Collect CPU IP/backtrace samples. Select 'none' to disable sampling. 
+	   'system-wide' requires root privileges or a paranoid level of 0 or less.
+	   If a target application is launched, the default is 'process-tree', otherwise the default
+	   is 'none'.
+
+	--samples-per-backtrace=
+
+	   Possible values are integers between 1 and 32.
+	   The number of CPU IP samples collected for every CPU IP sample backtrace collected. For 
+	   example, if set to 4, on the fourth CPU IP sample collected, a backtrace will also be 
+	   collected. Lower values increase the amount of data collected. Higher values can reduce 
+	   overhead and help reduce the number of CPU IP samples dropped. 
+	   Default is 1. If DWARF backtraces are collected, the default is 4.
+
+	--sampling-period=
+
+	   Possible values are integers between 23200000 and 181250.
+	   The number of Reference Cycles events counted before a CPU instruction pointer (IP)
+	   sample is collected. 
+	   If configured, backtraces may also be collected. The smaller the sampling period, the higher
+	   the sampling rate. 
+	   Note that lower sampling periods will increase overhead and significantly increase the size
+	   of the result file(s). 
+	   Default is 1450000. If DWARF backtraces are collected, the default is 2900000.
+
+	--session=
+
+	   Launch the application in the given session.
+	   The option argument must represent a valid session name or ID as reported by 'nsys sessions
+	   list'.
+	   Any '%q{ENV_VAR}' pattern in the option argument will be substituted with the value of the
+	   environment variable.
+	   Any '%h' pattern in the option argument will be substituted with the hostname of the system.
+	   Any '%%' pattern in the option argument will be substituted with '%'.
+
+	--session-new=
+
+	   Start the collection in a new named session. The option  argument represents the session
+	   name.
+	   The session name must start with an alphabetical character followed by printable or space
+	   characters.
+	   Any '%q{ENV_VAR}' pattern in the session name will be substituted with the value of the
+	   environment variable.
+	   Any '%h' pattern in the option argument will be substituted with the hostname of the system.
+	   Any '%%' pattern in the option argument will be substituted with '%'.
+
+	--stats=
+
+	   Possible values are 'true' or 'false'.
+	   Generate summary statistics after the collection.
+	   When set to true, an SQLite database file will be created after the collection.
+	   Default is 'false'.
+
+	(Experimental) --storage-metrics=
+
+	   Collect throughput and operations metrics from storage devices.
+	   For further information see:
+	   https://docs.nvidia.com/nsight-systems/UserGuide/#storage-metrics-profiling
+
+	(Experimental) --syscall
+
+	   Possible values are 'none', 'process-tree' or 'pid-namespace'.
+	   Collect syscall events.
+	   Default is 'none'.
+
+	-x, --stop-on-exit=
+
+	   Possible values are 'true' or 'false'.
+	   Stop profiling when the launched application exits.
+	   If stop-on-exit=false, duration must be greater than 0.
+	   Default is 'true'.
+

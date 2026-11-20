@@ -1,0 +1,8 @@
+BYIELD v5 independent local review
+Outcome: PASS for freeze and separate on/off GPU qualification; no runtime or deployment approval.
+
+Only the BYIELD resident peers change from4096 to3072 requested output tokens, keeping the same synthetic prompt identities/seed. All six normal-request length/exact usage/answer-only gates and on/off output hashes remain required. The actual workload files for admission, finite mixed, C8, prefill, budget and correctness are unchanged from v4. offline_tests.py only adjusts the fake service resident classification threshold.
+
+The first draft's peer coverage used HTTP end alone, which could mistake late terminal drain for a still-generating peer. Final v5 additionally requires each of exactly4 distinct peer lanes' last visible-content chunk at/after max(long.end,short.end), while first visible content precedes long.start and normal length finish remains mandatory. First/last visible and HTTP finish margins are recorded. A specific early-last-content24s / HTTP-end80s / required-end25s negative case now rejects. This establishes a finite SSE output span covering the transfer/recovery phase, not uninterrupted generation or GPU occupancy. Native read/park/resume/order/short-first evidence remains necessary.
+
+Independent command python3 -B byield_smoke.py --self-test passed with no HTTP/GPU. File bindings are in byield-v5-independent-review.json. Earlier v4 natural-EOS fixture failure is not relabelled as a full qualification pass; use v5 in both compared BYIELD arms.

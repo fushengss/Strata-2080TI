@@ -1,0 +1,46 @@
+Incremental v2 independent review: PASS exact A/B with a documented latency tradeoff.
+
+The completed ON/OFF pair uses frozen v2, engine45eaa612, PARK_OVERWRITE0.
+Re-running the frozen comparator passed all identities, actual request/message
+hashes, output/channel hashes, finish reasons, three usage counts and cache
+metadata. Independently recomputed request gates and actual assistant chain
+passed in both arms. Four residents visibly cover all measured phases. Exactly
+15722 output tokens per arm: seed64, residents4096/3275/4096/4096, increments64/19/12.
+Normal EOS therefore does not create unequal work.
+
+Post-seed finite-cohort throughput:145.7707 ->154.5781 tok/s (+6.042%).
+Whole case including cold seed:127.7798 ->134.3464 tok/s (+5.139%).
+These rates include admissions, waits, count preflight and final drain; they are
+not pure decode throughput.
+
+During incremental mixed work, maximum resident visible SSE silence fell from
+3.4513 to1.8466s (-46.50%). Maximum collective no-visible-event gap fell from
+3.4314 to1.8167s (-47.06%). Total time all four lanes exceeded1s since their last
+visible event fell6.2383 ->1.2948s (-79.24%). Ordinary per-lane chunk-gap p95 rose
+from26.22–26.28ms to39.09–39.92ms; p99 also rose. This improves the long stalls
+and finite-cohort efficiency, not every latency statistic.
+
+Actual continuation prompts100937/101867/102752, reused100070/101000/101885,
+fresh867 each, exactly equal across arms. Initial cross-conversation restore
+is recorded as live100070, beyond prior proven user-turn100000; subsequent
+prior user-turn boundaries100930/101860 are also retained. Current read endpoints
+are prompt−7. The real prior assistant replies form the next messages, bound
+by complete body/message/output hashes; no assistant text is persisted.
+
+Visible TTFT:2.454/2.799/3.132 ->2.665/2.994/3.382s (+6.9–8.6%, +0.19–0.25s).
+Native prompt stage:2317.5/2664.9/2993.1 ->2535.1/2867.4/3250.7ms (+7.6–9.4%).
+The measured tradeoff fits prioritizing concurrent stall reduction when the
+operator accepts modest incremental prefill latency increases.
+
+Mixed NVML eight-card mean sampled activity:30.48 ->35.63%; individual ON
+means30.47–44.41%. Activity p10 improves on most cards but remains0 on GPU5.
+This is not full hardware utilization. Observed ON mixed mean SM clocks range
+1809–1860MHz, below the requested2000MHz. Mixed samples show no thermal or
+hardware power-brake flags; software power-cap appears on up to17.65% of a
+card's samples. Nominal500ms sampling has actual gaps up to0.714s. Full per-card
+mean/p10 power/clocks/activity/throttle statistics and raw-source hashes are in
+the JSON review and paired GPU analyses.
+
+Only one exact synthetic incremental pair is measured. No deployment action
+was performed. Combine this evidence with the separate complete core8 review;
+remaining1.8s stalls and all-card saturation remain future work.

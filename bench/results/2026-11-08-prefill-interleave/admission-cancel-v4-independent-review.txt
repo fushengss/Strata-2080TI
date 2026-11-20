@@ -1,0 +1,27 @@
+Admission cancellation qualification — independent local source/semantics review
+2026-11-08; engine source bf5a8e5b24b1973efbae747a109f5a970b25e09d.
+No engine/harness changes or remote/GPU operations by this reviewer.
+
+Observed issue reported by root
+The actual resident reader launched and overlapped decode. In the intentionally cancelled HTTP admission, the native reader ended with read_ok=0, pump_ok=1, and the following native request PERF reported cancelled with zero generated tokens. A later normal reuse completed. The old global all-read_ok=1 test would reject this expected cancellation. This report does not independently establish the actual-run outcome before downloaded artifacts are inspected, and native decode progress does not alone establish gap or throughput improvement.
+
+Engine semantics
+Prefill::run checks should_stop at chunk boundaries and returns false with err=cancelled (src/prefill/prefill.cpp:3388,7311). generate.cpp:13789 binds should_stop to stop_req. The reader records this false return as read_ok=0 (17736,17801); pump_ok is independent. After the reader is joined, failed pump or pipeline drain is still fatal (17811–17815), while a read failure propagates read_err (17835–17837). The outer prompt path treats a stopped read as cancelled only with the stop request or yield condition, and still rejects batch_fatal (18192–18205). Native PERF includes cancelled, actual read_n and produced_n (19771,19927–19938). Therefore read_ok=0 is not itself evidence of an engine fault under an intentional cancellation. It must not be globally permitted.
+
+Minimum narrow harness semantics agreed for separate v4
+1. Before the sole cancel request, begin a dedicated owned-log byte slice. Observe a uniquely identifiable still-open large reader from that slice, then close only that request's HTTP socket. Preserve the observation/shutdown race disclaimer.
+2. Finish the cancel slice before issuing the normal reuse request. In that slice the only failed read must be the observed reader ID, with read_ok=0 and pump_ok=1. Keep every marker parsed and every ID uniquely paired. No other read/pump failure is exempt.
+3. Bind the failure to exactly one complete native cancelled PERF line for the counted cancel prompt, occurring after that reader end and before the next reader begin. Require zero generated tokens, initial reuse zero, fresh extent equal to prompt count and actual read count in range. A free-floating cancelled substring is insufficient.
+4. Require intentional API cancellation with no output chunks; cancel/reuse request hashes equal; reuse and all other six normal requests pass existing exact logical usage/output gates; closed seven-request set and server idle at end.
+5. Only a fully validated admission-on report may authorize that one failed read ID. The runner independently recomputes approval and passes it to its global reader validator. Other suites, off arms, unmatched IDs, malformed markers, pump errors, CUDA errors, unsafe ownership/residency or nonzero source dispatch remain failures.
+6. A read_ok=1 boundary race does not establish interrupted-reader coverage; keeping that case fail closed is acceptable. Do not claim immediate GPU cancellation or chunk-exact shutdown from this HTTP test.
+
+Status
+Source semantics and proposed narrow v4 qualification are acceptable. Actual v4 code and any actual-run artifacts remain to be reviewed; this is not a GPU pass or deployment approval.
+
+Code follow-up
+Reviewed harness-v4 admission_smoke.py, cancel_read_proof.py, interleave_evidence.py and runner_interleave.py. File SHA256 bindings are in admission-cancel-v4-review-binding.json. The implementation uses the same observed byte snapshot to select the open read and record observation_offset; seals its cancel slice before reuse; reopens and hashes the exact slice in the runner; reconstructs the narrow approval; limits the exception to admission/on; and keeps all pump, ownership/residency, parsing/pairing and source-dispatch checks. No remaining static blocker was found. Independent local runs of cancel_read_proof.py and interleave_evidence.py both passed, without HTTP or GPU. Author's full fake-HTTP check/freeze and actual GPU rerun remain separate gates.
+
+Downloaded old v3 admission evidence was inspected independently: its case-level seven-request/exclusive/idle and six normal-result gates passed. Reader5 had read_ok0/pump_ok1, 5875.702ms; API intentional cancel had no first output; its same-request SHA retry completed64tokens normally. First and cancelled prompts both count59939tokens, so count alone cannot disambiguate them. The old artifact has no new dedicated cancellation window metadata and is not retroactively relabelled a v4 full qualification pass.
+
+Final freeze binding: four reviewed file hashes remain unchanged; harness-v4-freeze.json SHA256 6b86c673a6ecfb3b52de1e2ecc56afc050d614633a87a6708e3536fd610eb1c5; tar.gz SHA256 56760413e708d26d3d541328ce685bb3e4ef02a23046b395f8d6a966a6915775. Author reported complete offline/fake HTTP checks passed. No remaining local review blocker; GPU rerun remains required.

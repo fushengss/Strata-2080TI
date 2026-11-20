@@ -1,0 +1,139 @@
+Offline comparison / deployment review — 2026-11-08
+Author scope: local read-only preparation; no remote or GPU actions.
+All frozen harness directories and their archives remain unchanged.
+
+Pairing and qualification
+
+The v7 compare_interleave.py accepts arm directories from different parent run
+directories, provided their full harness hash map, engine/library/server/base
+config identities, normalized config, selected suite sets, and actual output
+contracts agree. Always pass --baseline OFF --candidate ON, regardless of the
+chronological run order. A new v7 on/off run with suites
+admission,byield,budget,primary,mixed100k can combine fresh qualification with
+reverse-order finite performance measurements. Pass the frozen calibration and
+SHA because the finite suites require it. Its finite request generators, bodies,
+seeds and budgets match v6. The only v7 input change is four budget-suite output
+caps from384 to1024; that suite still requires actual four-way SSE overlap and
+exact output/actual usage/finish equality. v5 BYIELD peers remain3072.
+
+Do not compare one v6 arm directly against one v7 arm: the full harness identity
+check correctly rejects it. Aggregate two separately qualified within-version
+pairs only after confirming the engine/config/library/server and unchanged
+finite suite inputs agree. Do not merge individual arm files or relabel previous
+failed fixture runs as passed.
+
+The frozen standalone comparator has a completion-check limitation: it compares
+the suite_returncodes keys currently present, without independently requiring
+metadata.finished_epoch, all manifest-planned suites, or a failure-free ended
+parent run. Automatic runner comparison is reached only after completed arms,
+so its normal path is safe. For a manual comparator invocation, additionally
+require both arm metadata finished, exact planned suite sets with every rc0,
+parent ended_epoch and no failure, and membership of the completed arm in the
+parent arms list. Review the runner's source/marker/target-head/cleanup proofs,
+not only a child suite's return code.
+
+The standalone analysis below independently requires finished arms, complete
+planned suite sets, ended parents and no parent failure before publishing any
+comparative metrics. It requires case manifests/reports qualified, exact engine,
+server, library, base config, full harness, calibration, normalized config, case
+plan/fixture/count hashes, unique expected requests, same request/output/channel
+hashes, finish reasons and three logical API usage counts. It also rechecks
+normal completion and integer count/native predicted_n consistency. A matched
+normal EOS cohort remains valid. An unmatched EOS length cannot claim speedup.
+
+Acceptance metrics, declared before candidate results
+
+Use root's predeclared guard: cold AND warm standalone median native read_ms and
+TTFT no more than3% worse than the matching off arm; repeat if outside that
+range. There are only3 observations per kind and arm, so retain individual
+observations/min/max and reverse order if temperature, clocks or cache state
+could dominate the result. This is a practical measurement guard, not a
+statistical guarantee of zero regression. Standalone fixtures are approximately
+100k (actual counts in the results, commonly101139), while finite injected
+fixtures are calibrated exactly10000/60000/100000. Label each correctly.
+
+Mixed injected native prompt time and API-visible TTFT need explicit review:
+a smaller resident stall does not justify silently worsening prefill admission.
+Compare each actual10k/60k/100k injection independently; queue/park/restore/API
+costs make TTFT different from native read/prompt time. Native reader read_ms is
+another scope, excluding end drain, and cannot replace either API TTFT or the
+request's native prompt_ms. Evaluate primary and mixed100k first, then reverse
+order with the same request contract before claiming a stable improvement.
+
+Report resident per-lane phase p95/p99/max visible SSE gaps, largest gap clipping
+the phase, and collective intervals with no visible SSE from any resident. Keep
+both clipped durations and full gap endpoints: clipping can conceal a long gap
+spanning a boundary. Preserve all-four actual visible coverage for baseline,
+mixed and recovery, including last visible output at/after recovery end. A late
+HTTP terminal event does not prove the decoder was active. Show whole-case
+actual API completion tokens per elapsed second only after exact workload
+parity; it includes initial admission and final drain. Do not infer pure decode
+throughput by subtracting prompt/park durations or assigning token timestamps
+from bytes. SSE chunk gaps are client-arrival gaps, not token TBT.
+
+All correctness, C8, admission cancel/reuse, BYIELD park/resume/short-first and
+budget continuation/wrap tests must qualify, with output hashes and actual
+usage/finish reasons paired. Source proof requires one-to-one source markers,
+lookahead idle1 and dispatch_delta0; explicitly confirm staged1 was exercised
+for this host. read_ok0 is allowed only for the independently approved on-arm
+admission cancellation reader. No other failed read or pump can be excused.
+
+GPU nvidia-smi activity is sampled every500ms. Show each card's mean/p10 activity,
+actual SM clock, power and throttle fraction over the same SSE phase windows.
+A reported100% activity is not proof of peak SM FLOPS, memory bandwidth, or useful
+throughput. Seek improved useful output continuity with unchanged prefill, not
+an occupancy number in isolation. Hardware clocks/power changes or other GPU
+work invalidate a clean scheduling attribution.
+
+Standalone visible-content analysis
+
+Script: /Users/fu/project/HAI/Strata/bench/results/2026-11-08-prefill-interleave/analyze_visible_silence.py
+CPU validation:
+  python3 -B <script> --self-test
+Paired completed finite runs:
+  python3 -B <script> --baseline <OFF_ARM> --candidate <ON_ARM> \
+    --suites primary,mixed100k --out <NEW_JSON>
+Unpaired admission diagnostic only:
+  python3 -B <script> --single-case <ARM/admission> --out <NEW_JSON>
+
+Only chunks with positive bytes.visible_content count as visible progress.
+The collective event stream is the union of all four peer visible epochs.
+Threshold spans start0.25/1/5 seconds after each peer's last visible event; the
+all-four interval intersection measures simultaneous stalled time. The script
+stores numeric epochs/counts/byte-derived channel hashes, never output text.
+It cannot access HTTP/GPU/network and refuses to overwrite its output. Tests
+cover reasoning-only deltas, boundary clipping, late HTTP end, matched normal
+EOS, count/native/tool/error/phase mismatches and unfinished planned suites.
+The JSON intentionally makes no automatic deployment decision.
+
+Remaining park stall: tighter evidence from existing timestamps
+
+Unpaired h4 admission diagnostic:
+  qualification-v3-h4-on-off1/01-on/admission/results.json
+  engine.log lines334–335 / exact cancel byte slice38005–38287
+  observed open read_id5, no emitted content, later approved cancellation.
+
+Cancel request start_epoch1794071016.9200463.
+Open-reader snapshot observed epoch1794071018.265783.
+The exact pre-observation log slice contains only the59939-token park1218.9ms
+(snapshot_bytes1402574080) followed by read_id5 begin. Source performs this
+park synchronously in admitting the new BGEN, before reader/pump start.
+All four resident streams have a collective visible-event gap
+1794071017.0337849 →1794071018.6506941, duration1.6169093s;
+maximum single-peer clipped gap in the common visible window is1.6622181s.
+
+Conditional on that source-bound BGEN attribution and stable host wall clock,
+the park lies within the1.3457367s request→snapshot window. Using its rounded
+1218.9ms duration bounds its overlap with the collective gap to approximately
+1.105–1.219s. This is stronger than log ordering alone, but is still interval
+inference, not timestamped native park begin/end. It does not assign the
+remaining gap to a particular CUDA kernel/sync/copy, nor prove all park bytes
+crossed PCIe; streamed KV can be authoritative in host memory.
+
+Keep STRATA_PARK_TRACE diagnostics separate from timed A/B. Component durations
+can separate sync/checkpoint/running state/resize/copy cost but still cannot
+exactly align native phase boundaries with SSE epochs. Better precise
+attribution would log native begin/end monotonic timestamps plus a host epoch
+anchor and park/read/slot IDs, or use NVTX/CUPTI trace with clock correlation.
+A timestamped log follower would supply receipt bounds only (buffering remains).
+Never calculate a D2H bandwidth simply from snapshot_bytes divided by park time.
