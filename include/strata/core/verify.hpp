@@ -463,13 +463,14 @@ private:
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
     int last_rows_[strata::kernels::kWindowMaxT] = {};                ///< the slots of the last batch window's rows
     std::vector<int> bkey(const int* rows, int S, int hbase, bool target_head = false,
-                          bool direct_save = false) const {   // #871: the doorbell variant has its own graphs
+                          bool direct_save = false, bool stream_attn = false) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
         // No ordinary row/layout key contains a negative slot. Keep headless deferred bodies distinct from the
         // ordinary batch graph even when an admission/adaptive step uses the same rows and handoff base.
         if (target_head) k.push_back(-1);
         if (direct_save) k.push_back(-2);
+        if (stream_attn) k.push_back(-3);
         return k;
     }
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {

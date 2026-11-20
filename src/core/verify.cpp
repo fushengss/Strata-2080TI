@@ -335,6 +335,7 @@ bool batch_self_commit_on() { static const bool v = env_on("STRATA_BATCH_SELF_CO
 // streamed KV cache (a row's block resolve could evict the blocks an earlier row of the same slot selected).
 bool qsa_slots_on() { static const bool v = env_on("STRATA_QSA_SLOTS"); return v; }
 #define g_qsa_slots (qsa_slots_on())
+bool piped_stream_attn_on() { static const bool v = env_on("STRATA_PIPED_STREAM_ATTN_ROWS"); return v; }
 
 // every row of a batch window is another slot's (no slot has proposal rows)
 bool one_row_per_slot(const int* rows, int S) {
@@ -2079,26 +2080,77 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, bool dire
                     const char* v = std::getenv("STRATA_BATCH_ATTN_ROWS");
                     return v != nullptr && std::atoi(v) != 0;
                 }();
-                bool rows_ok = batch_rec_ && attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
-                for (int t = tb; rows_ok && t < te; ++t) rows_ok = slot_ss(t).qsa_states[qi].kv_mode != 1;
-                if (rows_ok) {
-                    const int n_rows = te - tb;
-                    strata::kernels::QsaScoreRows sr;
-                    strata::kernels::QsaAttnPoolsRows pr;
-                    sr.n = pr.n = n_rows;
-                    for (int t = tb; t < te; ++t) {
-                        const QsaState& sx = slot_ss(t).qsa_states[qi];
-                        sr.pooled[t - tb] = sx.idx_pooled;
-                        sr.dead[t - tb] = sx.idx_dead;
-                        pr.p[t - tb] = qsa_attn_pools(sx);
+                const auto slot_end = [&](int first) {
+                    int end = first + 1;
+                    while (end < te && brow_[end] == brow_[first]) ++end;
+                    return end;
+                };
+                // As in upstream #4937, resolve each slot's union before attending over its rows.
+                // Every selected cell can name at most one page. A capture must fit at the worst replay width,
+                // since current prompt length is not part of the graph key. Different slots have separate pools.
+                bool stream_rows_ok = batch_rec_ && staging_deferred_ && piped_stream_attn_on() &&
+                                      ar_on() && n > 1 && n <= kAttnRowsMax;
+                bool any_streamed = false;
+                if (stream_rows_ok) {
+                    for (int first = tb; stream_rows_ok && first < te;) {
+                        const int end = slot_end(first);
+                        const QsaState& sx = slot_ss(first).qsa_states[qi];
+                        any_streamed = any_streamed || sx.kv_mode == 1;
+                        stream_rows_ok = sx.kv_mode != 1 || end - first <= sx.n_slots / cap_;
+                        first = end;
                     }
-                    qsa_block_scores_rows(sr, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n_rows, max_blocks_, s,
-                                          scores_ + (size_t) tb * max_blocks_, cs);
-                    qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n_rows, max_blocks_, cap_,
+                    stream_rows_ok = stream_rows_ok && any_streamed;
+                }
+                bool rows_ok = batch_rec_ && attn_rows && n <= kAttnRowsMax;
+                for (int t = tb; rows_ok && t < te; ++t) rows_ok = slot_ss(t).qsa_states[qi].kv_mode != 1;
+                rows_ok = rows_ok || stream_rows_ok;
+                if (rows_ok) {
+                    strata::kernels::QsaAttnPoolsRows pr;
+                    if (stream_rows_ok) {
+                        // Keep the architecture's normal scorer. Proposals of the same slot share indexer keys.
+                        for (int first = tb; first < te;) {
+                            const int end = slot_end(first);
+                            const QsaState& sx = slot_ss(first).qsa_states[qi];
+                            qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + first * IQ * ID,
+                                             step_ + first * kStepCount, end - first, max_blocks_, s,
+                                             scores_ + (size_t) first * max_blocks_, cs);
+                            first = end;
+                        }
+                    } else {
+                        strata::kernels::QsaScoreRows sr;
+                        sr.n = pr.n = n;
+                        for (int t = tb; t < te; ++t) {
+                            const QsaState& sx = slot_ss(t).qsa_states[qi];
+                            sr.pooled[t - tb] = sx.idx_pooled;
+                            sr.dead[t - tb] = sx.idx_dead;
+                            pr.p[t - tb] = qsa_attn_pools(sx);
+                        }
+                        qsa_block_scores_rows(sr, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_, s,
+                                              scores_ + (size_t) tb * max_blocks_, cs);
+                    }
+                    qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_,
                                    s, sel_ + (size_t) tb * cap_, cs);
-                    qsa_decode_attn_batch_rows(qcur_ + tb * NH * HD, pr, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount,
-                                               cap_, s, attn_scratch_ + (size_t) tb * attn_scratch_floats_,
-                                               attn_ + tb * NH * HD, n_rows, cs);
+                    if (stream_rows_ok) {
+                        for (int first = tb; first < te;) {
+                            const int end = slot_end(first);
+                            const QsaState& sx = slot_ss(first).qsa_states[qi];
+                            const int32_t* selected = sel_ + (size_t) first * cap_;
+                            const int32_t* steps = step_ + first * kStepCount;
+                            qsa_kv_resolve(sx, *g_, selected, steps, end - first, cap_, cs);
+                            // Use the per-slot batch launcher so Turing keeps its INT8 V3 kernel.
+                            qsa_decode_attn_batch(qcur_ + first * NH * HD, qsa_attn_pools(sx), selected, steps,
+                                                  cap_, s, attn_scratch_ + (size_t) first * attn_scratch_floats_,
+                                                  attn_ + first * NH * HD, end - first, cs);
+                            first = end;
+                        }
+                        static std::atomic<bool> said{false};
+                        if (!said.exchange(true))
+                            std::fprintf(stderr, "strata verify: streamed KV batched slot attention captured (%d rows)\n", n);
+                    } else {
+                        qsa_decode_attn_batch_rows(qcur_ + tb * NH * HD, pr, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount,
+                                                   cap_, s, attn_scratch_ + (size_t) tb * attn_scratch_floats_,
+                                                   attn_ + tb * NH * HD, n, cs);
+                    }
                 } else
                 if (batch_rec_ && g_qsa_slots && !streamed) {
                     // the rows' block scores, top-k and attention, up to 8 rows per launch.  The rows only read
@@ -4031,7 +4083,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
     const bool target_head = staging_deferred_ && piped_target_head_ != nullptr;
     const bool direct_save = staging_deferred_ && direct_deferred_save(rows, S);
-    const auto key = bkey(rows, S, hbase, target_head, direct_save);
+    const auto key = bkey(rows, S, hbase, target_head, direct_save, staging_deferred_ && piped_stream_attn_on());
     cudaGraphExec_t& ex = exec_bm_[key];
     if (ex != nullptr) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
@@ -4229,7 +4281,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, bool direct_s
     using namespace strata::kernels;
     // The save/commit pair must protect the same executable key while instantiate_evicting handles OOM. A
     // normal key here could evict the new headless body before batch_launch_rows gets a chance to launch it.
-    const auto key = bkey(rows, S, hbase, piped_target_head_ != nullptr, direct_save);
+    const auto key = bkey(rows, S, hbase, piped_target_head_ != nullptr, direct_save, piped_stream_attn_on());
     cudaGraphExec_t& cex = dcommit_bm_[key];
     cudaGraphExec_t* const sex = direct_save ? nullptr : &save_bm_[key];
     if ((sex == nullptr || *sex != nullptr) && cex != nullptr) return true;
@@ -4429,7 +4481,7 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
     const bool direct_save = direct_deferred_save(rows, S);
     if (!capture_deferred(rows, S, hbase, direct_save, err)) return false;
     b_target_head_ = piped_target_head_ != nullptr;
-    const auto key = bkey(rows, S, hbase, b_target_head_, direct_save);
+    const auto key = bkey(rows, S, hbase, b_target_head_, direct_save, piped_stream_attn_on());
     cudaError_t le = cudaGraphLaunch(exec_bm_[key], cs_);
     if (le == cudaSuccess && !direct_save) le = cudaGraphLaunch(save_bm_[key], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
@@ -4445,7 +4497,9 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
 bool Verifier::batch_commit_rows(const int* rows, int S, int hbase, const int* keep, const int32_t* tokens,
                                  const int64_t* pos, std::string& err) {
     const OnDevice on_device(device_);
-    const auto it = dcommit_bm_.find(bkey(rows, S, hbase, piped_target_head_ != nullptr, direct_deferred_save(rows, S)));
+    const auto key = bkey(rows, S, hbase, piped_target_head_ != nullptr, direct_deferred_save(rows, S),
+                          piped_stream_attn_on());
+    const auto it = dcommit_bm_.find(key);
     if (it == dcommit_bm_.end() || it->second == nullptr) { err = "verify: a deferred commit without its window"; return false; }
     const int64_t CB = 2 + max_t_;
     // Each slot's accepted prefix.  The graph reads it from mapped memory when it runs; this slot's entry is written
@@ -4709,7 +4763,8 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
     const auto key = bkey(rows, S, hbase, staging_deferred_ && piped_target_head_ != nullptr,
-                          staging_deferred_ && direct_deferred_save(rows, S));
+                          staging_deferred_ && direct_deferred_save(rows, S),
+                          staging_deferred_ && piped_stream_attn_on());
     bool evicted = false;
     if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
         !evict_batch_graph(key, evicted, err))
