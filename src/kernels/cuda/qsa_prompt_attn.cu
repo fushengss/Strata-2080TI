@@ -116,22 +116,44 @@ struct Smem {
     long long row[CH];
 };
 
-template <int KV_MODE, bool PF = false>
+template <int KV_MODE, bool PF = false, bool Split = false>
 __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                               const int32_t* __restrict__ ids,
                                                               const int32_t* __restrict__ steps, int n_kv_heads,
                                                               int page_size, float scale_log2, float* __restrict__ attn,
                                                               int cap) {
+    static_assert(!Split || (KV_MODE == 1 && PF), "the SM75 split probe uses register-prefetched INT8 KV");
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem<KV_MODE, PF>& S = *reinterpret_cast<Smem<KV_MODE, PF>*>(smem_raw);
     const int qi = blockIdx.x, kvh = blockIdx.y;
     const int n_head = n_kv_heads * G;
     q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
-    attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
     ids += (size_t) qi * cap;
-    const int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
+    int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int gid = lane >> 2, tig = lane & 3;
+    float* split_max_sum = nullptr;
+    if constexpr (Split) {
+        const int split = blockIdx.z, splits = gridDim.z;
+        const int chunks = (n + CH - 1) / CH;
+        const int begin_cell = min(n, (chunks * split / splits) * CH);
+        const int end_cell = min(n, (chunks * (split + 1) / splits) * CH);
+        ids += begin_cell;
+        n = end_cell - begin_cell;
+        float* partial = attn + ((size_t) qi * splits + split) * n_head * (HD + 2);
+        attn = partial + (size_t) kvh * G * HD;
+        split_max_sum = partial + (size_t) n_head * HD + 2 * kvh * G;
+        if (n == 0) {
+            for (int i = t; i < G * HD; i += THREADS) attn[i] = 0.0f;
+            if (t < G) {
+                split_max_sum[2 * t] = -INFINITY;
+                split_max_sum[2 * t + 1] = 0.0f;
+            }
+            return;
+        }
+    } else {
+        attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    }
 
     // q: 12 heads + 4 zero rows, scaled by a power of two that puts its largest value near 2^14 (exact, and the
     // lo halves stay out of FP16's subnormal range), then split into hi + lo halves
@@ -167,6 +189,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
     static_assert(!PREFETCH || (CH * KP) % THREADS == 0 && CH * 4 == THREADS, "prefetch layout");
     uint4 pk[PPT], pv[PPT];
     float pa = 0.0f, pb = 0.0f;
+    bool page_valid = false;
     auto row_of = [&](int c0, int c) -> long long {          // as S.row below; -1 past the chunk's cells
         if (c >= min(CH, n - c0)) return -1;
         const int cell = ids[c0 + c];
@@ -184,6 +207,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
             }
             const int c = t / 4, g = t % 4;
             const long long r = row_of(c0, c);
+            if constexpr (Split) page_valid = r >= 0;
             pa = r >= 0 ? __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + g])) : 0.0f;
             pb = r >= 0 ? __half2float(__ushort_as_half(p.v_scale[r * (HD / KV_Q8_GROUP) + g])) : 0.0f;
         }
@@ -201,6 +225,9 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
             }
             S.ks[t / 4][t % 4] = pa;
             S.vs[t / 4][t % 4] = pb;
+            if constexpr (Split) {
+                if (t % 4 == 0) S.row[t / 4] = page_valid ? 0 : -1;
+            }
             __syncthreads();
         } else {
         if (t < CH) {
@@ -356,10 +383,15 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                 sc[3] = fmaf(tg[3], s1, sc[3]);
             }
             const int c = cb + 2 * tig;
-            S.s[gid][c] = c < nh ? sc[0] * qdown : -INFINITY;
-            S.s[gid][c + 1] = c + 1 < nh ? sc[1] * qdown : -INFINITY;
-            S.s[gid + 8][c] = c < nh ? sc[2] * qdown : -INFINITY;
-            S.s[gid + 8][c + 1] = c + 1 < nh ? sc[3] * qdown : -INFINITY;
+            bool valid0 = c < nh, valid1 = c + 1 < nh;
+            if constexpr (Split) {
+                valid0 = valid0 && S.row[c] >= 0;
+                valid1 = valid1 && S.row[c + 1] >= 0;
+            }
+            S.s[gid][c] = valid0 ? sc[0] * qdown : -INFINITY;
+            S.s[gid][c + 1] = valid1 ? sc[1] * qdown : -INFINITY;
+            S.s[gid + 8][c] = valid0 ? sc[2] * qdown : -INFINITY;
+            S.s[gid + 8][c + 1] = valid1 ? sc[3] * qdown : -INFINITY;
         }
         __syncthreads();
         if constexpr (PREFETCH) {   // the scores are done with K: V goes over it (read after the softmax's barrier)
@@ -477,13 +509,20 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
     }
     __syncthreads();
     const float l0 = S.lsum[gid], l1 = S.lsum[gid + 8];
-    const float i0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, i1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+    const float i0 = Split ? 1.0f : (l0 > 0.0f ? 1.0f / l0 : 0.0f);
+    const float i1 = Split ? 1.0f : (l1 > 0.0f ? 1.0f / l1 : 0.0f);
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int d = warp * 64 + j * 8 + 2 * tig;
         *reinterpret_cast<float2*>(attn + (size_t) gid * HD + d) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
         if (gid + 8 < G)
             *reinterpret_cast<float2*>(attn + (size_t) (gid + 8) * HD + d) = make_float2(acc[j][2] * i1, acc[j][3] * i1);
+    }
+    if constexpr (Split) {
+        if (t < G) {
+            split_max_sum[2 * t] = S.mrow[t];
+            split_max_sum[2 * t + 1] = S.lsum[t];
+        }
     }
 }
 
@@ -2428,6 +2467,67 @@ bool qsa_decode_attn_split(const float* q, const QsaAttnPools& pools, const int3
     return true;
 #endif
 }
+
+bool qsa_prepare_decode_attn_split_sm75_fp16() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static int sm75_ready[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    constexpr int bytes = (int) sizeof(Smem<1, true>);
+    if (!sm75_ready[dev]) {
+        int major = 0, minor = 0;
+        const bool ready =
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+            major == 7 && minor == 5 &&
+            cudaFuncSetAttribute(prompt_attn_kernel<1, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 bytes) == cudaSuccess;
+        if (!ready) cudaGetLastError();
+        sm75_ready[dev] = ready ? 1 : -1;
+    }
+    return sm75_ready[dev] > 0;
+#endif
+}
+
+bool qsa_decode_attn_split_sm75_fp16(const float* q, const QsaAttnPools& pools, const int32_t* ids,
+                                    const int32_t* steps, int64_t cap, const QsaShapes& s, float* scratch,
+                                    uint64_t scratch_floats, float* attn, int64_t n_q, int requested_splits, void* stream) {
+#if defined(__HIPCC__)
+    return false;
+#else
+    if (n_q <= 0) return true;
+    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || s.n_head_kv <= 0 ||
+        s.n_head_kv > 65535 / G || s.page_size <= 0 || cap <= 0 || cap > 65535 || n_q > 65535 ||
+        requested_splits <= 0 || requested_splits > 65535 ||
+        !q || !ids || !steps || !scratch || !attn || !pools.page_table ||
+        !pools.k_q || !pools.v_q || !pools.k_scale || !pools.v_scale || pools.k_q4 || pools.v_q4)
+        return false;
+    const uint64_t part_floats = (uint64_t) s.n_head * (HD + 2);
+    const auto available_parts = qsa_decode_attn_scratch_floats(cap, s) / part_floats;
+    const auto splits = std::min<uint64_t>(requested_splits, available_parts);
+    if (splits == 0 || ((uint64_t) n_q * splits * part_floats) > scratch_floats ||
+        !qsa_prepare_decode_attn_split_sm75_fp16())
+        return false;
+
+    constexpr int bytes = (int) sizeof(Smem<1, true>);
+    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    const auto st = static_cast<cudaStream_t>(stream);
+    const dim3 grid((unsigned) n_q, (unsigned) s.n_head_kv, (unsigned) splits);
+    prompt_attn_kernel<1, true, true><<<grid, THREADS, bytes, st>>>(
+        q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale_log2, scratch, (int) cap);
+    decode_attn_merge_kernel<<<dim3((unsigned) n_q, (unsigned) s.n_head), HD, 0, st>>>(
+        scratch, (int) s.n_head, (int) splits, attn);
+    const auto status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "qsa_decode_attn_split_sm75_fp16: %s\n", cudaGetErrorString(status));
+        std::exit(1);
+    }
+    return true;
+#endif
+}
+
 void qsa_prompt_attn_set_imma(int on) { g_pa_imma = on < 0 ? -1 : (on ? 1 : 0); }
 bool qsa_prompt_attn_matrix_cores_requested() {
 #if defined(__HIPCC__)

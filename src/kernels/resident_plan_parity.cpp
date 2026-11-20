@@ -14,6 +14,8 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,6 +52,49 @@ int main() {
     ck(cudaMalloc(&d_skip, 4), "skip");
     uint32_t* d_err = nullptr;
     ck(cudaMalloc(&d_err, 4), "err");
+
+    // The decode-only diagnostic replays a captured conditional copy into one stage-owned mapped buffer.
+    // Test disabled/enabled/reused gates, changed device IDs, odd row counts, and an untouched tail sentinel.
+    int capture_cases = 0;
+    {
+        int32_t *h = nullptr, *m = nullptr;
+        constexpr int words = 2 + 8 * K + 4;
+        ck(cudaHostAlloc((void**) &h, words * sizeof(int32_t), cudaHostAllocMapped), "capture host");
+        ck(cudaHostGetDevicePointer((void**) &m, h, 0), "capture alias");
+        cudaStream_t stream = nullptr;
+        ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "capture stream");
+        for (int rows : {1, 2, 3, 4, 8}) {
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t exec = nullptr;
+            ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture begin");
+            k::route_capture_ids(d_ids, rows, K, m + 1, m, stream);
+            ck(cudaStreamEndCapture(stream, &graph), "capture end");
+            ck(cudaGraphInstantiate(&exec, graph, 0), "capture instantiate");
+            for (int pass = 0; pass < 4; ++pass) {
+                const bool enabled = pass == 1 || pass == 3;
+                std::vector<int32_t> ids(rows * K);
+                for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t) ((i * 37 + pass * 19) % NE);
+                ck(cudaMemcpyAsync(d_ids, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream), "capture ids");
+                std::fill(h, h + words, -77);
+                h[0] = enabled ? 1 : 0;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                ck(cudaGraphLaunch(exec, stream), "capture replay");
+                ck(cudaStreamSynchronize(stream), "capture completion");
+                bool ok = true;
+                for (int i = 1; i < words; ++i) {
+                    const int32_t want = !enabled ? -77 : i == 1 ? rows : i < 2 + rows * K ? ids[i - 2] : -77;
+                    ok = ok && h[i] == want;
+                }
+                ++capture_cases;
+                if (!ok) { std::fprintf(stderr, "route_capture_ids: rows=%d pass=%d mismatch\n", rows, pass); return 1; }
+            }
+            ck(cudaGraphExecDestroy(exec), "capture exec destroy");
+            ck(cudaGraphDestroy(graph), "capture graph destroy");
+        }
+        ck(cudaStreamDestroy(stream), "capture stream destroy");
+        ck(cudaFreeHost(h), "capture host free");
+    }
+    std::printf("route_capture_ids: %d captured replay cases passed\n", capture_cases);
 
     std::vector<int32_t> res(NE);
     for (int e = 0; e < NE; ++e) res[e] = (e * 37 + 11) % 1000;      // distinct slots, not the identity

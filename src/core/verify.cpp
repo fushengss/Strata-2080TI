@@ -87,6 +87,11 @@
 #include <cstring>
 #include <exception>
 #include "strata/platform/cpu_relax.hpp"
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #if defined(STRATA_GPU_METAL)
 // The Metal backend's decode window (metal/src/engine/window.cpp): this file's init/run/commit hand over to it.
@@ -336,6 +341,47 @@ bool batch_self_commit_on() { static const bool v = env_on("STRATA_BATCH_SELF_CO
 bool qsa_slots_on() { static const bool v = env_on("STRATA_QSA_SLOTS"); return v; }
 #define g_qsa_slots (qsa_slots_on())
 bool piped_stream_attn_on() { static const bool v = env_on("STRATA_PIPED_STREAM_ATTN_ROWS"); return v; }
+
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+int configured_piped_sm75_decode_attn_splits() {
+    static const int fixed = [] {
+        const char* value = std::getenv("STRATA_SM75_DECODE_ATTN_SPLIT");
+        return value && std::strcmp(value, "32") == 0 ? 32 : 0;
+    }();
+    static const std::string control = [] {
+        const char* value = std::getenv("STRATA_SM75_DECODE_ATTN_SPLIT_CONTROL");
+        return value ? std::string(value) : std::string{};
+    }();
+    if (control.empty()) return fixed;
+
+    // Benchmark arms share a low-frequency poll; the normal static setting does no file I/O.
+    static std::mutex mutex;
+    static std::chrono::steady_clock::time_point next_poll{};
+    static int cached = -1;
+    const std::lock_guard<std::mutex> lock(mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_poll && cached >= 0) return cached;
+    next_poll = now + std::chrono::milliseconds(100);
+    int splits = 0;
+    if (auto* input = std::fopen(control.c_str(), "rb")) {
+        char bytes[16] = {};
+        const size_t n = std::fread(bytes, 1, sizeof(bytes) - 1, input);
+        const bool complete = std::feof(input) && !std::ferror(input);
+        std::fclose(input);
+        char* end = nullptr;
+        const long value = std::strtol(bytes, &end, 10);
+        if (end != bytes) {
+            while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') ++end;
+            if (complete && end == bytes + n && value == 32) splits = 32;
+        }
+    }
+    if (splits != cached) {
+        cached = splits;
+        std::fprintf(stderr, "strata verify: SM75 streamed decode attention control splits=%d\n", splits);
+    }
+    return cached;
+}
+#endif
 
 // every row of a batch window is another slot's (no slot has proposal rows)
 bool one_row_per_slot(const int* rows, int S) {
@@ -754,6 +800,8 @@ Verifier::~Verifier() {
     if (async_hist_host_) cudaFreeHost(async_hist_host_);
     if (async_hist_device_) cudaFree(async_hist_device_);
     if (async_sample_done_) cudaEventDestroy(async_sample_done_);
+    if (route_capture_file_) std::fclose(route_capture_file_);
+    if (route_capture_h_) cudaFreeHost(route_capture_h_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
@@ -2137,10 +2185,31 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, bool dire
                             const int32_t* selected = sel_ + (size_t) first * cap_;
                             const int32_t* steps = step_ + first * kStepCount;
                             qsa_kv_resolve(sx, *g_, selected, steps, end - first, cap_, cs);
-                            // Use the per-slot batch launcher so Turing keeps its INT8 V3 kernel.
-                            qsa_decode_attn_batch(qcur_ + first * NH * HD, qsa_attn_pools(sx), selected, steps,
-                                                  cap_, s, attn_scratch_ + (size_t) first * attn_scratch_floats_,
-                                                  attn_ + first * NH * HD, end - first, cs);
+                            const auto pools = qsa_attn_pools(sx);
+                            const float* query = qcur_ + first * NH * HD;
+                            float* scratch = attn_scratch_ + (size_t) first * attn_scratch_floats_;
+                            float* result = attn_ + first * NH * HD;
+                            bool split = false;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+                            if (record_sm75_decode_attn_splits_ > 0 && sx.kv_mode == 1) {
+                                const uint64_t scratch_floats = (uint64_t) (end - first) * attn_scratch_floats_;
+                                split = qsa_decode_attn_split_sm75_fp16(query, pools, selected, steps, cap_, s,
+                                            scratch, scratch_floats, result, end - first, record_sm75_decode_attn_splits_, cs);
+                                if (split && !reported_sm75_decode_attn_) {
+                                    reported_sm75_decode_attn_ = true;
+                                    std::fprintf(stderr, "strata verify: captured SM75 FP16 streamed decode attention "
+                                                 "on CUDA%d, splits=%d, slot rows=%d\n",
+                                                 device_, record_sm75_decode_attn_splits_, end - first);
+                                } else if (!split && !reported_sm75_decode_attn_fallback_) {
+                                    reported_sm75_decode_attn_fallback_ = true;
+                                    std::fprintf(stderr, "strata verify: SM75 FP16 streamed decode attention declined "
+                                                 "the geometry or scratch on CUDA%d; using the baseline\n", device_);
+                                }
+                            }
+#endif
+                            if (!split)
+                                qsa_decode_attn_batch(query, pools, selected, steps, cap_, s, scratch,
+                                                      result, end - first, cs);
                             first = end;
                         }
                         static std::atomic<bool> said{false};
@@ -2314,6 +2383,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, bool dire
         }
         if (rs_on_ && G == 1 && n <= 8 && T <= 8)
             strata::kernels::route_marginal_stats(ids_ + tb * K, n, (int) K, rs_dev_ + ((size_t) T * (size_t) g.n_layers + (size_t) l) * 8, cs);
+#if !defined(STRATA_GPU_METAL)
+        if (batch_rec_ && staging_deferred_ && route_capture_d_ != nullptr)
+            strata::kernels::route_capture_ids(ids_ + tb * K, n, (int) K,
+                route_capture_d_ + 1 + (size_t) (l - lb_) * route_capture_stride_, route_capture_d_, cs);
+#endif
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -4083,7 +4157,9 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
     const bool target_head = staging_deferred_ && piped_target_head_ != nullptr;
     const bool direct_save = staging_deferred_ && direct_deferred_save(rows, S);
-    const auto key = bkey(rows, S, hbase, target_head, direct_save, staging_deferred_ && piped_stream_attn_on());
+    const auto key = bkey(rows, S, hbase, target_head, direct_save, staging_deferred_ && piped_stream_attn_on(),
+                          staging_deferred_ && route_capture_h_ != nullptr,
+                          staging_deferred_ && record_sm75_decode_attn_splits_ > 0);
     cudaGraphExec_t& ex = exec_bm_[key];
     if (ex != nullptr) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
@@ -4236,6 +4312,125 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
 
 // ---- STRATA_PIPED_MTP: commits after the verdict (see the header)
 
+bool Verifier::init_route_capture(std::string& err) {
+    const char* prefix = std::getenv("STRATA_PIPED_ROUTE_CAPTURE");
+    if (prefix == nullptr || prefix[0] == '\0' || route_capture_h_ != nullptr) return true;
+#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP)
+    err = "verify route capture: this diagnostic supports CUDA piped batches only";
+    return false;
+#else
+    auto option = [](const char* name, int fallback, int lo, int hi) {
+        const char* p = std::getenv(name);
+        if (p == nullptr || p[0] == '\0') return fallback;
+        char* end = nullptr;
+        const long n = std::strtol(p, &end, 10);
+        return end != p && *end == '\0' && n >= lo && n <= hi ? (int) n : -1;
+    };
+    route_capture_every_ = option("STRATA_PIPED_ROUTE_EVERY", 16, 1, 65536);
+    route_capture_limit_ = option("STRATA_PIPED_ROUTE_LIMIT", 64, 1, 4096);
+    if (route_capture_every_ < 0 || route_capture_limit_ < 0) {
+        err = "verify route capture: invalid EVERY (1..65536) or LIMIT (1..4096)";
+        return false;
+    }
+    route_capture_stride_ = 1 + max_t_ * ss_->k;
+    const size_t words = 1 + (size_t) (le_ - lb_) * route_capture_stride_;
+    if (!mapped(words * sizeof(int32_t), (void**) &route_capture_h_, (void**) &route_capture_d_)) {
+        err = "verify route capture: mapped staging allocation failed";
+        return false;
+    }
+#if defined(_WIN32)
+    const int pid = _getpid();
+#else
+    const int pid = (int) getpid();
+#endif
+    route_capture_control_ = std::string(prefix) + ".control";
+    const std::string path = std::string(prefix) + ".pid" + std::to_string(pid) + ".d" + std::to_string(device_) +
+        ".l" + std::to_string(lb_) + "-" + std::to_string(le_) + ".routes";
+    route_capture_file_ = std::fopen(path.c_str(), "wb");
+    if (route_capture_file_ == nullptr) { err = "verify route capture: cannot create output file"; return false; }
+    std::fprintf(route_capture_file_, "# strata piped route capture v1 pid=%d device=%d layer_begin=%lld layer_end=%lld "
+                 "k=%d max_rows=%d every=%d limit_per_tag=%d total_limit=4096\n", pid, device_, (long long) lb_,
+                 (long long) le_, (int) ss_->k, max_t_, route_capture_every_, route_capture_limit_);
+    if (std::fflush(route_capture_file_) != 0) { err = "verify route capture: output header write failed"; return false; }
+    std::fprintf(stderr, "strata piped route capture: device=%d layers=%lld:%lld every=%d limit=%d; "
+                 "diagnostic only, not a performance run\n", device_, (long long) lb_, (long long) le_,
+                 route_capture_every_, route_capture_limit_);
+    return true;
+#endif
+}
+
+void Verifier::begin_route_capture() {
+    if (route_capture_h_ == nullptr) return;
+    route_capture_pending_ = false;
+    route_capture_h_[0] = 0;
+    // A missing/zero/malformed control disables capture. Controllers publish a new positive integer cohort by
+    // atomic rename; each stage samples its own completed windows. Never use this file as a performance timer.
+    int tag = 0;
+    if (route_capture_total_ < 4096) {
+        if (std::FILE* f = std::fopen(route_capture_control_.c_str(), "rb")) {
+            char b[64] = {};
+            const size_t n = std::fread(b, 1, sizeof b - 1, f);
+            const bool ended = std::feof(f) != 0;
+            std::fclose(f);
+            char* end = nullptr;
+            const long v = std::strtol(b, &end, 10);
+            while (end != nullptr && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) ++end;
+            if (ended && n > 0 && end != b && end == b + n && v > 0 && v <= 1000000) tag = (int) v;
+        }
+    }
+    if (tag > 0 && tag != route_capture_tag_) {
+        route_capture_tag_ = tag;
+        route_capture_seen_ = route_capture_written_ = 0;
+    }
+    if (tag > 0 && route_capture_written_ < route_capture_limit_ &&
+        (route_capture_seen_++ % route_capture_every_) == 0) {
+        const size_t words = (size_t) (le_ - lb_) * route_capture_stride_;
+        std::fill(route_capture_h_ + 1, route_capture_h_ + 1 + words, -1);
+        route_capture_epoch_us_ = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        route_capture_pending_ = true;
+        route_capture_h_[0] = 1;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    strata_store_fence();
+}
+
+bool Verifier::finish_route_capture(int S, std::string& err) {
+    if (!route_capture_pending_) return true;
+    // Called only after this window's existing successful stream query. The stage cannot launch a new window
+    // until batch_poll returns. Validate every layer before publishing any route, including on cancel/reuse.
+    route_capture_pending_ = false;
+    route_capture_h_[0] = 0;
+    const uint64_t done_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::string text = "# window tag=" + std::to_string(route_capture_tag_) + " sample=" +
+        std::to_string(route_capture_written_) + " epoch_us=" + std::to_string(route_capture_epoch_us_) +
+        " done_us=" + std::to_string(done_us) + " n=" + std::to_string(S) + " slots=";
+    for (int t = 0; t < S; ++t) text += (t ? "," : "") + std::to_string(last_rows_[t]);
+    text += "\n";
+    for (int64_t l = lb_; l < le_; ++l) {
+        const int32_t* src = route_capture_h_ + 1 + (size_t) (l - lb_) * route_capture_stride_;
+        if (src[0] != S) { err = "verify route capture: a completed window has a missing layer"; return false; }
+        text += std::to_string(l) + " " + std::to_string(S);
+        for (int i = 0; i < S * ss_->k; ++i) {
+            if (src[1 + i] < 0 || src[1 + i] >= g_->n_expert) {
+                err = "verify route capture: invalid expert ID";
+                return false;
+            }
+            text += " " + std::to_string(src[1 + i]);
+        }
+        text += "\n";
+    }
+    if (std::fwrite(text.data(), 1, text.size(), route_capture_file_) != text.size() ||
+        std::fflush(route_capture_file_) != 0) {
+        err = "verify route capture: output write failed";
+        return false;
+    }
+    ++route_capture_written_;
+    ++route_capture_total_;
+    return true;
+}
+
 bool Verifier::init_deferred_commit(int rows, std::string& err) {
     const OnDevice on_device(device_);
     if (slots_.empty()) { err = "verify: init_deferred_commit before init_slots"; return false; }
@@ -4266,6 +4461,7 @@ bool Verifier::init_deferred_commit(int rows, std::string& err) {
         return false;
     }
     dc_rows_ = rows;
+    if (!init_route_capture(err)) return false;
     std::fprintf(stderr, "strata verify: pipelined batch windows commit after the verdict (layers [%lld, %lld), %d rows, "
                          "%.1f MiB saved rows)\n", (long long) lb_, (long long) le_, rows, (double) bytes / 1048576.0);
     return true;
@@ -4277,11 +4473,11 @@ bool Verifier::direct_deferred_save(const int* rows, int S) const {
     return on && ar_on() && !batch_self_commits(rows, S);
 }
 
-bool Verifier::capture_deferred(const int* rows, int S, int hbase, bool direct_save, std::string& err) {
+bool Verifier::capture_deferred(const int* rows, int S, int hbase, bool direct_save, const std::vector<int>& key,
+                                const std::vector<int>& body_key, std::string& err) {
     using namespace strata::kernels;
-    // The save/commit pair must protect the same executable key while instantiate_evicting handles OOM. A
-    // normal key here could evict the new headless body before batch_launch_rows gets a chance to launch it.
-    const auto key = bkey(rows, S, hbase, piped_target_head_ != nullptr, direct_save, piped_stream_attn_on());
+    // The attention mode only changes the body. Save/commit replay the same backing buffers, so both modes share
+    // the same pair. Protect the actual body key from eviction while preparing that pair.
     cudaGraphExec_t& cex = dcommit_bm_[key];
     cudaGraphExec_t* const sex = direct_save ? nullptr : &save_bm_[key];
     if ((sex == nullptr || *sex != nullptr) && cex != nullptr) return true;
@@ -4306,7 +4502,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, bool direct_s
             if (ok) err = std::string(what) + cudaGetErrorString(ce);
             return false;
         }
-        const bool made = instantiate_evicting(ex, graph, key, what, err);
+        const bool made = instantiate_evicting(ex, graph, body_key, what, err);
         cudaGraphDestroy(graph);
         return made;
     };
@@ -4467,27 +4663,59 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, bool direct_s
     return true;
 }
 
+int Verifier::piped_sm75_decode_attn_splits() {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+    return piped_stream_attn_on() ? configured_piped_sm75_decode_attn_splits() : 0;
+#else
+    return 0;
+#endif
+}
+
 bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
-                                 std::string& err, cudaEvent_t upstream) {
+                                 std::string& err, cudaEvent_t upstream, int decode_attn_splits) {
     const OnDevice on_device(device_);
     if (dc_rows_ < 1) { err = "verify: batch_launch_rows without init_deferred_commit"; return false; }
     if (b_running_) { err = "verify: batch_launch_rows while this stage is busy"; return false; }
     if (S < 1 || hbase < 0 || hbase + S > dc_rows_) { err = "verify: a pipelined window outside the saved rows"; return false; }
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+    int attn_splits = 0;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+    if (decode_attn_splits == 32 && S > 1 && piped_stream_attn_on()) {
+        attn_splits = decode_attn_splits;
+        if (attn_splits > 0 && !strata::kernels::qsa_prepare_decode_attn_split_sm75_fp16()) {
+            attn_splits = 0;
+            if (!reported_sm75_decode_attn_fallback_) {
+                reported_sm75_decode_attn_fallback_ = true;
+                std::fprintf(stderr, "strata verify: SM75 FP16 streamed decode attention unavailable on CUDA%d; "
+                             "using the baseline\n", device_);
+            }
+        }
+    }
+#else
+    (void) decode_attn_splits;
+#endif
     staging_deferred_ = true;
+    record_sm75_decode_attn_splits_ = attn_splits;
     const bool staged = stage_batch(rows, S, hbase, tokens, pos, err);
+    record_sm75_decode_attn_splits_ = 0;
     staging_deferred_ = false;
     if (!staged) return false;
     const bool direct_save = direct_deferred_save(rows, S);
-    if (!capture_deferred(rows, S, hbase, direct_save, err)) return false;
+    const bool target_head = piped_target_head_ != nullptr;
+    const auto key = bkey(rows, S, hbase, target_head, direct_save, piped_stream_attn_on(), route_capture_h_ != nullptr);
+    const auto split_key = attn_splits > 0
+        ? bkey(rows, S, hbase, target_head, direct_save, piped_stream_attn_on(), route_capture_h_ != nullptr, true)
+        : std::vector<int>{};
+    const auto& body_key = attn_splits > 0 ? split_key : key;
+    if (!capture_deferred(rows, S, hbase, direct_save, key, body_key, err)) return false;
     // Staging and graph capture can synchronize this stream. Add the upstream dependency only once both have finished.
     if (upstream && cudaStreamWaitEvent(cs_, upstream, 0) != cudaSuccess) {
         err = "verify: waiting for the upstream batch handoff failed";
         return false;
     }
-    b_target_head_ = piped_target_head_ != nullptr;
-    const auto key = bkey(rows, S, hbase, b_target_head_, direct_save, piped_stream_attn_on());
-    cudaError_t le = cudaGraphLaunch(exec_bm_[key], cs_);
+    b_target_head_ = target_head;
+    begin_route_capture();   // this stage's previous window is complete; the gate stays immutable until batch_poll completes
+    cudaError_t le = cudaGraphLaunch(exec_bm_[body_key], cs_);
     if (le == cudaSuccess && !direct_save) le = cudaGraphLaunch(save_bm_[key], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     if (b_target_head_ && !launch_piped_target_head(S, err)) return false;
@@ -4503,7 +4731,7 @@ bool Verifier::batch_commit_rows(const int* rows, int S, int hbase, const int* k
                                  const int64_t* pos, std::string& err) {
     const OnDevice on_device(device_);
     const auto key = bkey(rows, S, hbase, piped_target_head_ != nullptr, direct_deferred_save(rows, S),
-                          piped_stream_attn_on());
+                          piped_stream_attn_on(), route_capture_h_ != nullptr);
     const auto it = dcommit_bm_.find(key);
     if (it == dcommit_bm_.end() || it->second == nullptr) { err = "verify: a deferred commit without its window"; return false; }
     const int64_t CB = 2 + max_t_;
@@ -4769,7 +4997,8 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
     const auto key = bkey(rows, S, hbase, staging_deferred_ && piped_target_head_ != nullptr,
                           staging_deferred_ && direct_deferred_save(rows, S),
-                          staging_deferred_ && piped_stream_attn_on());
+                          staging_deferred_ && piped_stream_attn_on(), staging_deferred_ && route_capture_h_ != nullptr,
+                          staging_deferred_ && record_sm75_decode_attn_splits_ > 0);
     bool evicted = false;
     if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
         !evict_batch_graph(key, evicted, err))
@@ -5304,6 +5533,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         if (!piped_target_head_->done(err)) return err.empty() ? 0 : -1;
         if (piped_target_head_second_ && !piped_target_head_second_->done(err)) return err.empty() ? 0 : -1;
     }
+    if (!finish_route_capture(S, err)) { b_running_ = false; return -1; }
     if (prof_on_) collect_profile();
     if (last_stage()) {
         int queued = 0;

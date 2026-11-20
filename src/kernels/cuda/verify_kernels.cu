@@ -635,6 +635,14 @@ __global__ void route_marginal_stats_kernel(const int32_t* __restrict__ ids, int
     atomicAdd(acc + r, (unsigned long long) fresh);
 }
 
+__global__ void route_capture_ids_kernel(const int32_t* __restrict__ ids, int n, int k,
+                                         int32_t* __restrict__ dst, const volatile int32_t* gate) {
+    if (*gate == 0) return;
+    for (int i = threadIdx.x; i < n * k; i += blockDim.x) dst[1 + i] = ids[i];
+    if (threadIdx.x == 0) dst[0] = n;
+    __threadfence_system();   // completion is observed by the existing verifier stream query, not by polling dst
+}
+
 __global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __restrict__ src, int64_t stride,
                                     const int32_t* __restrict__ index, int64_t n) {
     const int idx = *index;
@@ -1688,6 +1696,11 @@ void hc_mean_streams(const float* R, float* out, int64_t n_embd, int hc, void* s
 void route_marginal_stats(const int32_t* ids, int n, int k, unsigned long long* acc, void* stream) {
     route_marginal_stats_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, n, k, acc);
     check("route_marginal_stats");
+}
+
+void route_capture_ids(const int32_t* ids, int n, int k, int32_t* dst, const int32_t* gate, void* stream) {
+    route_capture_ids_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, n, k, dst, gate);
+    check("route_capture_ids");
 }
 
 void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* index, int64_t n, void* stream) {

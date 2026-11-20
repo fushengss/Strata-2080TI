@@ -265,10 +265,12 @@ public:
     /// The saved buffers for `rows` hand-off rows (after init_slots).
     bool init_deferred_commit(int rows, std::string& err);
     bool deferred_commit_on() const { return dc_rows_ > 0; }
+    /// The opt-in streamed decode setting. Read from the pipeline scheduler, once for each new group window.
+    static int piped_sm75_decode_attn_splits();
     /// The window over the slots `rows` (a slot's rows contiguous) at hand-off rows [hbase, hbase + S), its save right
     /// behind it, and no commit (batch_commit_rows, after the verdict).  The PLE history advances at the commit.
     bool batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
-                           std::string& err, cudaEvent_t upstream = nullptr);
+                           std::string& err, cudaEvent_t upstream = nullptr, int decode_attn_splits = 0);
     /// Queue the commit of that window's accepted prefixes on this stage's stream (no host wait): `keep` per slot ID,
     /// 1..the slot's rows.  `rows`, `S`, `hbase`, `tokens` and `pos` are the window's, as batch_launch_rows got them.
     bool batch_commit_rows(const int* rows, int S, int hbase, const int* keep, const int32_t* tokens,
@@ -463,7 +465,8 @@ private:
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
     int last_rows_[strata::kernels::kWindowMaxT] = {};                ///< the slots of the last batch window's rows
     std::vector<int> bkey(const int* rows, int S, int hbase, bool target_head = false,
-                          bool direct_save = false, bool stream_attn = false) const {   // #871: the doorbell variant has its own graphs
+                         bool direct_save = false, bool stream_attn = false, bool route_capture = false,
+                         bool sm75_split_attn = false) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
         // No ordinary row/layout key contains a negative slot. Keep headless deferred bodies distinct from the
@@ -471,6 +474,8 @@ private:
         if (target_head) k.push_back(-1);
         if (direct_save) k.push_back(-2);
         if (stream_attn) k.push_back(-3);
+        if (route_capture) k.push_back(-4);   // diagnostic nodes never enter an ordinary admission graph
+        if (sm75_split_attn) k.push_back(-5); // streamed decode body only
         return k;
     }
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
@@ -524,13 +529,16 @@ private:
     // dc_rows_ rows per layer instead of max_t_; the slots' accepted prefixes (mapped and device, 2 + max_t_ per slot)
     int dc_rows_ = 0;
     bool staging_deferred_ = false;   ///< stage_batch for batch_launch_rows: no capture_commit_batch
+    int record_sm75_decode_attn_splits_ = 0;   ///< sampled once at a deferred body launch and kept for its capture
+    bool reported_sm75_decode_attn_ = false, reported_sm75_decode_attn_fallback_ = false;
     float *dc_qkv_ = nullptr, *dc_h_ = nullptr, *dc_gate_ = nullptr, *dc_beta_ = nullptr, *dc_idx_ = nullptr;
     float* dc_hist_ = nullptr;
     void* dc_arena_ = nullptr;
     int32_t *h_commitd_ = nullptr, *m_commitd_ = nullptr, *commitd_ = nullptr;
     std::map<std::vector<int>, cudaGraphExec_t> save_bm_, dcommit_bm_;
     bool direct_deferred_save(const int* rows, int S) const;
-    bool capture_deferred(const int* rows, int S, int hbase, bool direct_save, std::string& err);
+    bool capture_deferred(const int* rows, int S, int hbase, bool direct_save, const std::vector<int>& key,
+                          const std::vector<int>& body_key, std::string& err);
     /// Free the graph pair of the least recently used batch layout other than `keep` (`evicted`: there was one).
     bool evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err);
     /// cudaGraphInstantiate; out of VRAM, batch layouts other than `key` are evicted (LRU) until it fits, and then (a
@@ -651,6 +659,21 @@ private:
     bool rs_on_ = false;                      // STRATA_ROUTE_STATS
     unsigned long long* rs_dev_ = nullptr;    // [9 T][n_layers][8 rows]: experts of row r that no earlier row of the window routed to
     int64_t rs_win_[strata::kernels::kVerifyLongT + 1] = {};
+
+    // Opt-in piped-decode route capture. One stage owns this mapped buffer until its existing completion query.
+    // A control file selects a numeric cohort; only expert IDs (never model token IDs or text) are written.
+    int32_t* route_capture_h_ = nullptr;
+    int32_t* route_capture_d_ = nullptr;
+    std::FILE* route_capture_file_ = nullptr;
+    std::string route_capture_control_;
+    int route_capture_stride_ = 0, route_capture_every_ = 16, route_capture_limit_ = 64;
+    int route_capture_tag_ = 0, route_capture_seen_ = 0, route_capture_written_ = 0;
+    int route_capture_total_ = 0;   // hard process lifetime bound, even if a controller repeatedly changes tags
+    uint64_t route_capture_epoch_us_ = 0;
+    bool route_capture_pending_ = false;
+    bool init_route_capture(std::string& err);
+    void begin_route_capture();
+    bool finish_route_capture(int S, std::string& err);
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;

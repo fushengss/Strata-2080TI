@@ -139,6 +139,9 @@ void hc_mean_streams(const float* R, float* out, int64_t n_embd, int hc, void* s
 /// STRATA_ROUTE_STATS only: acc[r] += the number of ids of row r (k per row, n rows <= 8) that no earlier row of the window holds
 /// (duplicates inside a row count once).
 void route_marginal_stats(const int32_t* ids, int n, int k, unsigned long long* acc, void* stream);
+/// Diagnostic only: when the mapped host gate is nonzero, publish n then exactly n*k expert IDs into mapped dst.
+/// The host may read/reuse gate and dst only after the owning stream's completion has been observed.
+void route_capture_ids(const int32_t* ids, int n, int k, int32_t* dst, const int32_t* gate, void* stream);
 /// dst[:n] = src[(*index) * stride + :n]  (index read from device memory; a negative index copies nothing).
 void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* index, int64_t n, void* stream);
 

@@ -49,6 +49,13 @@ bool qsa_hip_wmma_active();
 bool qsa_decode_attn_split(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, uint64_t scratch_floats, float* attn, int64_t n_q,
                            void* stream);
+/// Benchmark-only split decode on SM75. Reads INT8 KV and uses FP16 high/low tensor-core products with FP32
+/// accumulation. Uses the existing decode scratch. Returns false before launch if geometry or device is unsupported.
+// Call on the stage's current device before graph capture to set its shared-memory attribute.
+bool qsa_prepare_decode_attn_split_sm75_fp16();
+bool qsa_decode_attn_split_sm75_fp16(const float* q, const QsaAttnPools& pools, const int32_t* ids,
+                                    const int32_t* steps, int64_t cap, const QsaShapes& s, float* scratch,
+                                    uint64_t scratch_floats, float* attn, int64_t n_q, int requested_splits, void* stream);
 /// Tests: the int8-KV kernel on INT8 tensor cores (1), v2 (0), or as STRATA_PROMPT_ATTN_IMMA says (-1).
 void qsa_prompt_attn_set_imma(int on);
 /// HIP: STRATA_HIP_WMMA asks for the matrix-core prompt attention (=1 or =auto) and this device is a gfx11 / gfx12 matrix-core part

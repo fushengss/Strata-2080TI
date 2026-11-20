@@ -14984,6 +14984,7 @@ int main(int argc, char** argv) {
             bool inflight = false;
             bool early_handoff = false;     ///< stage is the next stage to submit; reaping does not advance it
             int stage = 0;                  ///< the stage it runs on or waits for
+            int decode_attn_splits = 0;      ///< snapshotted at stage 0; unsubmitted stages may downgrade on ingress
             int32_t tok[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int64_t since = 0;              ///< tick it started waiting (fairness)
@@ -15256,8 +15257,39 @@ int main(int argc, char** argv) {
         };
         // STRATA_P4_TIMING=1 / STRATA_P4_TRACE=PATH: where a pipelined window's time goes (pipe_probe.hpp; off: a branch)
         strata::program::PipeProbe p4(n_pipe, pg.size());
+        const bool qsa_schedule_trace = [] {
+            const char* value = std::getenv("STRATA_SM75_DECODE_ATTN_TRACE");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        int qsa_last_splits = -1;
+        const char* qsa_last_reason = "";
+        const auto trace_qsa_schedule = [&](int splits, const char* reason, int stage, int group) {
+            if (!qsa_schedule_trace ||
+                (qsa_last_splits == splits && std::strcmp(qsa_last_reason, reason) == 0)) return;
+            qsa_last_splits = splits;
+            qsa_last_reason = reason;
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+            std::fprintf(stderr, "strata QSA decode policy: mono_us=%lld splits=%d reason=%s stage=%d group=%d\n",
+                         (long long) us, splits, reason, stage, group);
+        };
+        const auto qsa_hold_reason = [&](bool between_requests) -> const char* {
+            if (in_prompt_read) return "prompt_read";
+            if (!between_requests || admit_slot >= 0) return "request_command";
+            if (!co_pending.empty()) return "co_prefill_pending";
+            {
+                std::lock_guard<std::mutex> lk(in_mu);
+                if (!in_lines.empty()) return "queued_input";
+            }
+            for (const BSlot& slot : bs) {
+                if (slot.partial && !slot.stop) return "yielded_prefill_pending";
+                // BADM emits one token. A live slot is steady after its first piped decode verdict.
+                if (slot.active && slot.produced <= 1) return "slot_warmup";
+                if (slot.active && slot.stop) return "slot_stopping";
+            }
+            return nullptr;
+        };
         // one turn: serve every running stage, hand finished groups on, start what can start
-        auto pump = [&](bool may_start) -> bool {
+        auto pump = [&](bool may_start, bool between_requests = false) -> bool {
             ++pipe_tick;
             const strata::program::PipeProbe::PumpScope p4_scope(p4);
             if (piped_mtp_observe) {
@@ -15457,7 +15489,27 @@ int main(int argc, char** argv) {
                 }
                 const auto p4_l0 = p4.now();
                 const cudaEvent_t upstream = G.early_handoff && k > 0 ? handoff_event(pick, k - 1) : nullptr;
-                if (!(pmtp ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err, upstream)
+                if (pmtp) {
+                    if (k == 0) {
+                        G.decode_attn_splits = G.S > 1 ? strata::core::Verifier::piped_sm75_decode_attn_splits() : 0;
+                        if (G.decode_attn_splits > 0) {
+                            const char* hold = qsa_hold_reason(between_requests);
+                            if (hold) G.decode_attn_splits = 0;
+                            trace_qsa_schedule(G.decode_attn_splits, hold ? hold : "steady_decode", k, pick);
+                        } else {
+                            trace_qsa_schedule(0, G.S > 1 ? "disabled" : "single_row_window", k, pick);
+                        }
+                    } else if (G.decode_attn_splits > 0) {
+                        // Prompt work may arrive while the group is in flight. Keep already submitted graphs valid
+                        // and use the baseline for this group's unsent stages, with no upgrade before its verdict.
+                        if (const char* hold = qsa_hold_reason(between_requests)) {
+                            G.decode_attn_splits = 0;
+                            trace_qsa_schedule(0, hold, k, pick);
+                        }
+                    }
+                }
+                if (!(pmtp ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err,
+                                                                 upstream, G.decode_attn_splits)
                            : stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err))) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
@@ -15609,7 +15661,7 @@ int main(int argc, char** argv) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
-                    if (!(piped ? pump(true) : batch_step())) return 1;
+                    if (!(piped ? pump(true, true) : batch_step())) return 1;
                     continue;
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first

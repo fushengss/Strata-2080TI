@@ -40,7 +40,7 @@ template <typename T> T* up(const std::vector<T>& h) {
 float h2f(uint16_t b) { __half h; *reinterpret_cast<uint16_t*>(&h) = b; return __half2float(h); }
 uint16_t f2h(float f) { __half h = __float2half(f); return *reinterpret_cast<uint16_t*>(&h); }
 
-int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0
+int run(int fmt, int64_t ctx, int64_t nq, int reps, int splits = 0) {   // fmt 1 int8, 0 fp16, 2 q4_0
 #if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
     if (fmt == 2) {   // mode 4 (Q4_0 KV) runs on sm_80 and newer only: below that the dispatcher keeps the old kernel
         int dev = 0, major = 0;
@@ -212,11 +212,22 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     // int8 KV: v2 here, and the opt-in INT8-MMA kernel (STRATA_PROMPT_ATTN_IMMA) checked and timed below beside it
     if (fmt == 1) k::qsa_prompt_attn_set_imma(0);
     auto new_run = [&]() {
-        if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, nullptr)) {
+        bool ok;
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        if (splits > 0) {
+            ok = k::qsa_decode_attn_split_sm75_fp16(d_q, pl, d_ids, d_steps, cap, s, scratch,
+                nq * k::qsa_decode_attn_scratch_floats(cap, s), d_new, nq, splits, nullptr);
+        } else
+#endif
+        {
+            ok = k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, nullptr);
+        }
+        if (!ok) {
             std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools\n");
             std::exit(2);
         }
     };
+    const bool compare_imma = fmt == 1 && splits == 0;
     float* d_im = nullptr;
     ck(cudaMalloc(&d_im, nq * NH * HD * 4), "malloc");
     auto imma_run = [&]() {
@@ -227,10 +238,10 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     };
     old_run();
     new_run();
-    if (fmt == 1) imma_run();
+    if (compare_imma) imma_run();
     ck(cudaDeviceSynchronize(), "run");
-    std::vector<float> o((size_t) (nq * NH * HD)), nw(o.size()), im(fmt == 1 ? o.size() : 0);
-    if (fmt == 1) ck(cudaMemcpy(im.data(), d_im, im.size() * 4, cudaMemcpyDeviceToHost), "down");
+    std::vector<float> o((size_t) (nq * NH * HD)), nw(o.size()), im(compare_imma ? o.size() : 0);
+    if (compare_imma) ck(cudaMemcpy(im.data(), d_im, im.size() * 4, cudaMemcpyDeviceToHost), "down");
     ck(cudaMemcpy(o.data(), d_old, o.size() * 4, cudaMemcpyDeviceToHost), "down");
     ck(cudaMemcpy(nw.data(), d_new, nw.size() * 4, cudaMemcpyDeviceToHost), "down");
     {   // a hash of the new kernel's output bits (bitwise A/B of two builds / switches)
@@ -273,7 +284,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 ref_scale = std::max(ref_scale, std::fabs(r));
                 err_old = std::max(err_old, std::fabs(o[at] - r));
                 err_new = std::max(err_new, std::fabs(nw[at] - r));
-                if (fmt == 1) err_im = std::max(err_im, std::fabs(im[at] - r));
+                if (compare_imma) err_im = std::max(err_im, std::fabs(im[at] - r));
             }
         }
     }
@@ -299,7 +310,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     ck(cudaEventSynchronize(e1), "time");
     cudaEventElapsedTime(&ms_new, e0, e1);
     bool ok_im = true;
-    if (fmt == 1) {   // the INT8-MMA kernel: the same bounds as v2's, against FP64 and against v2
+    if (compare_imma) {   // the INT8-MMA kernel: the same bounds as v2's, against FP64 and against v2
         double d_iv = 0;
         for (size_t i = 0; i < o.size(); ++i) d_iv = std::max(d_iv, (double) std::fabs(im[i] - nw[i]));
         float ms_im = 0, ms_v2 = 0;
@@ -364,6 +375,17 @@ int main(int argc, char** argv) {
     const int64_t ctx = argc > 1 ? std::atoll(argv[1]) : 32768;
     const int64_t nq = argc > 2 ? std::atoll(argv[2]) : 2048;
     const int reps = argc > 3 ? std::atoi(argv[3]) : 5;
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+    if (const char* setting = std::getenv("QA_SM75_DECODE_SPLIT")) {
+        const int splits = std::atoi(setting);
+        if (splits <= 0 || nq <= 0 || nq > 32 || ctx < nq || reps <= 0) {
+            std::fprintf(stderr, "split decode probe requires a positive split count, context >= queries, and 1..32 queries\n");
+            return 2;
+        }
+        std::printf("SM75 FP16 decode probe, %d requested KV splits\n", splits);
+        return run(1, ctx, nq, reps, splits);
+    }
+#endif
     int fails = 0;
     fails += run(1, ctx, nq, reps);
 #if !defined(__HIP_PLATFORM_AMD__)
