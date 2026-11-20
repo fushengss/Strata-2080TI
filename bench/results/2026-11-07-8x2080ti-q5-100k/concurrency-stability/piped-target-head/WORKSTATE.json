@@ -1,0 +1,139 @@
+{
+  "user_request": "Set all GPUs target core clock 2000 MHz; execute P1 piped target head, P2 async sampler, then assess/implement useful P3 MTP body batching; preserve prefill and only deploy validated gain.",
+  "host": "root@10.100.3.3",
+  "worktree": "/Users/fu/project/HAI/Strata-decode-head",
+  "branch": "codex/concurrency-stability",
+  "production_config": "/srv/Strata/strata-orca-q5_k_m.57.json",
+  "production_config_sha256": "f5376cc83215fc54b46d20094373f20a41b93daa8bf07262d2ac67dc13297220",
+  "production_engine": "/srv/Strata-0157/engine/releases/concurrent-mtp-20261107/strata",
+  "production_engine_sha256": "c9305b08b24e6ff85e363147063827760c54c8243eeec6b2362587159cda5ca6",
+  "server": "/srv/Strata-0157/serve/server.py",
+  "server_sha256": "40c5e9dfc96ab208b6514bd2f5f48986afb3e01b3927f873cff8d358d62528c9",
+  "library_sha256": "fb67bffc9ece81aa90ee22aa97fed40710c4d57ece6bceeb4ae023f9728a0661",
+  "remote_root": "/srv/bench100k-20261107-piped-target-head",
+  "remote_source": "/srv/Strata-decode-head-20261107",
+  "clock": "Driver accepted nvidia-smi -i 0,1,2,3,4,5,6,7 -lgc 2000,2000 for all cards; power limit remains250W. Receipt clock-lock.json. Effective clock still may throttle.",
+  "p1": {
+    "commit": "48f9d6d2d6fbf9487a316264e14d63a792427440",
+    "engine": "/srv/Strata-decode-head-20261107/engine/strata.piped-target-head1",
+    "engine_sha256": "8b27e040d26b51a67cfef4d7c7154fa8cc83f6d0a1cf1b1826f9eb0295bd30ab",
+    "test": "/srv/Strata-decode-head-20261107/engine/decode_head_test.piped-target-head1",
+    "test_sha256": "c2b307e056644538b4d964003c241bb737c60017c5e8e0b6bcd60fada7feca9e",
+    "flag": "STRATA_PIPED_TARGET_HEAD",
+    "built": true,
+    "gpu_tested": true,
+    "deployed": true,
+    "parity": "PASS:128 windows/111247360 bitwise logits;16sharded+36fullreturn windows inclsample/penalty/bias/NF/odd range.",
+    "pilot": {
+      "dir": "p1-pilot",
+      "c8_off": 285.9033201907502,
+      "c8_on": 300.11868026784134,
+      "exact_comparison_pass": true,
+      "old_c9305_cross_compat_pass": true,
+      "prefill_tested": false
+    },
+    "validation": {
+      "session": 51900,
+      "remote_out": "/srv/bench100k-20261107-piped-target-head/p1-validation",
+      "arms": [
+        "on",
+        "off"
+      ],
+      "suites": [
+        "prefill",
+        "c8",
+        "c4mixed",
+        "budget",
+        "long"
+      ],
+      "state": "Completedrc0, independentP1auditPASS34matchedcases, cross oldc9305C8+prefillPASS; C8+4.608%reverse/+4.972%pilot; coldread-0.17%; mixedflat; longwhole-1.30%native-0.33%."
+    }
+  },
+  "p2": {
+    "agent": "/root/engine_rate_audit",
+    "flag": "STRATA_PIPED_ASYNC_SAMPLE",
+    "state": "Full A/B completedrc0, independentidentity/correctnessPASS. Notselected: C8API-0.177%, C4mixed+0.218%, longnative-0.143%; no demonstrated gain.",
+    "commit": "c1b2f0f0c005a8b03cb38e86f4dd5ed719aad8ec",
+    "engine": "/srv/Strata-decode-head-20261107/engine/strata.piped-async-sample1",
+    "engine_sha256": "ff2cc241def6a4636fea6ce20d4b7ba5ca7554bf4025304e5ce903af4079e778",
+    "build_returncode": 0,
+    "validation": {
+      "session": 17784,
+      "remote_out": "/srv/bench100k-20261107-piped-target-head/p2-validation",
+      "arms": [
+        "off",
+        "on"
+      ],
+      "target_head": 1,
+      "state": "COMPLETE; botharmsall6suitespassed; raw localp2-validation, p2-validation-analysis."
+    }
+  },
+  "p3": {
+    "state": "v2diagnostic+C8compatPASS; independent16checksPASS; nopacking, notdeployed. body0.620737/headreturn0.319316/tail0.030594ms; maxpending1; includesdraftwaitpolls, not timefraction.",
+    "commit": "fb73be5a44fe4101fd1773f6fb4414b6344551d4",
+    "flag": "STRATA_PIPED_MTP_OBSERVE",
+    "engine": "/srv/Strata-decode-head-20261107/engine/strata.piped-mtp-observe1",
+    "engine_sha256": "b987f212fe8c50b9c2e4e1cde0b7c53e5934f37f571ba6353dbe8087d45c1a41",
+    "build_returncode": 0,
+    "diagnostic": {
+      "session": 37450,
+      "remote_out": "/srv/bench100k-20261107-piped-target-head/p3-diagnostic",
+      "target_head": 1,
+      "async_sample": 0,
+      "state": "FAILED; logsdownloaded; noCUDAevents/performanceobserved"
+    },
+    "rebuild": {
+      "remote": "/srv/bench100k-20261107-piped-target-head/p3-rebuild",
+      "state": "COMPLETED rc0; generate.cpp/mtp.cpp/prefill.cpp objectfreshnessgatesPASS",
+      "engine": "/srv/Strata-decode-head-20261107/engine/strata.piped-mtp-observe2",
+      "engine_sha256": "f36c12833e900a77cdc966298863f15ded275696855405816b4b2377208683b2"
+    },
+    "diagnostic_v2": {
+      "session": 79018,
+      "remote_out": "/srv/bench100k-20261107-piped-target-head/p3-diagnostic-v2",
+      "target_head": 1,
+      "async_sample": 0
+    }
+  },
+  "harness": {
+    "path": "harness/runner_target_head.py",
+    "frozen_sha256": "a4e453fc59098560fd09f8de6e824c242d5dac1afd0297eeabb278c988aaf072",
+    "pilot_suites": "c8,correctness",
+    "main_suites": "prefill,c8,c4mixed,budget,long",
+    "cross_compatibility": "harness/cross_compatibility.py reference ../head-reverse/01-on vs new off, suites c8,prefill, correctness only."
+  },
+  "maintenance": {
+    "tool": "python3 /srv/bench100k-20261107-piped-target-head/maintenance.py stop|restore|status",
+    "state": "RESTORED/ONLINE loadedtrue8servingslots; finalsmokepassed; no pendingmaintenancework.",
+    "private_backup": "/srv/bench100k-20261107-piped-target-head/baseline-private",
+    "must_restore_at_end": true
+  },
+  "notes": [
+    "Never print or download API keys/private configs.",
+    "Original Strata checkout user dirty docs/OPTIMIZATION_ROADMAP.md and src/program/generate.cpp must remain untouched.",
+    "Use git archive frozen commit when syncing; engine agent continues local P2.",
+    "Full 1018 source files matched48f9d6d2; ps1 CRLF normalized for comparison only.",
+    "Previous read guard rejected: mixed throughput -13%, long TTFT doubled. Keep guard unset.",
+    "Current power audit proved GPU7 97.8%/249W with sw_power_cap27/27; others55-66%. P1 targets exact full-logit return to retain sampler semantics."
+  ],
+  "deployment": {
+    "script": "deploy_piped_decode.py",
+    "state": "COMPLETE: P1engine8b deployed, actualidentity/resourcesPASS, 8lane128tokenssmokePASS/exclusive, clocks2000allaccepted/power250. Productiononline8slots.",
+    "release": "/srv/Strata-0157/engine/releases/piped-decode-20261107",
+    "candidate": "/srv/Strata-decode-head-20261107/engine/strata.piped-target-head1",
+    "engine_sha256": "8b27e040d26b51a67cfef4d7c7154fa8cc83f6d0a1cf1b1826f9eb0295bd30ab",
+    "flags": {
+      "STRATA_PIPED_TARGET_HEAD": "1",
+      "STRATA_PIPED_ASYNC_SAMPLE": "0"
+    },
+    "verify_script": "verify_piped_deployment.py",
+    "smoke_script": "smoke_piped_deployment.py",
+    "config_sha256": "f752a21492dedb98bda4fd4af7551999ed0a30516c8a9e5271f055e17f2a04dd",
+    "backup": "/srv/bench100k-20261107-piped-target-head/rollback-piped-decode-5yijad5j",
+    "restore_session": 88840,
+    "verified_at": "2026-11-07T23:58:01+08:00",
+    "engine_pid": 102086,
+    "smoke_passed": true
+  },
+  "finished": true
+}

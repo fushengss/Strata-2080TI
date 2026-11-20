@@ -1,0 +1,159 @@
+{
+  "created_epoch": 1794063086.661945,
+  "source_hashes": {
+    "runner.py": "e7babcd5f68966eff9ee40aca70fe828f7ef6bacaa29391211816a76b8fbab33",
+    "budget_correctness.py": "950fa856586ef02cf2333684b2df0c56bb44438322c5f9a13baf7616963e779c",
+    "correctness.py": "b3e32b596882bad35c9b6dd18f7c995615a7b4cc1ac1674cbf1bf3d06ed13a94",
+    "client.py": "3c019afbcd75d7a183ce1089aea49ffd21abadf8aba85445573c369996c43b8f",
+    "prefill_target_head_check.py": "4d905f6d9d8cbbbaaf5883071e4b8548708232876b16b84fb59b789661187c34",
+    "long_concurrency_check.py": "bd94e84e9c3465e7837aefbd72364c4e0f297200e54ba81de0b6139f157ce9ba",
+    "compare_target_head.py": "f3f49b681dd7c2a67f177286041115b7a22bb95d459951e853a59067c0d28b2d",
+    "prefill_check.py": "6822ff7f3cd58fcf3a4e58a237ba7f23d41b68c8f27ca4a84297a3e4c77cff15",
+    "c8_check.py": "eaaa7de9db74c59b06920efbf87addf7f630a7cd65301f184ceea1b979c98184",
+    "runner_target_head.py": "a4e453fc59098560fd09f8de6e824c242d5dac1afd0297eeabb278c988aaf072",
+    "cross_compatibility.py": "707dcdd739fb9d68757388896647d9ca92636dd3e7534881dce4463335ffb765"
+  },
+  "checks": [
+    {
+      "name": "runner_target_head.py --self-test",
+      "returncode": 0,
+      "passed": true,
+      "stdout": "OFFLINE PASS: one piped target-head flag; fixed shared MTP head, batch MTP, commit mode, budget cap, immutable base, fixed heads, startup gates, credential scan; no network/GPU\n",
+      "stderr": ""
+    },
+    {
+      "name": "c8_check.py --self-test",
+      "returncode": 0,
+      "passed": true,
+      "stdout": "{\"offline_self_test\": \"PASS\", \"network_requests\": 0, \"gpu_operations\": 0}\n",
+      "stderr": ""
+    },
+    {
+      "name": "prefill_target_head_check.py --self-test",
+      "returncode": 0,
+      "passed": true,
+      "stdout": "OFFLINE PASS: fixed prompts, greedy parameters, fake SSE cold/warm, exact numeric log match and sanitized records; no network/GPU\n",
+      "stderr": ""
+    },
+    {
+      "name": "long_concurrency_check.py --self-test",
+      "returncode": 0,
+      "passed": true,
+      "stdout": "{\"request\": \"lane-0\", \"done\": true, \"error\": null, \"usage\": {\"prompt_tokens\": 101139, \"completion_tokens\": 512, \"total_tokens\": 101651, \"prompt_tokens_details\": {\"cached_tokens\": 0}}, \"ttft_s\": 0.0020526666194200516}\nOFFLINE PASS: fixed fixtures, cold/length/overlap negative gates, long socket timeout, sanitized fake SSE and exact comparison failures; no network/GPU\n",
+      "stderr": ""
+    },
+    {
+      "name": "budget_correctness.py --self-test",
+      "returncode": 0,
+      "passed": true,
+      "stdout": "{\"offline_self_test\": \"PASS\", \"network_requests\": 0, \"gpu_operations\": 0}\n",
+      "stderr": ""
+    },
+    {
+      "name": "client.py --self-test",
+      "returncode": 0,
+      "passed": true,
+      "stdout": "OFFLINE PASS: SSE framing, reasoning/content/tool clocks, greedy/sampled fixtures, gap/token estimates, sanitized artifacts; HTTP transport was replaced by an in-memory fake\n",
+      "stderr": ""
+    },
+    {
+      "name": "runner default dryrun",
+      "passed": true,
+      "output": {
+        "mode": "DRY_RUN_NO_NETWORK_NO_GPU",
+        "arms": [
+          "off",
+          "on"
+        ],
+        "suites": [
+          "c8"
+        ],
+        "profile": "short",
+        "sampling_profile": "sampled",
+        "levels": [
+          "4"
+        ],
+        "port": 8092,
+        "variables": [
+          "STRATA_PIPED_TARGET_HEAD"
+        ],
+        "fixed": {
+          "STRATA_DECODE_HEAD_GPU": "2,4",
+          "STRATA_MTP_HEAD_GPU": "3,5",
+          "STRATA_PW_WITH_BATCH": "1",
+          "STRATA_BATCH_MTP": "1",
+          "STRATA_PIPED_MTP": "1",
+          "STRATA_BATCH_SELF_COMMIT": "0",
+          "STRATA_PIPED_MTP_HEAD": "1"
+        },
+        "cap_both": false,
+        "p2": "Not part of this experiment; no P2 flag is varied",
+        "requires": "GPUs empty and production8080 stopped by operator"
+      }
+    },
+    {
+      "name": "execution refuses missing identity before GPU/service checks",
+      "passed": true
+    },
+    {
+      "name": "offline comparator same",
+      "passed": true,
+      "returncode": 0,
+      "stdout": "{\"all_checks_passed\": true, \"suite_checks\": {\"c8\": true}, \"performance_requires_review\": true}\n",
+      "stderr": ""
+    },
+    {
+      "name": "offline comparator output-mismatch",
+      "passed": true,
+      "returncode": 2,
+      "stdout": "{\"all_checks_passed\": false, \"suite_checks\": {\"c8\": false}, \"performance_requires_review\": true}\n",
+      "stderr": ""
+    },
+    {
+      "name": "offline comparator wrong-arm",
+      "passed": true,
+      "returncode": 1,
+      "stdout": "",
+      "stderr": "Arm identity/configuration qualification failed; no comparisons accepted\n"
+    },
+    {
+      "name": "final runner_target_head.py --self-test",
+      "returncode": 0,
+      "passed": true,
+      "stdout": "OFFLINE PASS: one piped target-head flag; fixed shared MTP head, batch MTP, commit mode, budget cap, immutable base, fixed heads, startup gates, credential scan; no network/GPU\n",
+      "stderr": ""
+    },
+    {
+      "name": "final c8_check.py --self-test",
+      "returncode": 0,
+      "passed": true,
+      "stdout": "{\"offline_self_test\": \"PASS\", \"network_requests\": 0, \"gpu_operations\": 0}\n",
+      "stderr": ""
+    },
+    {
+      "name": "cross-version identical",
+      "returncode": 0,
+      "passed": true,
+      "stdout": "{\"all_checks_passed\": true, \"gates\": {\"reference_is_c9305_production\": true, \"candidate_p1_off\": true, \"reference_old_target_head_absent_or_off\": true, \"fixed_existing_paths\": true, \"selected_suites_qualified\": true, \"gpu_equal\": true, \"parallel_equal\": true, \"layer_split_equal\": true, \"engine_args_sha256_equal\": true, \"reasoning_budget_engine_cap_equal\": true}, \"suites\": {\"c8\": true, \"prefill\": true}, \"performance_compared\": false}\n",
+      "stderr": ""
+    },
+    {
+      "name": "cross-version usage-mismatch",
+      "returncode": 2,
+      "passed": true,
+      "stdout": "{\"all_checks_passed\": false, \"gates\": {\"reference_is_c9305_production\": true, \"candidate_p1_off\": true, \"reference_old_target_head_absent_or_off\": true, \"fixed_existing_paths\": true, \"selected_suites_qualified\": true, \"gpu_equal\": true, \"parallel_equal\": true, \"layer_split_equal\": true, \"engine_args_sha256_equal\": true, \"reasoning_budget_engine_cap_equal\": true}, \"suites\": {\"c8\": true, \"prefill\": false}, \"performance_compared\": false}\n",
+      "stderr": ""
+    },
+    {
+      "name": "cross-version candidate-on",
+      "returncode": 2,
+      "passed": true,
+      "stdout": "{\"all_checks_passed\": false, \"gates\": {\"reference_is_c9305_production\": true, \"candidate_p1_off\": false, \"reference_old_target_head_absent_or_off\": true, \"fixed_existing_paths\": true, \"selected_suites_qualified\": true, \"gpu_equal\": true, \"parallel_equal\": true, \"layer_split_equal\": true, \"engine_args_sha256_equal\": true, \"reasoning_budget_engine_cap_equal\": true}, \"suites\": {}, \"performance_compared\": false}\n",
+      "stderr": ""
+    }
+  ],
+  "all_passed": true,
+  "network_requests": 0,
+  "gpu_operations": 0,
+  "updated_epoch": 1794063310.026912
+}

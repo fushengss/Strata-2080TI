@@ -1,0 +1,66 @@
+{
+  "status": "No blocking issue found in independent static production-source review. Not a GPU correctness, performance or deployment approval.",
+  "baseline_commit": "862caa974fde10672a425de9c25c3b75c38f35fc",
+  "checklist_sha256": "d0e9f629a6b0b3266ab58538f450bb4b34b05acf3ff9d66ceede69d9dfec841c",
+  "reviewed_source_sha256": {
+    "include/strata/core/mtp.hpp": "d00c215822f678a226f9694c8eb3d8a06d3069390d5c47f15357b8aef7bff3f1",
+    "include/strata/core/mtp_head.hpp": "dd5f9ba6857eddde91794b28c47339b812fc36b351fa9098ef01e5a90d7dbffd",
+    "src/core/mtp.cpp": "81fd16a3464aacfce1faf68194ca981bcac033b44b5cef3274d309a2f9054808",
+    "src/core/mtp_head.cpp": "7090aca93bdf2cb66f03c469484a5c0ef17e6cdf85a14c28dbf4cf9d01cd2f3e",
+    "src/program/generate.cpp": "8fe6b0f2b53c1a2a756697ae92f1044e8c38281a7a0ff67622d38cd215969ddf"
+  },
+  "reviewer_checks": {
+    "git_diff_check": "passed",
+    "gpu_operations": 0,
+    "service_actions": 0,
+    "production_edits": 0,
+    "builds_by_reviewer": 0
+  },
+  "assessed_invariants": [
+    {
+      "area": "shared_weight_ownership",
+      "evidence": "mtp_head.cpp53-62 WeightBank owns target allocations; workspace retains const shared_ptr; reset85-114 drains source/targets, destroys graphs/streams/scratch, then drops reference. Shared init153-157 reuses bank with separate mutable workspace allocations."
+    },
+    {
+      "area": "asynchronous_dependencies",
+      "evidence": "Existing enqueue source publish/producer -> each target wait/graph/completion -> both source waits/full gather remains unchanged. Source waits are not installed before both completion records succeed. Partial-chain failure still drains in chain_launch before returning."
+    },
+    {
+      "area": "clone_matching",
+      "evidence": "mtp.cpp1989-2007 validates exact plain Q6_K subset/mapping/source/N/head/type and idle chain state; standalone prepare_head_shards retains owned-head restriction. bind copies only trusted layout metadata."
+    },
+    {
+      "area": "numerical_path",
+      "evidence": "Target graph preserves original Q6_K MMVQ,128-row cut,exact32-bit odd-vocab copy; original source argmax/probability/map/selection/force tail is reused. No numerical reduction or acceptance change added."
+    },
+    {
+      "area": "piped_scope",
+      "evidence": "generate11624-11631 rejects opt-in without actual slot MTP;11849-11869 requires existing solo bank and allocates per-slot workspace;14777-14780 requires actual deferred-commit piped route. Only chain_launch reads persistent slot activation."
+    },
+    {
+      "area": "sampled_targets",
+      "evidence": "mtp.cpp2053 guard depends on !coupled_active_. Existing slot proposals are greedy even when target request sampling is active, so eligible sampled targets are retained. No target-temperature0 condition was introduced."
+    },
+    {
+      "area": "default_off",
+      "evidence": "Flag defaults false; original slot prepare_chain point remains when false. Solo bank initialization preserves CUDA allocation/capture ordering. Only host shared_ptr ownership is refactored on existing solo path."
+    },
+    {
+      "area": "lifetime_boundary",
+      "evidence": "mtp.hpp public shared-prepare contract states dense/expert/subset-map owner must live. Helper-bank owner reset safety does not extend to whole MtpDrafter-owner early destruction."
+    }
+  ],
+  "remaining_validation": [
+    "Real CUDA compilation and low-level8-slot simultaneous-submission bitwise parity, probability bits and mapped IDs.",
+    "Single workspace reset/destroy while peers remain queued; test patch is being handled separately.",
+    "End-to-end captrue/true budget continuation, sampled/greedy/bias/penalty correctness, cancellation/reuse/slot-to-solo.",
+    "Actual per-slot offload counters,8slots/full expert residency/3.80GiB ownbuffers, graph memory and W16-cache budget.",
+    "Same-binary opt-in A/B with100k prefill, mixed long gaps and completed API-token throughput.",
+    "HIP runtime/build not verified by this review. Agent-reported Metal-compat syntax checks are not CUDA/HIP runtime evidence."
+  ],
+  "limits": [
+    "Source-level review does not prove runtime CUDA event visibility or scheduling behavior.",
+    "No injected mid-flight CUDA failure was executed.",
+    "GPU7 hotspot observation does not establish draft head on the performance critical path."
+  ]
+}

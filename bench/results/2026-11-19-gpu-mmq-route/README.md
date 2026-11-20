@@ -4,7 +4,7 @@
 
 GPU 组按 `(专家行数, 专家 ID)` 稳定排序，保持每个专家内部的 token/rank 顺序，直接写 MMQ 的 `slot/src` 设备表。主机只回读 512 个计数，合计 2 KiB，并构造原有 MMQ launch 参数。CPU 和 GPU 组运行同一个二进制，通过 `STRATA_MMQ_GPU_ROUTE` 切换。CUDA 单测覆盖 26 组路由，并验证非法专家 ID 会被拒绝。
 
-启用范围是使用常驻排序的原生布局、全驻留且无需专家流式搬运的合格分块。小分块、非全驻留、启用 peer 或使用原始路由回调的路径继续使用 CPU 分组。候选 `f2b4bcbbb` 的日志确认八张卡均使用了 GPU 分组。[CUDA 分组](/Users/fu/project/HAI/Strata-gpu-mmq-route/src/prefill/moe_mmq.cu) · [接入点](/Users/fu/project/HAI/Strata-gpu-mmq-route/src/prefill/prefill.cpp) · [CUDA 单测输出](raw/route-parity.log)
+启用范围是使用常驻排序的原生布局、全驻留且无需专家流式搬运的合格分块。小分块、非全驻留、启用 peer 或使用原始路由回调的路径继续使用 CPU 分组。候选 `f2b4bcbbb` 的日志确认八张卡均使用了 GPU 分组。[CUDA 分组](https://github.com/fushengss/Strata-2080TI/blob/f2b4bcbbb27d80512249da5151843973b1ef3013/src/prefill/moe_mmq.cu) · [接入点](https://github.com/fushengss/Strata-2080TI/blob/f2b4bcbbb27d80512249da5151843973b1ef3013/src/prefill/prefill.cpp) · [CUDA 单测输出](raw/route-parity.log)
 
 ## 测量结果
 

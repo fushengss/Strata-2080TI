@@ -1,0 +1,24 @@
+Independent static review — P2 c1b2f0f0 + P3 fb73be5a
+Worktree: /Users/fu/project/HAI/Strata-decode-head
+Scope: source/diffs only; no source changes, GPU runs or network activity.
+
+Result: No new blocking correctness/lifetime issue found in the current serving call paths. This is not a CUDA build or GPU-parity pass. P2 still requires the planned GPU mixed-sampling/penalty/bias/cancel/reuse validation; P3 requires build and observation-off/on parity before use as evidence.
+
+P2 checks
+- verify.cpp:4922–4942 caps history at 4096 tokens and copies only row t into a persistent host/device stride of 4096. Different row penalty lengths cannot overlap; temporary CPU hrows is not the async DMA source.
+- verify.cpp:5161–5175 records completion after all same-stream sample launches and keeps b_running_ true. batch_poll:5082–5096 waits for event success before finish_polled_batch:5181–5198 publishes mapped picks and releases the stage. batch_launch_rows:4350 refuses a busy stage; the pump leaves stage_group occupied while poll returns zero (generate.cpp:15148–15154).
+- BSTOP only changes stop state (generate.cpp:15473–15476). It does not free/reset in-flight sample history, bias or logits. A BGEN admission drains the pipeline first (15449–15456), then requires an inactive slot (15520). Concurrent prefill failures become batch_fatal (17711–17714), not a resumed/reused verifier.
+- Partial queue/event errors return failure through pump and terminate serving (15446/15456; batch_fatal on concurrent-read path). The new pending flag is not cleared on failure, but current callers never retry/reuse that verifier after failure, so this is not a production correctness blocker. A future recover-and-retry API would require draining and clearing this state first.
+- Destruction synchronizes cs_ at verify.cpp:713 before freeing history/event at 753–755. Partial enable allocations remain owned for destructor cleanup; startup fails on enable error.
+- Default-off sample_rows retains its stream synchronization; synchronous slot runs still use default wait=true. No prefill route was changed. Completed async counters count windows/rows actually sampled, including greedy rows with penalty/bias; plain greedy rows are intentionally excluded. These counters are not accepted output tokens.
+- Existing sampler scratch is keyed by device/stream (sampler.cu:1180–1206); async launches on a stream stay ordered. Initial allocation may still block the host, so speedup must be measured.
+
+P3 checks
+- Observation events are private per MtpDrafter slot and per possible step (mtp.hpp:332), created only when enabled. chain_launch requires !chain_live_ (mtp.cpp:2075), so no next chain overwrites unconsumed timing events.
+- All four events use the slot source stream; producer/head-return dependencies precede the return event (mtp.cpp:2126–2132; mtp_head.cpp:245–257). chain completion precedes elapsed reads (2175–2196). Reading results does not add an explicit wait.
+- Failed event creation destroys partial allocations (2055–2063). Failed launch uses the existing split-head drain (2142–2147). Failed elapsed-time read returns an error and is fatal through pmtp_poll_draft (generate.cpp:14938–14939); no stale observation is published as valid. Destructor first synchronizes the source stream (mtp.cpp:145), then destroys observation events.
+- Reports run only after pipeline/batch empty and pmtp_settle (generate.cpp:15345–15346). Completed-chain aggregate take/reset therefore does not race active slot timing.
+- Default off creates/records no new CUDA events, reads no added clocks, and follows the same graph order. The new host structure is unused except for gated branches.
+- Statistical labels are appropriate: body/head_return/tail are source-stream wall intervals (include contention/transfer waits), not pure kernel duration. Slot sums may overlap and cannot be summed into system wall time. Pending-pump histogram counts submitted-but-unreaped chains, not ready jobs or time-weighted occupancy; verdict jobs are not a post-attention batching queue. The documentation explicitly preserves these limits.
+
+No style findings or speculative faults reported. Outstanding risk is empirical rather than a demonstrated code defect: CUDA build, mixed sampled/greedy exact-output parity, cancellation + immediate slot reuse, multiple history lengths/logit bias, and observed/off performance perturbation remain to be checked by the ongoing GPU validation.

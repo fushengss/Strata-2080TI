@@ -1,0 +1,839 @@
+[
+  {
+    "name": "cold-1",
+    "category": "cold-code",
+    "request_sha256": "a6b476d7ff0ac09ce1c637179acfe5b1d506a24bc602e716e444911e9d94a517",
+    "messages_sha256": "68282161ad30387cb73d7e23c41856e35f8e4b02a51c2b7aedf0f1a109ab7b95",
+    "max_tokens": 768,
+    "start_epoch": 1794038454.448492,
+    "end_epoch": 1794038475.12837,
+    "ttft_s": 14.925485997926444,
+    "last_content_s": 20.676896671997383,
+    "total_s": 20.67987796710804,
+    "usage": {
+      "prompt_tokens": 101137,
+      "completion_tokens": 768,
+      "total_tokens": 101905,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\nimport threading\nfrom collections import OrderedDict\nimport unittest\n\n\nclass LRUCache:\n    \"\"\"Least Recently Used Cache implementation using OrderedDict.\"\"\"\n\n    def __init__(self, capacity: int):\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be positive\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n\n    def get(self, key):\n        \"\"\"Get value for key, moving it to end (most recently used).\"\"\"\n        if key not in self.cache:\n            return None\n        # Move to end to mark as recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n\n    def put(self, key, value):\n        \"\"\"Put key-value pair, evicting LRU item if at capacity.\"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        # Evict least recently used if over capacity\n        if len(self.cache) > self.capacity:\n            self.cache.popitem(last=False)\n\n    def delete(self, key):\n        \"\"\"Delete key from cache. Returns True if deleted, False if not found.\"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n\n    def __len__(self):\n        \"\"\"Return current number of items in cache.\"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeLRUCache:\n    \"\"\"Thread-safe wrapper around LRUCache using a lock.\"\"\"\n\n    def __init__(self, capacity: int):\n        self._cache = LRUCache(capacity)\n        self._lock = threading.Lock()\n\n    def get(self, key):\n        with self._lock:\n            return self._cache.get(key)\n\n    def put(self, key, value):\n        with self._lock:\n            self._cache.put(key, value)\n\n    def delete(self, key):\n        with self._lock:\n            return self._cache.delete(key)\n\n    def __len__(self):\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestLRUCache(unittest.TestCase):\n    \"\"\"Test suite for LRUCache and ThreadSafeLRUCache.\"\"\"\n\n    def test_basic_put_get(self):\n        \"\"\"Test basic put and get operations.\"\"\"\n        cache = LRUCache(2)\n        cache.put(\"a\", 1)\n        cache.put(\"b\", 2)\n        self.assertEqual(cache.get(\"a\"), 1)\n        self.assertEqual(cache.get(\"b\"), 2)\n\n    def test_eviction_lru(self):\n        \"\"\"Test that least recently used item is evicted.\"\"\"\n        cache = LRUCache(2)\n        cache.put(\"a\", 1)\n        cache.put(\"b\", 2)\n        # Access 'a' to make it recently used\n        cache.get(\"a\")\n        # Add 'c', should evict 'b' (least recently used)\n        cache.put(\"c\", 3)\n        self.assertIsNone(cache.get(\"b\"))\n        self.assertEqual(cache.get(\"a\"), 1)\n        self.assertEqual(cache.get(\"c\"), 3)\n\n    def test_update_existing_key(self):\n        \"\"\"Test updating an existing key moves it to most recently used.\"\"\"\n        cache = LRUCache(2)\n        cache.put(\"a\", 1)\n        cache.put(\"b\", 2)\n        # Update 'a'\n        cache.put(\"a\", 10)\n        #",
+    "reasoning_text": "",
+    "output_sha256": "c844347e5109546f142e0836ebdf2526089537f2beb2f9927caed9bd402c173b",
+    "delta_count": 687,
+    "decode_tps_usage_minus_one_estimate": 133.35858686945497,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 0,
+      "in_flight": 0,
+      "last_request_at": null
+    },
+    "activity_after": {
+      "requests": 1,
+      "in_flight": 0,
+      "last_request_at": 1794038475
+    },
+    "engine_lines": [
+      "strata serve: prompt 101137 tokens = 0 reused + 101137 read in 14486 ms (6981.9 tok/s), 768 generated in 6020 ms (127.6 tok/s), drafts accepted 473 of 572, 7 checkpoints",
+      "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+      "strata serve: KV streaming: 97.73% of 537118 block reads hit VRAM, 49.1 MiB read from RAM",
+      "strata serve: suffix drafts: 4 windows, 14 of 15 drafts accepted"
+    ],
+    "engine_prompt_records": [
+      {
+        "prompt_tokens": 101137,
+        "reused_tokens": 0,
+        "read_tokens": 101137,
+        "prefill_ms": 14486,
+        "prefill_tps": 6981.9,
+        "generated_tokens": 768,
+        "decode_ms": 6020,
+        "decode_tps": 127.6
+      }
+    ]
+  },
+  {
+    "name": "cold-2",
+    "category": "cold-code",
+    "request_sha256": "6cdb30cc4605ee61c7a74c5a0bbef45edb9853cb36a38b4fbe5b249da418a8d7",
+    "messages_sha256": "61a840d1c275436c0fa0c75904d1e10cc8fa7e3dfaa9ac079368e1e67743dbd4",
+    "max_tokens": 768,
+    "start_epoch": 1794038475.164177,
+    "end_epoch": 1794038497.7641306,
+    "ttft_s": 17.021465974859893,
+    "last_content_s": 22.596313648857176,
+    "total_s": 22.599953623022884,
+    "usage": {
+      "prompt_tokens": 101137,
+      "completion_tokens": 768,
+      "total_tokens": 101905,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\nimport threading\nfrom collections import OrderedDict\nimport unittest\n\n\nclass LRUCache:\n    \"\"\"\n    A Least Recently Used (LRU) Cache implementation.\n    \"\"\"\n\n    def __init__(self, capacity: int):\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be positive\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n\n    def get(self, key):\n        \"\"\"\n        Get the value of the key if it exists, otherwise return None.\n        Moves the accessed item to the end (most recently used).\n        \"\"\"\n        if key not in self.cache:\n            return None\n        # Move to end to mark as recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n\n    def put(self, key, value):\n        \"\"\"\n        Insert or update the value of the key.\n        If the cache exceeds capacity, remove the least recently used item.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        if len(self.cache) > self.capacity:\n            # Remove the first item (least recently used)\n            self.cache.popitem(last=False)\n\n    def delete(self, key):\n        \"\"\"\n        Delete the key from the cache if it exists.\n        Returns True if deleted, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n\n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeLRUCache:\n    \"\"\"\n    A thread-safe wrapper for LRUCache using a lock.\n    \"\"\"\n\n    def __init__(self, capacity: int):\n        self._cache = LRUCache(capacity)\n        self._lock = threading.Lock()\n\n    def get(self, key):\n        with self._lock:\n            return self._cache.get(key)\n\n    def put(self, key, value):\n        with self._lock:\n            self._cache.put(key, value)\n\n    def delete(self, key):\n        with self._lock:\n            return self._cache.delete(key)\n\n    def __len__(self):\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestLRUCache(unittest.TestCase):\n    \"\"\"\n    Unit tests for LRUCache and ThreadSafeLRUCache.\n    \"\"\"\n\n    def test_basic_operations(self):\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        self.assertEqual(cache.get(1), 1)\n        cache.put(3, 3)  # evicts key 2\n        self.assertIsNone(cache.get(2))\n        cache.put(4, 4)  # evicts key 1\n        self.assertIsNone(cache.get(1))\n        self.assertEqual(cache.get(3), 3)\n        self.assertEqual(cache.get(4), 4)\n\n    def test_update_existing_key(self):\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        cache.put(1, 10)  # Update key 1, should not evict\n        self.assertEqual(cache.get(1), 10)\n        self.assertEqual(cache.get(2), 2",
+    "reasoning_text": "",
+    "output_sha256": "4bcb2a187e1b91f791ec21ff01438f7278ba46ff098f963120b3ab2fedfe6295",
+    "delta_count": 679,
+    "decode_tps_usage_minus_one_estimate": 137.5822345025698,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 1,
+      "in_flight": 0,
+      "last_request_at": 1794038475
+    },
+    "activity_after": {
+      "requests": 2,
+      "in_flight": 0,
+      "last_request_at": 1794038497
+    },
+    "engine_lines": [
+      "strata serve: prompt 101137 tokens = 0 reused + 101137 read in 16837 ms (6006.8 tok/s), 768 generated in 5594 ms (137.3 tok/s), drafts accepted 480 of 553, 7 checkpoints",
+      "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+      "strata serve: KV streaming: 97.73% of 525311 block reads hit VRAM, 48.1 MiB read from RAM",
+      "strata serve: suffix drafts: 4 windows, 13 of 16 drafts accepted"
+    ],
+    "engine_prompt_records": [
+      {
+        "prompt_tokens": 101137,
+        "reused_tokens": 0,
+        "read_tokens": 101137,
+        "prefill_ms": 16837,
+        "prefill_tps": 6006.8,
+        "generated_tokens": 768,
+        "decode_ms": 5594,
+        "decode_tps": 137.3
+      }
+    ]
+  },
+  {
+    "name": "cold-3",
+    "category": "cold-prose",
+    "request_sha256": "a51ed966889d0f23a6a143491ba75e7d759965782cb2242b244650fc972e65b9",
+    "messages_sha256": "66f91bad7df31fdb0bc7030a9597742ce0b406b56fa5a8695eb10c5fdb394c90",
+    "max_tokens": 512,
+    "start_epoch": 1794038497.8290374,
+    "end_epoch": 1794038521.067242,
+    "ttft_s": 16.949808865087107,
+    "last_content_s": 23.23565764608793,
+    "total_s": 23.238204406108707,
+    "usage": {
+      "prompt_tokens": 101111,
+      "completion_tokens": 512,
+      "total_tokens": 101623,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "**The Pulse of the Coast: A History and Life of Harbors**\n\nHarbors are far more than mere indentations in the coastline where ships can find shelter from the wind and waves. They are the living, breathing hearts of coastal civilization, serving as the critical interfaces between the land and the sea. For millennia, these natural or man-made havens have dictated the rise and fall of empires, shaped cultural identities, and sustained the livelihoods of millions. To understand a harbor is to understand the complex interplay of geography, history, and human resilience.\n\nThe history of harbors is inextricably linked to the history of trade and exploration. In the ancient world, the quality of a harbor often determined the fate of a city-state. Athens, for instance, relied heavily on the port of Piraeus to maintain its naval dominance and economic power, while Carthage’s artificial harbors, known as cothon, were marvels of engineering that allowed it to control Mediterranean trade routes. These early ports were not just commercial hubs; they were military fortresses. The ability to protect a fleet from storms and enemy attack was a strategic necessity that drove the development of breakwaters, lighthouses, and fortified quays.\n\nAs the Age of Exploration dawned, harbors became the launchpads for global connectivity. Ports like Lisbon, Seville, and later Amsterdam and London, transformed from local fishing villages into global metropolises. They became melting pots of culture, language, and religion, where spices from the East, gold from the Americas, and textiles from Asia converged. The architecture of these cities reflects this history; grand warehouses, customs houses, and merchant guild halls still stand as testaments to the wealth generated by maritime commerce. However, this era also had a dark side. Harbors were the primary points of entry for the transatlantic slave trade, serving as grim gateways where human beings were commodified and transported across the ocean. The legacy of this history remains visible in the demographic and cultural fabric of many port cities today.\n\nThe industrial revolution brought a new dimension to harbor life. The shift from sail to steam, and later to diesel, required massive infrastructure changes. Deep-water channels were dredged, and vast networks of railways were built to connect ports to inland markets. This era saw the rise of the dockworker, a figure central to the social history of coastal towns. These workers, often organized into powerful unions, faced dangerous conditions and irregular employment, yet they formed tight",
+    "reasoning_text": "",
+    "output_sha256": "8a7b166a2da79e6b52f9a7c3061521a89ea485ae54baad073282cc38f9d1fa35",
+    "delta_count": 508,
+    "decode_tps_usage_minus_one_estimate": 81.29371510566938,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 2,
+      "in_flight": 0,
+      "last_request_at": 1794038497
+    },
+    "activity_after": {
+      "requests": 3,
+      "in_flight": 0,
+      "last_request_at": 1794038521
+    },
+    "engine_lines": [
+      "strata serve: prompt 101111 tokens = 0 reused + 101111 read in 16777 ms (6026.8 tok/s), 512 generated in 6305 ms (81.2 tok/s), drafts accepted 236 of 392, 7 checkpoints",
+      "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+      "strata serve: KV streaming: 97.79% of 523767 block reads hit VRAM, 46.6 MiB read from RAM"
+    ],
+    "engine_prompt_records": [
+      {
+        "prompt_tokens": 101111,
+        "reused_tokens": 0,
+        "read_tokens": 101111,
+        "prefill_ms": 16777,
+        "prefill_tps": 6026.8,
+        "generated_tokens": 512,
+        "decode_ms": 6305,
+        "decode_tps": 81.2
+      }
+    ]
+  },
+  {
+    "name": "append-600",
+    "category": "append",
+    "request_sha256": "f668909dc8291e4f802548fe47dd243f8f13c99fad656e39da7cdb5ca74da569",
+    "messages_sha256": "00b4b0964ab6d246dfff0da9ae29131337a1ae4ef48be6998b98bef81fb21d34",
+    "max_tokens": 256,
+    "start_epoch": 1794038521.1380413,
+    "end_epoch": 1794038527.8649833,
+    "ttft_s": 4.308205130044371,
+    "last_content_s": 6.724586249096319,
+    "total_s": 6.726941982051358,
+    "usage": {
+      "prompt_tokens": 102543,
+      "completion_tokens": 256,
+      "total_tokens": 102799,
+      "prompt_tokens_details": {
+        "cached_tokens": 101905
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "To extend an LRU cache with TTL (Time-To-Live) expiry, you need to store the expiration timestamp alongside each value. When retrieving an item, you must check if it has expired. If it has, treat it as a cache miss (and optionally remove it).\n\nHere is the Python code implementing an `LRUCacheWithTTL`:\n\n```python\nimport time\nfrom collections import OrderedDict\nimport threading\n\n\nclass LRUCacheWithTTL:\n    \"\"\"\n    Least Recently Used Cache with Time-To-Live (TTL) support.\n    \n    Each entry has an expiration time. If an entry is accessed after its\n    expiration time, it is considered invalid and removed.\n    \"\"\"\n\n    def __init__(self, capacity: int, default_ttl: float = None):\n        \"\"\"\n        Initialize the cache.\n        \n        Args:\n            capacity: Maximum number of items in the cache.\n            default_ttl: Default time-to-live in seconds. If None, items never expire\n                         unless a specific TTL is provided in put().\n        \"\"\"\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be positive\")\n        self.capacity = capacity\n        self.default_ttl = default_ttl",
+    "reasoning_text": "",
+    "output_sha256": "946c452a0ff003f70e06a73e3233b387d721b5761ad0476efac0f9501353cb14",
+    "delta_count": 233,
+    "decode_tps_usage_minus_one_estimate": 105.52971052018799,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 3,
+      "in_flight": 0,
+      "last_request_at": 1794038521
+    },
+    "activity_after": {
+      "requests": 4,
+      "in_flight": 0,
+      "last_request_at": 1794038527
+    },
+    "engine_lines": [
+      "strata serve: prompt 102543 tokens = 101905 reused + 638 read in 4199 ms (152.0 tok/s), 256 generated in 2435 ms (105.1 tok/s), drafts accepted 142 of 202, 8 checkpoints",
+      "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+      "strata serve: KV streaming: 97.36% of 231582 block reads hit VRAM, 24.6 MiB read from RAM",
+      "strata serve: suffix drafts: 2 windows, 2 of 8 drafts accepted"
+    ],
+    "engine_prompt_records": [
+      {
+        "prompt_tokens": 102543,
+        "reused_tokens": 101905,
+        "read_tokens": 638,
+        "prefill_ms": 4199,
+        "prefill_tps": 152.0,
+        "generated_tokens": 256,
+        "decode_ms": 2435,
+        "decode_tps": 105.1
+      }
+    ]
+  },
+  {
+    "name": "c6-long-1",
+    "category": "c6-long",
+    "request_sha256": "a3f05f5a54086f8b84ac36d8aa5b38d3fe49d20f80ce31a27f2198cf092d9bd4",
+    "messages_sha256": "040ffbdf8d19c9ed0c6916a1da42bbb77fddfb56e8c6d8cd1a4a2ec9d8f613b2",
+    "max_tokens": 1024,
+    "start_epoch": 1794038527.9181988,
+    "end_epoch": 1794038582.641134,
+    "ttft_s": 7.885666490998119,
+    "last_content_s": 54.717485012020916,
+    "total_s": 54.72293521696702,
+    "usage": {
+      "prompt_tokens": 101165,
+      "completion_tokens": 1024,
+      "total_tokens": 102189,
+      "prompt_tokens_details": {
+        "cached_tokens": 98304
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\nimport unittest\nimport threading\nfrom collections import OrderedDict\n\nclass LRUCache:\n    \"\"\"\n    A Least Recently Used (LRU) Cache implementation using OrderedDict.\n    \n    Methods:\n        get(key): Returns the value of the key if present, else -1.\n        put(key, value): Inserts or updates the value of the key.\n        delete(key): Removes the key from the cache if present.\n        __len__(): Returns the current number of items in the cache.\n    \"\"\"\n    def __init__(self, capacity: int):\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be positive\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n\n    def get(self, key):\n        \"\"\"\n        Get the value of the key if it exists in the cache.\n        Moves the accessed item to the end (most recently used).\n        \"\"\"\n        if key not in self.cache:\n            return -1\n        # Move to end to mark as recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n\n    def put(self, key, value):\n        \"\"\"\n        Insert or update the value of the key.\n        If the key already exists, update its value and move to end.\n        If the cache exceeds capacity, remove the least recently used item.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        \n        # If capacity exceeded, remove the first item (least recently used)\n        if len(self.cache) > self.capacity:\n            self.cache.popitem(last=False)\n\n    def delete(self, key):\n        \"\"\"\n        Remove the key from the cache if it exists.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n\n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeLRUCache:\n    \"\"\"\n    A thread-safe wrapper for LRUCache using a threading.Lock.\n    \"\"\"\n    def __init__(self, capacity: int):\n        self.cache = LRUCache(capacity)\n        self.lock = threading.Lock()\n\n    def get(self, key):\n        with self.lock:\n            return self.cache.get(key)\n\n    def put(self, key, value):\n        with self.lock:\n            self.cache.put(key, value)\n\n    def delete(self, key):\n        with self.lock:\n            self.cache.delete(key)\n\n    def __len__(self):\n        with self.lock:\n            return len(self.cache)\n\n\nclass TestLRUCache(unittest.TestCase):\n    \"\"\"\n    Unit tests for LRUCache and ThreadSafeLRUCache.\n    \"\"\"\n\n    def test_basic_operations(self):\n        \"\"\"Test basic get and put operations.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        self.assertEqual(cache.get(1), 1)\n        cache.put(3, 3)    # evicts key 2\n        self.assertEqual(cache.get(2), -1)\n        cache.put(4, 4)    # evicts key 1\n        self.assertEqual(cache.get(1), -1)\n        self.assertEqual(cache.get(3), 3)\n        self.assertEqual(cache.get(4), 4)\n\n    def test_update_existing_key(self):\n        \"\"\"Test updating an existing key does not change size but updates value and recency.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        cache.put(1, 10)   # Update key 1, should not evict\n        self.assertEqual(len(cache), 2)\n        self.assertEqual(cache.get(1), 10)\n        self.assertEqual(cache.get(2), 2)\n        cache.put(3, 3)    # Should evict key 2 (least recently used)\n        self.assertEqual(cache.get(2), -1)\n        self.assertEqual(cache.get(1), 10)\n        self.assertEqual(cache.get(3), 3)\n\n    def test_delete_operation(self):\n        \"\"\"Test deleting keys.\"\"\"\n        cache = LRUCache(3)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        cache.put(3, 3)\n        self.assertEqual(len(cache), 3)\n        \n        cache.delete(2)\n        self.assertEqual(len(cache), 2)\n        self.assertEqual(cache.get",
+    "reasoning_text": "",
+    "output_sha256": "bd27084ec41c188c2658ab1b15b4c62112ccc9820614b8a959e1161c1859ebba",
+    "delta_count": 916,
+    "decode_tps_usage_minus_one_estimate": 21.84412291273241,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 4,
+      "in_flight": 0,
+      "last_request_at": 1794038527
+    },
+    "activity_after": {
+      "requests": 10,
+      "in_flight": 5,
+      "last_request_at": 1794038582
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c6-long-3",
+    "category": "c6-long",
+    "request_sha256": "5b276ae1d99ad942ae6f12e3dd424f371bebd678e55e508e7816b04fc1f0900e",
+    "messages_sha256": "9872dbbf00dcacc2509fc5c94680905b714f52e5a0e7d46c1a35f329b7e20767",
+    "max_tokens": 1024,
+    "start_epoch": 1794038528.0315788,
+    "end_epoch": 1794038582.7746313,
+    "ttft_s": 12.749681869987398,
+    "last_content_s": 54.73812940507196,
+    "total_s": 54.743052408099174,
+    "usage": {
+      "prompt_tokens": 101165,
+      "completion_tokens": 1024,
+      "total_tokens": 102189,
+      "prompt_tokens_details": {
+        "cached_tokens": 98304
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\nimport unittest\nimport threading\nfrom collections import OrderedDict\n\nclass LRUCache:\n    \"\"\"\n    A Least Recently Used (LRU) Cache implementation using OrderedDict.\n    \"\"\"\n    def __init__(self, capacity: int):\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be positive\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n\n    def get(self, key):\n        \"\"\"\n        Retrieve value for key. If key exists, move it to the end (most recently used).\n        Returns None if key does not exist.\n        \"\"\"\n        if key not in self.cache:\n            return None\n        # Move to end to mark as recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n\n    def put(self, key, value):\n        \"\"\"\n        Insert or update value for key. If capacity is exceeded, remove least recently used item.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        if len(self.cache) > self.capacity:\n            # Remove the first item (least recently used)\n            self.cache.popitem(last=False)\n\n    def delete(self, key):\n        \"\"\"\n        Remove key from cache if it exists.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n\n    def __len__(self):\n        \"\"\"\n        Return current number of items in cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeLRUCache:\n    \"\"\"\n    A thread-safe wrapper around LRUCache using a threading.Lock.\n    \"\"\"\n    def __init__(self, capacity: int):\n        self._cache = LRUCache(capacity)\n        self._lock = threading.Lock()\n\n    def get(self, key):\n        with self._lock:\n            return self._cache.get(key)\n\n    def put(self, key, value):\n        with self._lock:\n            self._cache.put(key, value)\n\n    def delete(self, key):\n        with self._lock:\n            self._cache.delete(key)\n\n    def __len__(self):\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestLRUCache(unittest.TestCase):\n    \"\"\"\n    Unit tests for LRUCache and ThreadSafeLRUCache.\n    \"\"\"\n\n    def test_basic_operations(self):\n        \"\"\"Test basic get, put, and len operations.\"\"\"\n        cache = LRUCache(2)\n        self.assertEqual(len(cache), 0)\n        \n        cache.put(1, 1)\n        self.assertEqual(len(cache), 1)\n        self.assertEqual(cache.get(1), 1)\n        \n        cache.put(2, 2)\n        self.assertEqual(len(cache), 2)\n        self.assertEqual(cache.get(2), 2)\n        \n        # Access 1 to make it recently used\n        self.assertEqual(cache.get(1), 1)\n        \n        # Add 3, should evict 2 (least recently used)\n        cache.put(3, 3)\n        self.assertEqual(len(cache), 2)\n        self.assertIsNone(cache.get(2))\n        self.assertEqual(cache.get(1), 1)\n        self.assertEqual(cache.get(3), 3)\n\n    def test_eviction_order(self):\n        \"\"\"Test that LRU eviction works correctly.\"\"\"\n        cache = LRUCache(3)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        cache.put(3, 3)\n        \n        # Access 1, making 2 the LRU\n        self.assertEqual(cache.get(1), 1)\n        \n        # Add 4, should evict 2\n        cache.put(4, 4)\n        self.assertIsNone(cache.get(2))\n        self.assertEqual(cache.get(1), 1)\n        self.assertEqual(cache.get(3), 3)\n        self.assertEqual(cache.get(4), 4)\n\n    def test_update_existing_key(self):\n        \"\"\"Test that updating an existing key moves it to most recently used.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        \n        # Update 1, making it most recently used\n        cache.put(1, 10)\n        \n        # Add 3, should evict 2 (LRU)\n        cache.put(3, 3)\n        self.assertIsNone(cache.get(2))\n        self.assertEqual(cache.get(1), 10)\n        self.assertEqual(cache.get(",
+    "reasoning_text": "",
+    "output_sha256": "27f74c133a9a4f28ef276cbdc4e1f4d20a4593f661e654d39352392a57c18d98",
+    "delta_count": 913,
+    "decode_tps_usage_minus_one_estimate": 24.36384434421409,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 4,
+      "in_flight": 0,
+      "last_request_at": 1794038527
+    },
+    "activity_after": {
+      "requests": 10,
+      "in_flight": 4,
+      "last_request_at": 1794038582
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c6-long-4",
+    "category": "c6-long",
+    "request_sha256": "4eba8818ba5ad5c1a48d0bc9229e3521c5fe18219a970fc4439828871869f09c",
+    "messages_sha256": "b8fe0f76a4f0efadab872de013a8078af7b928ffc7c9df248be9cfa6cea4cc3e",
+    "max_tokens": 1024,
+    "start_epoch": 1794038528.0869057,
+    "end_epoch": 1794038582.8373313,
+    "ttft_s": 17.553367758868262,
+    "last_content_s": 54.748923148959875,
+    "total_s": 54.75042557879351,
+    "usage": {
+      "prompt_tokens": 101165,
+      "completion_tokens": 1024,
+      "total_tokens": 102189,
+      "prompt_tokens_details": {
+        "cached_tokens": 98304
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\nimport unittest\nimport threading\nfrom collections import OrderedDict\n\nclass LRUCache:\n    \"\"\"\n    A Least Recently Used (LRU) Cache implementation using OrderedDict.\n    \"\"\"\n    def __init__(self, capacity: int):\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be positive\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n\n    def get(self, key):\n        \"\"\"\n        Retrieve the value for the given key.\n        If the key exists, it is moved to the end (most recently used).\n        Returns None if the key does not exist.\n        \"\"\"\n        if key in self.cache:\n            # Move to end to mark as recently used\n            self.cache.move_to_end(key)\n            return self.cache[key]\n        return None\n\n    def put(self, key, value):\n        \"\"\"\n        Insert or update the value for the given key.\n        If the cache exceeds capacity, the least recently used item is removed.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        \n        # If capacity exceeded, remove the first item (least recently used)\n        if len(self.cache) > self.capacity:\n            self.cache.popitem(last=False)\n\n    def delete(self, key):\n        \"\"\"\n        Remove the key from the cache if it exists.\n        Returns True if the key was removed, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n\n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeLRUCache:\n    \"\"\"\n    A thread-safe wrapper for LRUCache using a threading.Lock.\n    \"\"\"\n    def __init__(self, capacity: int):\n        self._cache = LRUCache(capacity)\n        self._lock = threading.Lock()\n\n    def get(self, key):\n        with self._lock:\n            return self._cache.get(key)\n\n    def put(self, key, value):\n        with self._lock:\n            self._cache.put(key, value)\n\n    def delete(self, key):\n        with self._lock:\n            return self._cache.delete(key)\n\n    def __len__(self):\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestLRUCache(unittest.TestCase):\n    \"\"\"\n    Unit tests for LRUCache and ThreadSafeLRUCache.\n    \"\"\"\n\n    def test_basic_operations(self):\n        \"\"\"Test basic put and get operations.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        self.assertEqual(cache.get(1), 1)\n        self.assertEqual(cache.get(2), 2)\n        self.assertEqual(len(cache), 2)\n\n    def test_eviction_policy(self):\n        \"\"\"Test that the least recently used item is evicted.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        # Access 1 to make it recently used\n        self.assertEqual(cache.get(1), 1)\n        # Add 3, should evict 2 (least recently used)\n        cache.put(3, 3)\n        self.assertIsNone(cache.get(2))\n        self.assertEqual(cache.get(1), 1)\n        self.assertEqual(cache.get(3), 3)\n\n    def test_update_existing_key(self):\n        \"\"\"Test updating an existing key updates value and recency.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        # Update 1\n        cache.put(1, 10)\n        self.assertEqual(cache.get(1), 10)\n        # Add 3, should evict 2 because 1 was just updated/accessed\n        cache.put(3, 3)\n        self.assertIsNone(cache.get(2))\n        self.assertEqual(cache.get(1), 10)\n        self.assertEqual(cache.get(3), 3)\n\n    def test_delete_operation(self):\n        \"\"\"Test deleting keys.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        \n        # Delete existing key\n        self.assertTrue(cache.delete(1))\n        self.assertIsNone(cache.get(1))\n        self.assertEqual(len(cache), 1)\n",
+    "reasoning_text": "",
+    "output_sha256": "91d53552add996a95b59a020d0b77c1834b1e56865af10bd740bdd92d7b6076d",
+    "delta_count": 911,
+    "decode_tps_usage_minus_one_estimate": 27.503286058541104,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 4,
+      "in_flight": 0,
+      "last_request_at": 1794038528
+    },
+    "activity_after": {
+      "requests": 10,
+      "in_flight": 3,
+      "last_request_at": 1794038582
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c6-long-2",
+    "category": "c6-long",
+    "request_sha256": "8c04792f0c303512e120e79fead9bab507284bc2f6c5799d39425304b8df957c",
+    "messages_sha256": "43b42e3108be4cef897202793be9ea62d54588f034ada8cc3eb54ffef5c0f628",
+    "max_tokens": 1024,
+    "start_epoch": 1794038527.9743166,
+    "end_epoch": 1794038582.9266486,
+    "ttft_s": 22.39447339088656,
+    "last_content_s": 54.95064471499063,
+    "total_s": 54.952331902924925,
+    "usage": {
+      "prompt_tokens": 101165,
+      "completion_tokens": 1024,
+      "total_tokens": 102189,
+      "prompt_tokens_details": {
+        "cached_tokens": 98304
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\nimport unittest\nimport threading\nfrom collections import OrderedDict\n\nclass LRUCache:\n    \"\"\"\n    A Least Recently Used (LRU) Cache implementation using OrderedDict.\n    \"\"\"\n    def __init__(self, capacity: int):\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be positive\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n\n    def get(self, key):\n        \"\"\"\n        Retrieve value for key. If key exists, move it to the end (most recently used).\n        Returns None if key does not exist.\n        \"\"\"\n        if key not in self.cache:\n            return None\n        # Move to end to mark as recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n\n    def put(self, key, value):\n        \"\"\"\n        Insert or update value for key. If capacity is exceeded, remove least recently used item.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        \n        # If capacity exceeded, remove the first item (least recently used)\n        if len(self.cache) > self.capacity:\n            self.cache.popitem(last=False)\n\n    def delete(self, key):\n        \"\"\"\n        Remove key from cache if it exists.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n\n    def __len__(self):\n        \"\"\"\n        Return current number of items in cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeLRUCache:\n    \"\"\"\n    A thread-safe wrapper for LRUCache using a threading.Lock.\n    \"\"\"\n    def __init__(self, capacity: int):\n        self._cache = LRUCache(capacity)\n        self._lock = threading.Lock()\n\n    def get(self, key):\n        with self._lock:\n            return self._cache.get(key)\n\n    def put(self, key, value):\n        with self._lock:\n            self._cache.put(key, value)\n\n    def delete(self, key):\n        with self._lock:\n            self._cache.delete(key)\n\n    def __len__(self):\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestLRUCache(unittest.TestCase):\n    \"\"\"\n    Unit tests for LRUCache and ThreadSafeLRUCache.\n    \"\"\"\n\n    def test_basic_operations(self):\n        \"\"\"Test basic get, put, and len operations.\"\"\"\n        cache = LRUCache(2)\n        self.assertEqual(len(cache), 0)\n        \n        cache.put(1, 1)\n        self.assertEqual(len(cache), 1)\n        self.assertEqual(cache.get(1), 1)\n        \n        cache.put(2, 2)\n        self.assertEqual(len(cache), 2)\n        self.assertEqual(cache.get(2), 2)\n        \n        # Access 1 to make it recently used\n        self.assertEqual(cache.get(1), 1)\n        \n        # Add 3, should evict 2 (least recently used)\n        cache.put(3, 3)\n        self.assertEqual(len(cache), 2)\n        self.assertIsNone(cache.get(2))\n        self.assertEqual(cache.get(1), 1)\n        self.assertEqual(cache.get(3), 3)\n\n    def test_eviction_order(self):\n        \"\"\"Test that LRU eviction works correctly.\"\"\"\n        cache = LRUCache(3)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        cache.put(3, 3)\n        \n        # Access 1, making 2 the LRU\n        cache.get(1)\n        \n        # Add 4, should evict 2\n        cache.put(4, 4)\n        self.assertIsNone(cache.get(2))\n        self.assertEqual(cache.get(1), 1)\n        self.assertEqual(cache.get(3), 3)\n        self.assertEqual(cache.get(4), 4)\n\n    def test_update_existing_key(self):\n        \"\"\"Test updating an existing key updates value and recency.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        \n        # Update 1\n        cache.put(1, 10)\n        self.assertEqual(cache.get(1), 10)\n        \n        # Add 3, should evict 2 (since 1 was just updated/accessed)\n        cache.put(3, 3)\n        self.assertIsNone(cache.get(2))\n        self.assertEqual(cache.get(1), ",
+    "reasoning_text": "",
+    "output_sha256": "e5bdf4561c62f5db4bac6b9afd31bce09b0c8b2933ed4f2c5aa9961e6e421e38",
+    "delta_count": 914,
+    "decode_tps_usage_minus_one_estimate": 31.422613851481582,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 4,
+      "in_flight": 0,
+      "last_request_at": 1794038527
+    },
+    "activity_after": {
+      "requests": 10,
+      "in_flight": 1,
+      "last_request_at": 1794038582
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c6-long-6",
+    "category": "c6-long",
+    "request_sha256": "08beb770235c2fbd2b02625619d17d4dbef6301eb77c96a23d10ebdff7c363f2",
+    "messages_sha256": "6c757e397acbe593c630e2aa7a5d1899d1913894ba55dfb8a9f8f28b51c50c04",
+    "max_tokens": 1024,
+    "start_epoch": 1794038528.1990278,
+    "end_epoch": 1794038582.9274023,
+    "ttft_s": 26.015159814152867,
+    "last_content_s": 54.72694441303611,
+    "total_s": 54.72837442602031,
+    "usage": {
+      "prompt_tokens": 101165,
+      "completion_tokens": 1024,
+      "total_tokens": 102189,
+      "prompt_tokens_details": {
+        "cached_tokens": 98304
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\nimport unittest\nimport threading\nfrom collections import OrderedDict\n\nclass LRUCache:\n    \"\"\"\n    A Least Recently Used (LRU) Cache implementation using OrderedDict.\n    \"\"\"\n    def __init__(self, capacity: int):\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be positive\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n\n    def get(self, key):\n        \"\"\"\n        Retrieve the value for the given key.\n        If the key exists, it is moved to the end (most recently used).\n        Returns None if the key does not exist.\n        \"\"\"\n        if key in self.cache:\n            # Move to end to mark as recently used\n            self.cache.move_to_end(key)\n            return self.cache[key]\n        return None\n\n    def put(self, key, value):\n        \"\"\"\n        Insert or update the value for the given key.\n        If the cache exceeds capacity, the least recently used item is removed.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        \n        # If capacity exceeded, remove the first item (least recently used)\n        if len(self.cache) > self.capacity:\n            self.cache.popitem(last=False)\n\n    def delete(self, key):\n        \"\"\"\n        Remove the key from the cache if it exists.\n        Returns True if the key was removed, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n\n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeLRUCache:\n    \"\"\"\n    A thread-safe wrapper for LRUCache using a threading.Lock.\n    \"\"\"\n    def __init__(self, capacity: int):\n        self._cache = LRUCache(capacity)\n        self._lock = threading.Lock()\n\n    def get(self, key):\n        with self._lock:\n            return self._cache.get(key)\n\n    def put(self, key, value):\n        with self._lock:\n            self._cache.put(key, value)\n\n    def delete(self, key):\n        with self._lock:\n            return self._cache.delete(key)\n\n    def __len__(self):\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestLRUCache(unittest.TestCase):\n    \"\"\"\n    Unit tests for LRUCache and ThreadSafeLRUCache.\n    \"\"\"\n\n    def test_basic_operations(self):\n        \"\"\"Test basic put and get operations.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        self.assertEqual(cache.get(1), 1)\n        self.assertEqual(cache.get(2), 2)\n        self.assertEqual(len(cache), 2)\n\n    def test_eviction_policy(self):\n        \"\"\"Test that the least recently used item is evicted.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        # Access 1 to make it recently used\n        self.assertEqual(cache.get(1), 1)\n        # Add 3, should evict 2 (least recently used)\n        cache.put(3, 3)\n        self.assertIsNone(cache.get(2))\n        self.assertEqual(cache.get(1), 1)\n        self.assertEqual(cache.get(3), 3)\n\n    def test_update_existing_key(self):\n        \"\"\"Test updating an existing key updates value and recency.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        # Update 1\n        cache.put(1, 10)\n        self.assertEqual(cache.get(1), 10)\n        # Add 3, should evict 2 because 1 was just updated/accessed\n        cache.put(3, 3)\n        self.assertIsNone(cache.get(2))\n        self.assertEqual(cache.get(1), 10)\n        self.assertEqual(cache.get(3), 3)\n\n    def test_delete_operation(self):\n        \"\"\"Test deleting keys.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        \n        # Delete existing key\n        self.assertTrue(cache.delete(1))\n        self.assertIsNone(cache.get(1))\n        self.assertEqual(len(cache), 1)\n",
+    "reasoning_text": "",
+    "output_sha256": "91d53552add996a95b59a020d0b77c1834b1e56865af10bd740bdd92d7b6076d",
+    "delta_count": 911,
+    "decode_tps_usage_minus_one_estimate": 35.62996916742647,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 4,
+      "in_flight": 0,
+      "last_request_at": 1794038528
+    },
+    "activity_after": {
+      "requests": 10,
+      "in_flight": 1,
+      "last_request_at": 1794038582
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c6-long-5",
+    "category": "c6-long",
+    "request_sha256": "7fc75a6ba653ad074efaf34d9f2eba824b0d577753b79329e969fb17642a7bcf",
+    "messages_sha256": "4cc2f01956270e401742c7c447cf442db1c2441057617db48bb54791bf8a129e",
+    "max_tokens": 1024,
+    "start_epoch": 1794038528.1436334,
+    "end_epoch": 1794038583.0251684,
+    "ttft_s": 29.84886664710939,
+    "last_content_s": 54.8674988031853,
+    "total_s": 54.881535169202834,
+    "usage": {
+      "prompt_tokens": 101165,
+      "completion_tokens": 1024,
+      "total_tokens": 102189,
+      "prompt_tokens_details": {
+        "cached_tokens": 98304
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\nimport unittest\nimport threading\nfrom collections import OrderedDict\n\nclass LRUCache:\n    \"\"\"\n    A Least Recently Used (LRU) Cache implementation using OrderedDict.\n    \"\"\"\n    def __init__(self, capacity: int):\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be positive\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n\n    def get(self, key):\n        \"\"\"\n        Retrieve the value for the given key.\n        If the key exists, it is moved to the end (most recently used).\n        Returns None if the key does not exist.\n        \"\"\"\n        if key in self.cache:\n            # Move to end to mark as recently used\n            self.cache.move_to_end(key)\n            return self.cache[key]\n        return None\n\n    def put(self, key, value):\n        \"\"\"\n        Insert or update the value for the given key.\n        If the cache exceeds capacity, the least recently used item is removed.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        \n        # If capacity exceeded, remove the first item (least recently used)\n        if len(self.cache) > self.capacity:\n            self.cache.popitem(last=False)\n\n    def delete(self, key):\n        \"\"\"\n        Remove the key from the cache if it exists.\n        Returns True if the key was removed, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n\n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeLRUCache:\n    \"\"\"\n    A thread-safe wrapper for LRUCache using a threading.Lock.\n    \"\"\"\n    def __init__(self, capacity: int):\n        self._cache = LRUCache(capacity)\n        self._lock = threading.Lock()\n\n    def get(self, key):\n        with self._lock:\n            return self._cache.get(key)\n\n    def put(self, key, value):\n        with self._lock:\n            self._cache.put(key, value)\n\n    def delete(self, key):\n        with self._lock:\n            return self._cache.delete(key)\n\n    def __len__(self):\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestLRUCache(unittest.TestCase):\n    \"\"\"\n    Unit tests for LRUCache and ThreadSafeLRUCache.\n    \"\"\"\n\n    def test_basic_operations(self):\n        \"\"\"Test basic put and get operations.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        self.assertEqual(cache.get(1), 1)\n        self.assertEqual(cache.get(2), 2)\n        self.assertEqual(len(cache), 2)\n\n    def test_eviction_policy(self):\n        \"\"\"Test that the least recently used item is evicted.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        # Access 1 to make it recently used\n        self.assertEqual(cache.get(1), 1)\n        # Add 3, which should evict 2 (least recently used)\n        cache.put(3, 3)\n        self.assertIsNone(cache.get(2))\n        self.assertEqual(cache.get(1), 1)\n        self.assertEqual(cache.get(3), 3)\n\n    def test_update_existing_key(self):\n        \"\"\"Test updating an existing key updates value and recency.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        # Update 1\n        cache.put(1, 10)\n        self.assertEqual(cache.get(1), 10)\n        # Add 3, should evict 2 because 1 was just updated/accessed\n        cache.put(3, 3)\n        self.assertIsNone(cache.get(2))\n        self.assertEqual(cache.get(1), 10)\n        self.assertEqual(cache.get(3), 3)\n\n    def test_delete_operation(self):\n        \"\"\"Test deleting keys.\"\"\"\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        \n        # Delete existing key\n        self.assertTrue(cache.delete(1))\n        self.assertIsNone(cache.get(1))\n        self.assertEqual(len(cache), 1)",
+    "reasoning_text": "",
+    "output_sha256": "a27a2598f25e9bc0ff9f9d7c05fa3b70cde12e3129ad151bd1356b3bebeddd36",
+    "delta_count": 911,
+    "decode_tps_usage_minus_one_estimate": 40.88952559908672,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 4,
+      "in_flight": 0,
+      "last_request_at": 1794038528
+    },
+    "activity_after": {
+      "requests": 10,
+      "in_flight": 0,
+      "last_request_at": 1794038582
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c8-short-1",
+    "category": "c8-short",
+    "request_sha256": "d19bee2a2f7c6081e49fca02452a85ac94faf6e167bbe1b5083f7e4fd409a12d",
+    "messages_sha256": "8a762080c5e958f12eb87028b5222715928bb32410bb8a3b3c85da2fd75caa3e",
+    "max_tokens": 1024,
+    "start_epoch": 1794038583.275212,
+    "end_epoch": 1794038612.8221884,
+    "ttft_s": 2.2756489280145615,
+    "last_content_s": 29.54506220901385,
+    "total_s": 29.546976237092167,
+    "usage": {
+      "prompt_tokens": 80,
+      "completion_tokens": 1024,
+      "total_tokens": 1104,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\n\"\"\"\nShortCache1: A thread-safe LRU cache implementation with comprehensive tests.\n\"\"\"\n\nimport unittest\nimport threading\nfrom collections import OrderedDict\nfrom typing import Any, Optional\n\n\nclass ShortCache1:\n    \"\"\"\n    A Least Recently Used (LRU) cache implementation using OrderedDict.\n    \n    This class provides basic cache operations: get, put, delete, and length.\n    It is NOT thread-safe by itself; use ThreadSafeShortCache1 for thread safety.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the LRU cache with a given capacity.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n            \n        Raises:\n            ValueError: If capacity is less than or equal to 0.\n        \"\"\"\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be a positive integer\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n    \n    def get(self, key: Any) -> Optional[Any]:\n        \"\"\"\n        Retrieve a value from the cache by key.\n        \n        If the key exists, it is moved to the end (most recently used).\n        If the key does not exist, returns None.\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The cached value if found, None otherwise.\n        \"\"\"\n        if key not in self.cache:\n            return None\n        # Move the accessed item to the end (most recently used)\n        self.cache.move_to_end(key)\n        return self.cache[key]\n    \n    def put(self, key: Any, value: Any) -> None:\n        \"\"\"\n        Insert or update a key-value pair in the cache.\n        \n        If the key already exists, its value is updated and it is moved to the end.\n        If the cache is at capacity, the least recently used item is evicted.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n            self.cache[key] = value\n        else:\n            # Check if we need to evict\n            if len(self.cache) >= self.capacity:\n                # Remove the least recently used item (first item)\n                self.cache.popitem(last=False)\n            # Insert new item at the end (most recently used)\n            self.cache[key] = value\n    \n    def delete(self, key: Any) -> bool:\n        \"\"\"\n        Remove a key-value pair from the cache.\n        \n        Args:\n            key: The key to remove.\n            \n        Returns:\n            True if the key was found and removed, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n    \n    def __len__(self) -> int:\n        \"\"\"\n        Return the current number of items in the cache.\n        \n        Returns:\n            The number of items currently stored.\n        \"\"\"\n        return len(self.cache)\n    \n    def __contains__(self, key: Any) -> bool:\n        \"\"\"\n        Check if a key exists in the cache.\n        \n        Args:\n            key: The key to check.\n            \n        Returns:\n            True if the key exists, False otherwise.\n        \"\"\"\n        return key in self.cache\n    \n    def __repr__(self) -> str:\n        \"\"\"\n        Return a string representation of the cache.\n        \n        Returns:\n            A string showing the cache contents in order from least to most recently used.\n        \"\"\"\n        items = list(self.cache.items())\n        return f\"ShortCache1(capacity={self.capacity}, items={items})\"\n\n\nclass ThreadSafeShortCache1:\n    \"\"\"\n    A thread-safe wrapper around ShortCache1 using a threading lock.\n    \n    All public methods acquire the lock before delegating to the underlying\n    ShortCache1 instance, ensuring that concurrent access is safe.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the thread-safe LRU cache.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n            \n        Raises:\n            ValueError: If capacity is less than or equal to 0.\n        \"\"\"\n        self._cache = ShortCache1(capacity)\n        self._lock = threading.Lock()\n    \n    def get(self, key: Any) -> Optional[Any]:\n        \"\"\"\n        Thread-safe retrieval of a value by key.\n        \n        Args:\n            key: The key to",
+    "reasoning_text": "",
+    "output_sha256": "2daa9381c759d26ed9df9f280e5280d212082aa75d8988aa3d6c2f6f19f2fe9a",
+    "delta_count": 910,
+    "decode_tps_usage_minus_one_estimate": 37.51455850767436,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 10,
+      "in_flight": 0,
+      "last_request_at": 1794038582
+    },
+    "activity_after": {
+      "requests": 18,
+      "in_flight": 7,
+      "last_request_at": 1794038612
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c8-short-3",
+    "category": "c8-short",
+    "request_sha256": "1df62b7c2cef5f865709c890fabc5ebfb9ac0888df8d19eccfe46816e6bfea0a",
+    "messages_sha256": "ce42517295f414455e619d88eaa6acaa498dfa02606c7f834d2dc15a9026457b",
+    "max_tokens": 1024,
+    "start_epoch": 1794038583.376652,
+    "end_epoch": 1794038612.9337738,
+    "ttft_s": 3.4075793651863933,
+    "last_content_s": 29.555260421009734,
+    "total_s": 29.557121651014313,
+    "usage": {
+      "prompt_tokens": 80,
+      "completion_tokens": 1024,
+      "total_tokens": 1104,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\n\"\"\"\nShortCache3: A thread-safe LRU cache implementation with comprehensive tests.\n\"\"\"\n\nimport threading\nimport unittest\nfrom collections import OrderedDict\n\n\nclass ShortCache3:\n    \"\"\"\n    A Least Recently Used (LRU) cache implementation using OrderedDict.\n    \n    Methods:\n        get(key): Retrieve value for key, updating its position as recently used.\n        put(key, value): Insert or update key-value pair, evicting LRU item if at capacity.\n        delete(key): Remove key from cache if it exists.\n        __len__(): Return current number of items in cache.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the LRU cache with a given capacity.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be a positive integer\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n    \n    def get(self, key):\n        \"\"\"\n        Retrieve the value associated with the given key.\n        \n        If the key exists, it is moved to the end (most recently used).\n        If the key does not exist, returns None.\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        if key not in self.cache:\n            return None\n        # Move the accessed item to the end (most recently used)\n        self.cache.move_to_end(key)\n        return self.cache[key]\n    \n    def put(self, key, value):\n        \"\"\"\n        Insert or update the key-value pair in the cache.\n        \n        If the key already exists, its value is updated and it is moved to the end.\n        If the key does not exist, it is added. If the cache is at capacity,\n        the least recently used item is evicted.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end (most recently used)\n            self.cache.move_to_end(key)\n            self.cache[key] = value\n        else:\n            # Check if we need to evict the least recently used item\n            if len(self.cache) >= self.capacity:\n                # Pop the first item (least recently used)\n                self.cache.popitem(last=False)\n            # Add the new item at the end (most recently used)\n            self.cache[key] = value\n    \n    def delete(self, key):\n        \"\"\"\n        Remove the key from the cache if it exists.\n        \n        Args:\n            key: The key to remove.\n            \n        Returns:\n            True if the key was found and removed, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n    \n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \n        Returns:\n            The number of items currently stored in the cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeShortCache3:\n    \"\"\"\n    A thread-safe wrapper around ShortCache3 using a threading lock.\n    \n    All public methods are protected by a lock to ensure thread safety.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the thread-safe LRU cache.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        self._cache = ShortCache3(capacity)\n        self._lock = threading.Lock()\n    \n    def get(self, key):\n        \"\"\"\n        Thread-safe get operation.\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        with self._lock:\n            return self._cache.get(key)\n    \n    def put(self, key, value):\n        \"\"\"\n        Thread-safe put operation.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        with self._lock:\n            self._cache.put(key, value)\n    \n    def delete(self, key):\n        \"\"\"\n        Thread-safe delete operation.\n        \n        Args:\n            key: The key to remove.\n            \n        Returns:\n            True if the key was found and removed, False otherwise.\n        \"\"\"\n        with self._lock:",
+    "reasoning_text": "",
+    "output_sha256": "5f0fa87c8fe4702f0b440d50c134d1da679a7bc8aaa8f43d718943ad9efcbeaf",
+    "delta_count": 905,
+    "decode_tps_usage_minus_one_estimate": 39.123928344390144,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 12,
+      "in_flight": 2,
+      "last_request_at": 1794038583
+    },
+    "activity_after": {
+      "requests": 18,
+      "in_flight": 3,
+      "last_request_at": 1794038612
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c8-short-2",
+    "category": "c8-short",
+    "request_sha256": "48e61090ef6d16a5eb5305ccfb665c6d348947de71966ef3948ac8125f807a50",
+    "messages_sha256": "8ac351cc5b55c2e54540040f2163733b035eebac4b7e5a351b2f4bc1789b5430",
+    "max_tokens": 1024,
+    "start_epoch": 1794038583.3260555,
+    "end_epoch": 1794038612.9358447,
+    "ttft_s": 2.8978054760955274,
+    "last_content_s": 29.60724593908526,
+    "total_s": 29.6097892310936,
+    "usage": {
+      "prompt_tokens": 80,
+      "completion_tokens": 1024,
+      "total_tokens": 1104,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\n\"\"\"\nLRU Cache implementation with thread-safe wrapper and comprehensive tests.\n\"\"\"\n\nimport unittest\nimport threading\nfrom collections import OrderedDict\n\n\nclass ShortCache2:\n    \"\"\"\n    A Least Recently Used (LRU) cache implementation using OrderedDict.\n    \n    Supports get, put, delete, and __len__ operations.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the LRU cache with a given capacity.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be a positive integer\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n    \n    def get(self, key):\n        \"\"\"\n        Get the value for the given key if it exists in the cache.\n        Moves the accessed item to the end (most recently used).\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        if key not in self.cache:\n            return None\n        # Move to end to mark as most recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n    \n    def put(self, key, value):\n        \"\"\"\n        Insert or update the value for the given key.\n        If the cache exceeds capacity, evict the least recently used item.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n            self.cache[key] = value\n        else:\n            # Check if we need to evict\n            if len(self.cache) >= self.capacity:\n                # Remove the least recently used item (first item)\n                self.cache.popitem(last=False)\n            self.cache[key] = value\n    \n    def delete(self, key):\n        \"\"\"\n        Delete the item with the given key from the cache.\n        \n        Args:\n            key: The key to delete.\n            \n        Returns:\n            True if the key was found and deleted, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n    \n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \n        Returns:\n            The number of items in the cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeShortCache2:\n    \"\"\"\n    A thread-safe wrapper around ShortCache2 using a threading lock.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the thread-safe LRU cache.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        self._cache = ShortCache2(capacity)\n        self._lock = threading.Lock()\n    \n    def get(self, key):\n        \"\"\"\n        Thread-safe get operation.\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        with self._lock:\n            return self._cache.get(key)\n    \n    def put(self, key, value):\n        \"\"\"\n        Thread-safe put operation.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        with self._lock:\n            self._cache.put(key, value)\n    \n    def delete(self, key):\n        \"\"\"\n        Thread-safe delete operation.\n        \n        Args:\n            key: The key to delete.\n            \n        Returns:\n            True if the key was found and deleted, False otherwise.\n        \"\"\"\n        with self._lock:\n            return self._cache.delete(key)\n    \n    def __len__(self):\n        \"\"\"\n        Thread-safe length operation.\n        \n        Returns:\n            The number of items in the cache.\n        \"\"\"\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestShortCache2(unittest.TestCase):\n    \"\"\"\n    Comprehensive test suite for ShortCache2 and ThreadSafeShortCache2.\n    \"\"\"\n    \n    def test_basic_put_and_get(self):\n        \"\"\"Test basic put and get operations.\"\"\"\n        cache = ShortCache2(2)\n        cache.put(\"a\", 1)\n        cache.put(\"b\", 2)\n        self.assertEqual(cache.get(\"a\"), ",
+    "reasoning_text": "",
+    "output_sha256": "4f8384592ff10270b28dafb04ccc9bf803165c1eed71645e0d75f885b362ad30",
+    "delta_count": 895,
+    "decode_tps_usage_minus_one_estimate": 38.30106442767053,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 11,
+      "in_flight": 1,
+      "last_request_at": 1794038583
+    },
+    "activity_after": {
+      "requests": 18,
+      "in_flight": 3,
+      "last_request_at": 1794038612
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c8-short-4",
+    "category": "c8-short",
+    "request_sha256": "bbd35ac93f0b872437d456ee5b35b8d844f0554a0af7a1ce306ad584c64d2132",
+    "messages_sha256": "14006aa1280ae552896af52d7486207851fce97caf1b9d8829740af7f233003e",
+    "max_tokens": 1024,
+    "start_epoch": 1794038583.427463,
+    "end_epoch": 1794038612.9342144,
+    "ttft_s": 3.913614535005763,
+    "last_content_s": 29.504001919878647,
+    "total_s": 29.50675120507367,
+    "usage": {
+      "prompt_tokens": 80,
+      "completion_tokens": 1024,
+      "total_tokens": 1104,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\n\"\"\"\nShortCache4: A thread-safe LRU cache implementation with comprehensive tests.\n\"\"\"\n\nimport threading\nimport unittest\nfrom collections import OrderedDict\n\n\nclass ShortCache4:\n    \"\"\"\n    A Least Recently Used (LRU) cache implementation using OrderedDict.\n    \n    Supports get, put, delete, and __len__ operations.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the LRU cache with a given capacity.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be a positive integer\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n    \n    def get(self, key):\n        \"\"\"\n        Retrieve a value from the cache.\n        \n        If the key exists, it is moved to the end (most recently used).\n        If the key does not exist, returns None.\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        if key not in self.cache:\n            return None\n        # Move the accessed item to the end (most recently used)\n        self.cache.move_to_end(key)\n        return self.cache[key]\n    \n    def put(self, key, value):\n        \"\"\"\n        Insert or update a key-value pair in the cache.\n        \n        If the key already exists, its value is updated and it is moved\n        to the end (most recently used). If the cache exceeds capacity,\n        the least recently used item is evicted.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n            self.cache[key] = value\n        else:\n            # Check if we need to evict\n            if len(self.cache) >= self.capacity:\n                # Remove the least recently used item (first item)\n                self.cache.popitem(last=False)\n            self.cache[key] = value\n    \n    def delete(self, key):\n        \"\"\"\n        Remove a key from the cache.\n        \n        Args:\n            key: The key to remove.\n            \n        Returns:\n            True if the key was found and removed, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n    \n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \n        Returns:\n            The number of items in the cache.\n        \"\"\"\n        return len(self.cache)\n    \n    def __contains__(self, key):\n        \"\"\"\n        Check if a key exists in the cache.\n        \n        Args:\n            key: The key to check.\n            \n        Returns:\n            True if the key exists, False otherwise.\n        \"\"\"\n        return key in self.cache\n\n\nclass ThreadSafeShortCache4:\n    \"\"\"\n    A thread-safe wrapper around ShortCache4 using a threading lock.\n    \n    All public methods are protected by a lock to ensure thread safety.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the thread-safe LRU cache.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        self._cache = ShortCache4(capacity)\n        self._lock = threading.Lock()\n    \n    def get(self, key):\n        \"\"\"\n        Thread-safe get operation.\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        with self._lock:\n            return self._cache.get(key)\n    \n    def put(self, key, value):\n        \"\"\"\n        Thread-safe put operation.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        with self._lock:\n            self._cache.put(key, value)\n    \n    def delete(self, key):\n        \"\"\"\n        Thread-safe delete operation.\n        \n        Args:\n            key: The key to remove.\n            \n        Returns:\n            True if the key was found and removed, False otherwise.\n        \"\"\"\n        with self._lock:\n            return self._cache.delete(key)\n    \n    def __len__(self):\n        \"\"\"\n        Thread-safe length operation.\n        \n       ",
+    "reasoning_text": "",
+    "output_sha256": "51099f04625f87477a7532c3d27ffa5fc2f1872a72ca67c439cbcc75f6612ac4",
+    "delta_count": 896,
+    "decode_tps_usage_minus_one_estimate": 39.97594817985134,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 13,
+      "in_flight": 3,
+      "last_request_at": 1794038583
+    },
+    "activity_after": {
+      "requests": 18,
+      "in_flight": 3,
+      "last_request_at": 1794038612
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c8-short-5",
+    "category": "c8-short",
+    "request_sha256": "843f61bd688756ee7de526a123b9b7156946e2d8f9c61efdb87d6ec17136fa82",
+    "messages_sha256": "1bf5c46a1f969481aa64c438525fc51269fb2fc4b87b3be8edf130ddf8684bdf",
+    "max_tokens": 1024,
+    "start_epoch": 1794038583.482694,
+    "end_epoch": 1794038612.9403305,
+    "ttft_s": 4.4194366100709885,
+    "last_content_s": 29.452839577104896,
+    "total_s": 29.457636597100645,
+    "usage": {
+      "prompt_tokens": 80,
+      "completion_tokens": 1024,
+      "total_tokens": 1104,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\n\"\"\"\nLRU Cache implementation with thread-safe wrapper and comprehensive tests.\n\"\"\"\n\nimport unittest\nimport threading\nfrom collections import OrderedDict\n\n\nclass ShortCache5:\n    \"\"\"\n    A Least Recently Used (LRU) cache implementation using OrderedDict.\n    \n    Supports get, put, delete, and __len__ operations.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the LRU cache with a given capacity.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be a positive integer\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n    \n    def get(self, key):\n        \"\"\"\n        Get the value for the given key if it exists in the cache.\n        Moves the accessed item to the end (most recently used).\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        if key not in self.cache:\n            return None\n        # Move to end to mark as recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n    \n    def put(self, key, value):\n        \"\"\"\n        Insert or update the value for the given key.\n        If the cache exceeds capacity, evict the least recently used item.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        # If over capacity, remove the least recently used (first item)\n        if len(self.cache) > self.capacity:\n            self.cache.popitem(last=False)\n    \n    def delete(self, key):\n        \"\"\"\n        Delete the item with the given key from the cache.\n        \n        Args:\n            key: The key to delete.\n            \n        Returns:\n            True if the key was found and deleted, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n    \n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \n        Returns:\n            The number of items in the cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeShortCache5:\n    \"\"\"\n    A thread-safe wrapper around ShortCache5 using a threading lock.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the thread-safe LRU cache.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        self._cache = ShortCache5(capacity)\n        self._lock = threading.Lock()\n    \n    def get(self, key):\n        \"\"\"\n        Thread-safe get operation.\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        with self._lock:\n            return self._cache.get(key)\n    \n    def put(self, key, value):\n        \"\"\"\n        Thread-safe put operation.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        with self._lock:\n            self._cache.put(key, value)\n    \n    def delete(self, key):\n        \"\"\"\n        Thread-safe delete operation.\n        \n        Args:\n            key: The key to delete.\n            \n        Returns:\n            True if the key was found and deleted, False otherwise.\n        \"\"\"\n        with self._lock:\n            return self._cache.delete(key)\n    \n    def __len__(self):\n        \"\"\"\n        Thread-safe length operation.\n        \n        Returns:\n            The number of items in the cache.\n        \"\"\"\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestShortCache5(unittest.TestCase):\n    \"\"\"\n    Comprehensive test suite for ShortCache5 and ThreadSafeShortCache5.\n    \"\"\"\n    \n    def test_basic_put_and_get(self):\n        \"\"\"Test basic put and get operations.\"\"\"\n        cache = ShortCache5(2)\n        cache.put(\"a\", 1)\n        cache.put(\"b\", 2)\n        self.assertEqual(cache.get(\"a\"), 1)\n        self.assertEqual(cache.get(\"b\"), 2)\n    \n    def test",
+    "reasoning_text": "",
+    "output_sha256": "598feb9c86c8809b08adf83579d4b1f1796ef8d727097a1866f52b5bc7e28ebe",
+    "delta_count": 895,
+    "decode_tps_usage_minus_one_estimate": 40.865398977005746,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 14,
+      "in_flight": 4,
+      "last_request_at": 1794038583
+    },
+    "activity_after": {
+      "requests": 18,
+      "in_flight": 1,
+      "last_request_at": 1794038612
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c8-short-6",
+    "category": "c8-short",
+    "request_sha256": "e2728a5e27fad3424b13435450e908a8730cb5f4b4e426837c288db2d87320e7",
+    "messages_sha256": "7faa483eabdf3c875fb96862f45da7e2678843b1c7b9838e70a27d3bef31d90f",
+    "max_tokens": 1024,
+    "start_epoch": 1794038583.5286727,
+    "end_epoch": 1794038612.9465637,
+    "ttft_s": 4.940806851955131,
+    "last_content_s": 29.41521770088002,
+    "total_s": 29.417890921933576,
+    "usage": {
+      "prompt_tokens": 80,
+      "completion_tokens": 1024,
+      "total_tokens": 1104,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\n\"\"\"\nLRU Cache implementation with thread-safe wrapper and comprehensive tests.\n\"\"\"\n\nimport unittest\nimport threading\nfrom collections import OrderedDict\n\n\nclass ShortCache6:\n    \"\"\"\n    A Least Recently Used (LRU) cache implementation using OrderedDict.\n    \n    Supports get, put, delete, and __len__ operations.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the LRU cache with a given capacity.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be a positive integer\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n    \n    def get(self, key):\n        \"\"\"\n        Get the value for the given key if it exists in the cache.\n        Moves the accessed item to the end (most recently used).\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        if key not in self.cache:\n            return None\n        # Move to end to mark as most recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n    \n    def put(self, key, value):\n        \"\"\"\n        Insert or update the value for the given key.\n        If the cache exceeds capacity, evict the least recently used item.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n            self.cache[key] = value\n        else:\n            # Check if we need to evict\n            if len(self.cache) >= self.capacity:\n                # Remove the least recently used item (first item)\n                self.cache.popitem(last=False)\n            self.cache[key] = value\n    \n    def delete(self, key):\n        \"\"\"\n        Delete the item with the given key from the cache.\n        \n        Args:\n            key: The key to delete.\n            \n        Returns:\n            True if the key was found and deleted, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n    \n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \n        Returns:\n            The number of items in the cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeShortCache6:\n    \"\"\"\n    A thread-safe wrapper around ShortCache6 using a threading lock.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the thread-safe LRU cache.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        self._cache = ShortCache6(capacity)\n        self._lock = threading.Lock()\n    \n    def get(self, key):\n        \"\"\"\n        Thread-safe get operation.\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        with self._lock:\n            return self._cache.get(key)\n    \n    def put(self, key, value):\n        \"\"\"\n        Thread-safe put operation.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        with self._lock:\n            self._cache.put(key, value)\n    \n    def delete(self, key):\n        \"\"\"\n        Thread-safe delete operation.\n        \n        Args:\n            key: The key to delete.\n            \n        Returns:\n            True if the key was found and deleted, False otherwise.\n        \"\"\"\n        with self._lock:\n            return self._cache.delete(key)\n    \n    def __len__(self):\n        \"\"\"\n        Thread-safe length operation.\n        \n        Returns:\n            The number of items in the cache.\n        \"\"\"\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestShortCache6(unittest.TestCase):\n    \"\"\"\n    Comprehensive test suite for ShortCache6 and ThreadSafeShortCache6.\n    \"\"\"\n    \n    def test_basic_put_and_get(self):\n        \"\"\"Test basic put and get operations.\"\"\"\n        cache = ShortCache6(2)\n        cache.put(\"a\", 1)\n        cache.put(\"b\", 2)\n        self.assertEqual(cache.get(\"a\"), ",
+    "reasoning_text": "",
+    "output_sha256": "1a1e61c355f74136826ec9433f22380a0a7912378f1a26ee2f8afe93dd47ad89",
+    "delta_count": 895,
+    "decode_tps_usage_minus_one_estimate": 41.798758969715436,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 15,
+      "in_flight": 5,
+      "last_request_at": 1794038583
+    },
+    "activity_after": {
+      "requests": 18,
+      "in_flight": 1,
+      "last_request_at": 1794038612
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c8-short-7",
+    "category": "c8-short",
+    "request_sha256": "c3820ba1e2310c5d1cf1a34e67ea8ae6429b6756f4014786b977a52d1c266de9",
+    "messages_sha256": "7fd56a374b7dcf7ee4456ce9f3c1a514d988d798bfcc3150a7d4d9becd35ff16",
+    "max_tokens": 1024,
+    "start_epoch": 1794038583.5799298,
+    "end_epoch": 1794038612.9502482,
+    "ttft_s": 5.4566358109004796,
+    "last_content_s": 29.366908597992733,
+    "total_s": 29.370318468892947,
+    "usage": {
+      "prompt_tokens": 80,
+      "completion_tokens": 1024,
+      "total_tokens": 1104,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\n\"\"\"\nLRU Cache implementation with thread-safe wrapper and comprehensive tests.\n\"\"\"\n\nimport unittest\nimport threading\nfrom collections import OrderedDict\n\n\nclass ShortCache7:\n    \"\"\"\n    A Least Recently Used (LRU) cache implementation using OrderedDict.\n    \n    Supports get, put, delete, and __len__ operations.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the LRU cache with a given capacity.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be a positive integer\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n    \n    def get(self, key):\n        \"\"\"\n        Get the value for the given key if it exists in the cache.\n        Moves the accessed item to the end (most recently used).\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        if key not in self.cache:\n            return None\n        # Move to end to mark as most recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n    \n    def put(self, key, value):\n        \"\"\"\n        Insert or update the value for the given key.\n        If the cache exceeds capacity, evict the least recently used item.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        # If over capacity, remove the least recently used (first item)\n        if len(self.cache) > self.capacity:\n            self.cache.popitem(last=False)\n    \n    def delete(self, key):\n        \"\"\"\n        Delete the item with the given key from the cache.\n        \n        Args:\n            key: The key to delete.\n            \n        Returns:\n            True if the key was found and deleted, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n    \n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \n        Returns:\n            The number of items in the cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeShortCache7:\n    \"\"\"\n    A thread-safe wrapper around ShortCache7 using a threading lock.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the thread-safe LRU cache.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        self._cache = ShortCache7(capacity)\n        self._lock = threading.Lock()\n    \n    def get(self, key):\n        \"\"\"\n        Thread-safe get operation.\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        with self._lock:\n            return self._cache.get(key)\n    \n    def put(self, key, value):\n        \"\"\"\n        Thread-safe put operation.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        with self._lock:\n            self._cache.put(key, value)\n    \n    def delete(self, key):\n        \"\"\"\n        Thread-safe delete operation.\n        \n        Args:\n            key: The key to delete.\n            \n        Returns:\n            True if the key was found and deleted, False otherwise.\n        \"\"\"\n        with self._lock:\n            return self._cache.delete(key)\n    \n    def __len__(self):\n        \"\"\"\n        Thread-safe length operation.\n        \n        Returns:\n            The number of items in the cache.\n        \"\"\"\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestShortCache7(unittest.TestCase):\n    \"\"\"\n    Comprehensive test suite for ShortCache7 and ThreadSafeShortCache7.\n    \"\"\"\n    \n    def test_basic_put_and_get(self):\n        \"\"\"Test basic put and get operations.\"\"\"\n        cache = ShortCache7(2)\n        cache.put(\"a\", 1)\n        cache.put(\"b\", 2)\n        self.assertEqual(cache.get(\"a\"), 1)\n        self.assertEqual(cache.get(\"b\"), 2)\n    \n    def",
+    "reasoning_text": "",
+    "output_sha256": "f020c4d01eb0e16bf2f3a7129044429099f8f230ef43374c2b3c8d3aa71ace1b",
+    "delta_count": 895,
+    "decode_tps_usage_minus_one_estimate": 42.78495729050224,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 16,
+      "in_flight": 6,
+      "last_request_at": 1794038583
+    },
+    "activity_after": {
+      "requests": 18,
+      "in_flight": 0,
+      "last_request_at": 1794038612
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  },
+  {
+    "name": "c8-short-8",
+    "category": "c8-short",
+    "request_sha256": "d7b96243f6c2a147b7feedb70789e05a30e3fb907038b9dac2a83ab8b96be62a",
+    "messages_sha256": "cf71221cd729511c7815925a07ddffbc8180cbf633c4c6db7e94c28959125d83",
+    "max_tokens": 1024,
+    "start_epoch": 1794038583.6307497,
+    "end_epoch": 1794038612.954507,
+    "ttft_s": 5.965925154974684,
+    "last_content_s": 29.318507113028318,
+    "total_s": 29.323757441015914,
+    "usage": {
+      "prompt_tokens": 80,
+      "completion_tokens": 1024,
+      "total_tokens": 1104,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\n\"\"\"\nLRU Cache implementation with thread-safe wrapper and comprehensive tests.\n\"\"\"\n\nimport unittest\nimport threading\nfrom collections import OrderedDict\n\n\nclass ShortCache8:\n    \"\"\"\n    A Least Recently Used (LRU) cache implementation using OrderedDict.\n    \n    Supports get, put, delete, and __len__ operations.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the LRU cache with a given capacity.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be a positive integer\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n    \n    def get(self, key):\n        \"\"\"\n        Get the value for the given key if it exists in the cache.\n        Moves the accessed item to the end (most recently used).\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        if key not in self.cache:\n            return None\n        # Move to end to mark as recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n    \n    def put(self, key, value):\n        \"\"\"\n        Insert or update the value for the given key.\n        If the cache exceeds capacity, evict the least recently used item.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n            self.cache[key] = value\n        else:\n            # Check if we need to evict\n            if len(self.cache) >= self.capacity:\n                # Remove the least recently used item (first item)\n                self.cache.popitem(last=False)\n            self.cache[key] = value\n    \n    def delete(self, key):\n        \"\"\"\n        Delete the item with the given key from the cache.\n        \n        Args:\n            key: The key to delete.\n            \n        Returns:\n            True if the key was found and deleted, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n    \n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \n        Returns:\n            The number of items in the cache.\n        \"\"\"\n        return len(self.cache)\n    \n    def __contains__(self, key):\n        \"\"\"\n        Check if a key exists in the cache.\n        \n        Args:\n            key: The key to check.\n            \n        Returns:\n            True if the key exists, False otherwise.\n        \"\"\"\n        return key in self.cache\n\n\nclass ThreadSafeShortCache8:\n    \"\"\"\n    A thread-safe wrapper around ShortCache8 using a threading lock.\n    \"\"\"\n    \n    def __init__(self, capacity: int):\n        \"\"\"\n        Initialize the thread-safe LRU cache.\n        \n        Args:\n            capacity: Maximum number of items the cache can hold.\n        \"\"\"\n        self._cache = ShortCache8(capacity)\n        self._lock = threading.Lock()\n    \n    def get(self, key):\n        \"\"\"\n        Thread-safe get operation.\n        \n        Args:\n            key: The key to look up.\n            \n        Returns:\n            The value associated with the key, or None if not found.\n        \"\"\"\n        with self._lock:\n            return self._cache.get(key)\n    \n    def put(self, key, value):\n        \"\"\"\n        Thread-safe put operation.\n        \n        Args:\n            key: The key to insert or update.\n            value: The value to associate with the key.\n        \"\"\"\n        with self._lock:\n            self._cache.put(key, value)\n    \n    def delete(self, key):\n        \"\"\"\n        Thread-safe delete operation.\n        \n        Args:\n            key: The key to delete.\n            \n        Returns:\n            True if the key was found and deleted, False otherwise.\n        \"\"\"\n        with self._lock:\n            return self._cache.delete(key)\n    \n    def __len__(self):\n        \"\"\"\n        Thread-safe length operation.\n        \n        Returns:\n            The number of items in the cache.\n        \"\"\"\n        with self._lock:\n            return len(self._cache)\n    \n    def __contains__(self, key):\n        \"\"\"\n        Thread-safe contains operation.\n        \n        Args:\n           ",
+    "reasoning_text": "",
+    "output_sha256": "94edacd9ff189e92baa0e44c930bd92cbfbc3fdcee1714a36d7d0e03fb0612ca",
+    "delta_count": 891,
+    "decode_tps_usage_minus_one_estimate": 43.80671918152488,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 17,
+      "in_flight": 7,
+      "last_request_at": 1794038583
+    },
+    "activity_after": {
+      "requests": 18,
+      "in_flight": 0,
+      "last_request_at": 1794038612
+    },
+    "engine_lines": [],
+    "engine_prompt_records": []
+  }
+]

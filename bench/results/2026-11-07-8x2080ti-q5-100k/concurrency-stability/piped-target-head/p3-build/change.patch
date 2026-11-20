@@ -1,0 +1,391 @@
+diff --git a/docs/PIPED_MTP_OBSERVE.md b/docs/PIPED_MTP_OBSERVE.md
+new file mode 100644
+index 00000000..54a0f9ec
+--- /dev/null
++++ b/docs/PIPED_MTP_OBSERVE.md
+@@ -0,0 +1,60 @@
++# Piped MTP observation
++
++`STRATA_PIPED_MTP_OBSERVE=1` adds timing and counters to the existing CUDA piped MTP shared-head
++path. It is off by default. Startup rejects it without active piped MTP slot drafters and
++`STRATA_PIPED_MTP_HEAD=1`, on other backends, or together with `STRATA_MTP_PROFILE`.
++The latter uses one shared timestamp buffer and cannot separate concurrent slot chains.
++
++This switch does not pack jobs, create a ready queue, wait to form a batch, or change the order of the
++body, head or tail graphs. Prefill and admission's ordinary draft graphs retain their path. With the
++switch off, no observation event is created or recorded and no observation clock is read.
++
++Each slot owns four timing-enabled CUDA events per possible draft step. All four are recorded on
++that slot's source stream:
++
++1. Before the body graph, after the existing residual staging and dependency.
++2. After the body graph.
++3. After both remote head shards have completed and their full logits have returned.
++4. After the original selection/probability/residual tail.
++
++The events are read only after the existing chain completion event succeeds. A slot cannot launch
++another chain until that completion is reaped, so neither another slot nor the next chain can overwrite
++its measurements. Reading elapsed times adds no stream synchronization. Destruction retains the
++existing source-stream drain before destroying the observation events.
++
++The batch-drained report contains completed-chain counts and per-draft-step count, mean, minimum,
++maximum and sum in milliseconds for `body`, `head_return` and `tail`. Step zero's body includes the
++verified-window catch-up; later steps, when configured, execute a single new draft row. These are
++source-stream elapsed intervals. The body starts after residual staging and its upstream dependency,
++so it excludes waiting before the chain body begins. The intervals include GPU contention and dependencies; `head_return` includes
++activation publication, remote projection, source waits and the mapped logit copy. They are not pure
++kernel active time, FLOPS utilization or disjoint contributions to whole-system wall time. Intervals
++from different slot streams can overlap and their sums must not be added into an engine throughput.
++
++The host report contains:
++
++- `verdicts` and `verdict_gap_ms`: arrivals of last-stage group verdicts. Gaps can include admission,
++  prefill, pipeline drain/refill and other pauses within the reported span; they are neither GPU stage
++  execution time nor pure decode interarrival time. Align them with the run's admission/decode phases.
++- `stage0_draft_not_ready_group_skips`: scheduling attempts that found a group's draft still pending.
++  Repeated attempts count repeatedly; this is neither elapsed waiting time nor a count of distinct jobs.
++- `submitted_unreaped_pump_samples=[N:count,...]`: pending-chain count sampled at each pump entry.
++  `pm_drafting` means submitted but not reaped, including work whose GPU event may already have
++  completed. This is a distribution of pump samples, not a time-weighted occupancy distribution.
++- `unsubmitted_jobs_at_verdict=[N:count,...]`: the live jobs from the current verdict immediately
++  before the existing submission loop. With eight slots and eight groups this is zero or one. They
++  have not run their body and are not a post-attention GPU ready batch.
++
++Reports appear only with the existing drained-batch summary, not per chain. The per-slot aggregates
++cover completed chains since the preceding report. No prompt, token ids, output text or credentials
++are logged by this observation path.
++
++Use an observation-off run as the performance baseline. Timing events, event queries, host clocks and
++counters themselves add overhead. Compare full output, usage, finish reasons, MTP acceptance and route
++counts before treating an observed run as representative. This code has no local GPU performance
++measurement and does not claim a speedup.
++
++These probes can establish which broad draft phase competes for GPU7 and whether draft waits are
++common. They cannot establish a usable post-attention packing queue: existing chains are submitted
++immediately, and this probe deliberately preserves that schedule. A later packing experiment must
++show naturally queued compatible jobs and retain an immediate single-job path when only one is ready.
+diff --git a/include/strata/core/mtp.hpp b/include/strata/core/mtp.hpp
+index 022ac4e5..66393cf1 100644
+--- a/include/strata/core/mtp.hpp
++++ b/include/strata/core/mtp.hpp
+@@ -189,6 +189,26 @@ public:
+     void set_head_shards_active(bool on) { head_shards_active_ = on && head_shards_.initialized(); }
+     bool head_shards_enabled() const { return head_shards_.initialized(); }
+     uint64_t head_shard_steps() const { return head_shard_steps_; }
++    struct TimingSummary {
++        uint64_t count = 0;
++        double total_ms = 0, min_ms = 0, max_ms = 0;
++        void add(double ms) {
++            if (count == 0) min_ms = max_ms = ms;
++            else { min_ms = std::min(min_ms, ms); max_ms = std::max(max_ms, ms); }
++            total_ms += ms;
++            ++count;
++        }
++        double mean_ms() const { return count ? total_ms / (double) count : 0.0; }
++    };
++    struct ChainObservation {
++        uint64_t chains = 0;
++        TimingSummary body, head_return, tail;
++    };
++    /// Observation only, after prepare_chain, for an idle piped clone using the shared head. Independent timing
++    /// events per step/slot; no event is reused until chain_poll has consumed it. Nothing is allocated when off.
++    bool enable_piped_observation(std::string& err);
++    /// Completed-chain aggregates since the last take, never a synchronization or a scheduling decision.
++    ChainObservation take_chain_observation() { auto out = chain_observation_; chain_observation_ = {}; return out; }
+     /// The catch-up over T cells from `p` (as draft()), then `n_out` outputs from row `a`: output j is the chain's
+     /// own pick, and step j (1 <= j <= n_force) takes force[j - 1] as its input token instead of output j - 1.
+     /// `n_early`: an event after each of the first `n_early` outputs (chain_outputs_ready).
+@@ -308,6 +328,9 @@ private:
+     MtpHeadShards head_shards_;
+     bool head_shards_active_ = false;
+     uint64_t head_shard_steps_ = 0;
++    bool piped_observe_on_ = false;
++    cudaEvent_t observe_events_[8][4] = {};  // body start/end, full head return, tail end; timing enabled
++    ChainObservation chain_observation_;
+     cudaGraphExec_t head_round_body_[9] = {}, head_step_body_[9] = {}, head_tail_[9] = {};
+     const float* src_R_ = nullptr;
+     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index 30934b8b..07b7ef1d 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -143,6 +143,7 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
+ MtpDrafter::~MtpDrafter() {
+     const OnDevice on_device(device_);
+     if (cs_) cudaStreamSynchronize(cs_);
++    for (auto& step : observe_events_) for (auto& e : step) if (e) cudaEventDestroy(e);
+     head_shards_.reset();  // its cross-device events and buffers outlive every queued chain tail
+     for (auto& e : head_round_body_) if (e) cudaGraphExecDestroy(e);
+     for (auto& e : head_step_body_) if (e) cudaGraphExecDestroy(e);
+@@ -2034,6 +2035,39 @@ bool MtpDrafter::prepare_chain(std::string& err) {
+     return true;
+ }
+ 
++bool MtpDrafter::enable_piped_observation(std::string& err) {
++#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
++    err = "mtp observe: only the CUDA piped shared-head path is supported";
++    return false;
++#else
++    const OnDevice on_device(device_);
++    const char* global_profile = std::getenv("STRATA_MTP_PROFILE");
++    if (global_profile && std::atoi(global_profile) != 0) {
++        err = "mtp observe: disable the shared-buffer STRATA_MTP_PROFILE";
++        return false;
++    }
++    if (piped_observe_on_ || chain_live_ || owns_weights_ || owns_draft_head_ || !force_on_ || !cs_ ||
++        !head_shards_active_ || !head_shards_.initialized() || coupled_active_ || !ev_chain_ ||
++        !head_round_body_[1] || !head_tail_[0] || max_t_ < 2 || max_t_ > 8) {
++        err = "mtp observe: requires an idle prepared piped shared-head clone";
++        return false;
++    }
++    for (auto& step : observe_events_) for (auto& e : step) {
++        const cudaError_t status = cudaEventCreateWithFlags(&e, cudaEventDefault);
++        if (status != cudaSuccess) {
++            err = std::string("mtp observe: create timing event: ") + cudaGetErrorString(status);
++            for (auto& allocated_step : observe_events_) for (auto& allocated : allocated_step) {
++                if (allocated) cudaEventDestroy(allocated);
++                allocated = nullptr;
++            }
++            return false;
++        }
++    }
++    piped_observe_on_ = true;
++    return true;
++#endif
++}
++
+ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force,
+                               int n_out, int n_early, std::string& err) {
+     const OnDevice on_device(device_);
+@@ -2051,6 +2085,10 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
+     // Solo request eligibility is controlled by its PW2 caller. Piped slots always draft greedily, including
+     // sampled targets. Coupled sampling can never take this greedy split tail, regardless of either caller.
+     const bool head_split = head_shards_active_ && head_shards_.initialized() && !coupled_active_;
++    if (piped_observe_on_ && (!head_split || n_out > 8)) {
++        err = "mtp observe: an observed chain must keep its shared-head route";
++        return false;
++    }
+     if (head_split) {
+         if (!head_round_body_[T] || !head_tail_[0]) { err = "mtp head: split round graphs not prepared"; return false; }
+         for (int j = 1; j < n_out; ++j)
+@@ -2077,11 +2115,21 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+     if (!stage_source_R(T, err)) return false;
+     chain_early_ = std::max(0, std::min(n_early, n_out));
++    auto observe_record = [&](int step, int point) {
++        const cudaError_t status = cudaEventRecord(observe_events_[step][point], cs_);
++        if (status == cudaSuccess) return true;
++        err = std::string("mtp observe: record timing event: ") + cudaGetErrorString(status);
++        return false;
++    };
+     auto launch = [&](int j) {
+         if (!head_split) return cudaGraphLaunch(j == 0 ? round_exec_[T] : step_exec_[j], cs_) == cudaSuccess;
++        if (piped_observe_on_ && !observe_record(j, 0)) return false;
+         if (cudaGraphLaunch(j == 0 ? head_round_body_[T] : head_step_body_[j], cs_) != cudaSuccess) return false;
++        if (piped_observe_on_ && !observe_record(j, 1)) return false;
+         if (!head_shards_.enqueue(cs_, xq_, head_logits_, j, err)) return false;
++        if (piped_observe_on_ && !observe_record(j, 2)) return false;
+         if (cudaGraphLaunch(head_tail_[j], cs_) != cudaSuccess) return false;
++        if (piped_observe_on_ && !observe_record(j, 3)) return false;
+         ++head_shard_steps_;
+         return true;
+     };
+@@ -2128,6 +2176,25 @@ int MtpDrafter::chain_poll(std::string& err) {
+     if (q == cudaErrorNotReady) return 0;
+     chain_live_ = false;
+     if (q != cudaSuccess) { err = std::string("mtp chain: ") + cudaGetErrorString(q); return -1; }
++    if (piped_observe_on_) {
++        // ev_chain_ is after every observed event on this source stream: elapsed-time reads never wait on an
++        // unfinished chain. These are stream wall intervals, including GPU contention and head-transfer waits.
++        float elapsed[8][3] = {};
++        for (int j = 0; j < chain_n_; ++j) for (int part = 0; part < 3; ++part) {
++            const cudaError_t status = cudaEventElapsedTime(&elapsed[j][part], observe_events_[j][part],
++                                                           observe_events_[j][part + 1]);
++            if (status != cudaSuccess) {
++                err = std::string("mtp observe: read completed timing events: ") + cudaGetErrorString(status);
++                return -1;
++            }
++        }
++        for (int j = 0; j < chain_n_; ++j) {
++            chain_observation_.body.add(elapsed[j][0]);
++            chain_observation_.head_return.add(elapsed[j][1]);
++            chain_observation_.tail.add(elapsed[j][2]);
++        }
++        ++chain_observation_.chains;
++    }
+     for (int j = 0; j < chain_n_; ++j) {
+         chain_tok_[j] = ((volatile int32_t*) h_out_)[j];
+         chain_prob_[j] = ((volatile float*) h_prob_)[j];
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 60dc8263..a00e265d 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -6828,6 +6828,24 @@ int main(int argc, char** argv) {
+     // each stage commits a group's window once the last stage has judged its proposals
+     // (Verifier::batch_launch_rows / batch_commit_rows)
+     bool piped_mtp = batch_mtp && !stages.empty() && batch_groups_for(true).mtp_piped;   // (final once the slots that fit are known, below)
++    const bool piped_mtp_observe = [] {
++        const char* v = std::getenv("STRATA_PIPED_MTP_OBSERVE");
++        return v != nullptr && std::atoi(v) != 0;
++    }();
++    if (piped_mtp_observe) {
++        const char* shared_head = std::getenv("STRATA_PIPED_MTP_HEAD");
++        const char* global_profile = std::getenv("STRATA_MTP_PROFILE");
++        if (!o.serve || !piped_mtp || !shared_head || std::atoi(shared_head) == 0 ||
++            (global_profile && std::atoi(global_profile) != 0)) {
++            std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP_OBSERVE requires serving piped MTP shared-head chains "
++                                 "and STRATA_MTP_PROFILE disabled\n");
++            return 1;
++        }
++#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
++        std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP_OBSERVE is supported only on CUDA\n");
++        return 1;
++#endif
++    }
+     // STRATA_PIPED_MTP=N: up to N proposals per slot and window (at most --spec - 1); the first always, each further
+     // one while the draft layer is at least --spec-min-p sure of it, as the solo path extends its windows
+     int pm_drafts = 0;
+@@ -11901,10 +11919,18 @@ int main(int argc, char** argv) {
+                     return 1;
+                 }
+                 d.set_head_shards_active(true); // only chain_launch reads this; admission/prefill use their original graphs
++                if (piped_mtp_observe && !d.enable_piped_observation(err)) {
++                    std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP_OBSERVE slot %zu: %s\n", b, err.c_str());
++                    return 1;
++                }
+             }
+             std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP_HEAD: %zu private slot workspaces, CUDA%d+%d, "
+                                  "1 shared weight bank, source CUDA%d; greedy proposals include sampled targets\n",
+                          slot_mtp.size(), mtp_head_devices[0], mtp_head_devices[1], mtp.device());
++            if (piped_mtp_observe)
++                std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP_OBSERVE: %zu independent slot event sets; "
++                                     "source-stream body/head-return/tail intervals, no packing or scheduling changes\n",
++                             slot_mtp.size());
+         }
+         cudaEvent_t pl_mtp_ev[2] = {nullptr, nullptr};
+         bool pl_mtp_live[2] = {false, false};
+@@ -14827,6 +14853,10 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "strata serve: STRATA_PIPED_ASYNC_SAMPLE requires the deferred-commit piped route\n");
+             return 1;
+         }
++        if (piped_mtp_observe && (!pmtp || !piped_mtp_head || slot_mtp.empty())) {
++            std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP_OBSERVE requires the active piped shared-head route\n");
++            return 1;
++        }
+         uint64_t target_head_reported_windows = 0, target_head_reported_rows = 0;
+         uint64_t async_sample_reported_windows = 0, async_sample_reported_rows = 0;
+         std::vector<uint64_t> pmtp_head_reported(piped_mtp_head ? slot_mtp.size() : 0, 0);
+@@ -14879,6 +14909,19 @@ int main(int argc, char** argv) {
+         // STRATA_PIPED_MTP: a slot whose next proposals are drafting (its chain in flight on the drafter's stream), and
+         // per slot the event after the copy of its rows on the last stage's stream, which the chain waits for
+         std::vector<char> pm_drafting(bs.size(), 0);
++        // Counts below describe host observations, not a ready queue or a time-weighted GPU occupancy measure.
++        // In particular pm_drafting means submitted but not yet reaped; an event may already have completed.
++        struct MtpHostObservation {
++            strata::core::MtpDrafter::TimingSummary verdict_gap;
++            Clock::time_point last_verdict{};
++            bool have_verdict = false;
++            uint64_t verdicts = 0, stage0_draft_skips = 0;
++            std::vector<uint64_t> pending_pump_hist, unsubmitted_verdict_hist;
++        } mtp_observation;
++        if (piped_mtp_observe) {
++            mtp_observation.pending_pump_hist.assign(bs.size() + 1, 0);
++            mtp_observation.unsubmitted_verdict_hist.assign(bs.size() + 1, 0);
++        }
+         std::vector<cudaEvent_t> pm_copied(pmtp ? bs.size() : 0, nullptr);
+         if (pmtp) {
+             const strata::core::OnDevice on_last(stage_verifier(n_pipe - 1).device());
+@@ -14916,6 +14959,14 @@ int main(int argc, char** argv) {
+         // Judge the proposals, queue every stage's commit of the kept rows (each stage runs it before that group's next
+         // window there: the same stream), emit them, and start drafting the next proposals.
+         auto pmtp_verdict = [&](PGroup& G, strata::core::Verifier& vk, const int32_t* outb) -> bool {
++            if (piped_mtp_observe) {
++                const auto now = Clock::now();
++                if (mtp_observation.have_verdict)
++                    mtp_observation.verdict_gap.add(std::chrono::duration<double, std::milli>(now - mtp_observation.last_verdict).count());
++                mtp_observation.last_verdict = now;
++                mtp_observation.have_verdict = true;
++                ++mtp_observation.verdicts;
++            }
+             auto is_eos = [&](int32_t y) {
+                 return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+             };
+@@ -14993,6 +15044,13 @@ int main(int argc, char** argv) {
+             // rows - the last stage's final residuals - are copied on THAT stage's stream, so its next window, which
+             // rewrites them, runs after the copy; the chain waits for the copy.
+             const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
++            if (piped_mtp_observe) {
++                size_t candidates = 0;
++                for (const Blk& blk : blks) if (bs[(size_t) blk.b].active) ++candidates;
++                // Only this verdict's live jobs, immediately submitted below. GS=1 gives 0 or 1; these have not
++                // even run their body yet and are not a GPU post-attention ready batch.
++                ++mtp_observation.unsubmitted_verdict_hist[candidates];
++            }
+             for (const Blk& blk : blks) {
+                 BSlot& sl = bs[(size_t) blk.b];
+                 if (!sl.active) continue;   // it ended: no more drafts for it
+@@ -15057,6 +15115,11 @@ int main(int argc, char** argv) {
+         auto pump = [&](bool may_start) -> bool {
+             ++pipe_tick;
+             const strata::program::PipeProbe::PumpScope p4_scope(p4);
++            if (piped_mtp_observe) {
++                size_t pending_chains = 0;
++                for (char pending_chain : pm_drafting) pending_chains += pending_chain != 0;
++                ++mtp_observation.pending_pump_hist[pending_chains];
++            }
+             if (p4.timing()) {
+                 int nb = 0, nf = 0;
+                 for (int k = 0; k < n_pipe; ++k) if (stage_group[(size_t) k] >= 0) ++nb;
+@@ -15166,7 +15229,10 @@ int main(int argc, char** argv) {
+                                 if (dr < 0) return false;
+                                 if (dr == 0) { ready = false; break; }
+                             }
+-                            if (!ready) continue;
++                            if (!ready) {
++                                if (piped_mtp_observe) ++mtp_observation.stage0_draft_skips;
++                                continue;
++                            }
+                         }
+                         pick = gi;
+                     }
+@@ -15320,6 +15386,40 @@ int main(int argc, char** argv) {
+                         pmtp_head_reported[b] = steps;
+                     }
+                 }
++                if (piped_mtp_observe) {
++                    auto summary = [](const char* name, const strata::core::MtpDrafter::TimingSummary& s) {
++                        std::fprintf(stderr, " %s_ms(n=%llu,mean=%.6f,min=%.6f,max=%.6f,sum=%.6f)", name,
++                                     (unsigned long long) s.count, s.mean_ms(), s.min_ms, s.max_ms, s.total_ms);
++                    };
++                    for (size_t b = 0; b < slot_mtp.size(); ++b) {
++                        const auto obs = slot_mtp[b]->take_chain_observation();
++                        std::fprintf(stderr, "strata piped MTP observe: slot %zu, completed_chains=%llu, source_stream_intervals",
++                                     b, (unsigned long long) obs.chains);
++                        summary("body", obs.body);
++                        summary("head_return", obs.head_return);
++                        summary("tail", obs.tail);
++                        std::fprintf(stderr, "\n");
++                    }
++                    std::fprintf(stderr, "strata piped MTP observe host: verdicts=%llu, stage0_draft_not_ready_group_skips=%llu",
++                                 (unsigned long long) mtp_observation.verdicts,
++                                 (unsigned long long) mtp_observation.stage0_draft_skips);
++                    summary("verdict_gap", mtp_observation.verdict_gap);
++                    auto histogram = [](const char* name, const std::vector<uint64_t>& hist) {
++                        std::fprintf(stderr, " %s=[", name);
++                        for (size_t i = 0; i < hist.size(); ++i)
++                            std::fprintf(stderr, "%s%zu:%llu", i ? "," : "", i, (unsigned long long) hist[i]);
++                        std::fprintf(stderr, "]");
++                    };
++                    histogram("submitted_unreaped_pump_samples", mtp_observation.pending_pump_hist);
++                    histogram("unsubmitted_jobs_at_verdict", mtp_observation.unsubmitted_verdict_hist);
++                    std::fprintf(stderr, " (pump-sample counts, not walltime shares; verdict jobs are immediately submitted, "
++                                         "not a post-attention ready batch; GPU intervals include contention and mapped head transfer)\n");
++                    mtp_observation.verdict_gap = {};
++                    mtp_observation.have_verdict = false;
++                    mtp_observation.verdicts = mtp_observation.stage0_draft_skips = 0;
++                    std::fill(mtp_observation.pending_pump_hist.begin(), mtp_observation.pending_pump_hist.end(), 0);
++                    std::fill(mtp_observation.unsubmitted_verdict_hist.begin(), mtp_observation.unsubmitted_verdict_hist.end(), 0);
++                }
+                 p4.flush();
+                 pa_rounds = pa_swaps = 0;
+                 pa_ms = 0;

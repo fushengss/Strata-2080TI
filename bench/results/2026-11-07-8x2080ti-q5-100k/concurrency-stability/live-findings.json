@@ -1,0 +1,67 @@
+{
+  "observed_local_date": "2026-11-07",
+  "timezone": "Asia/Taipei",
+  "scope": "Read-only live test traffic; no inference requests submitted by observer and no service changes.",
+  "facts": {
+    "single_completed_example": {
+      "prompt_tokens": 53792,
+      "reused": 53762,
+      "read_ms": 334,
+      "generated": 3177,
+      "decode_ms": 35985,
+      "decode_tps": 88.3
+    },
+    "concurrent_snapshot": {
+      "active_requests": 4,
+      "reading_slots": 1,
+      "decoding_slots": 3,
+      "per_stream_observed_tps": [
+        7.3,
+        8.7,
+        5.0
+      ]
+    },
+    "completed_concurrent_example": {
+      "prompt_tokens": 60987,
+      "reused": 57123,
+      "output_tokens": 541,
+      "first_engine_token_s": 5.557,
+      "decode_ms": 53121.1,
+      "decode_tps": 10.2
+    },
+    "production_env_confirmed": {
+      "STRATA_BATCH_MTP": null,
+      "STRATA_PIPED_MTP": null,
+      "STRATA_SPLIT_MTP_BATCH": "1",
+      "STRATA_PIPED_CONCURRENT": null,
+      "STRATA_PIPED_READ_PIECE": null,
+      "batch_mtp_argument": false
+    },
+    "props_defaults_only": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20
+    }
+  },
+  "limitations": [
+    "Examples are different live prompts, not controlled throughput comparisons.",
+    "API monitor was unavailable; per-request sampling parameters were not recovered. Defaults are not proof of actual request settings.",
+    "Batch MTP accepted/offered counts are not currently propagated through /metrics; disabled status was confirmed independently from process environment and arguments.",
+    "The 90-second saved telemetry sample later shows steadier traffic; it must not be pooled with the earlier cold-admission burst to claim a causal speedup."
+  ],
+  "new_objective": "Concurrent tail latency, maximum output stalls and fair per-request progress; preserve isolated prefill behavior; prioritize enabling and validating piped MTP.",
+  "candidate_guard": {
+    "commit": "0642262b3acae3f2331322b07dbc43f5bc104bc7",
+    "deployed": false,
+    "gpu_tested": false,
+    "cpu_policy_test": "passed"
+  },
+  "next_isolated_trial": {
+    "baseline_binary_sha256": "113a4ea9bf2101a9ad9a3449ae611f8a21f892cc62293fa9a779d302dc2df96f",
+    "candidate_env": {
+      "STRATA_BATCH_MTP": "1",
+      "STRATA_PIPED_MTP": "1"
+    },
+    "keep_existing_prefill_and_solo_heads": true
+  }
+}

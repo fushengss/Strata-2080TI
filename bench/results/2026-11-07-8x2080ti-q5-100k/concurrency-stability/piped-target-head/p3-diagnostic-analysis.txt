@@ -1,0 +1,22 @@
+P3 v2 independent numeric audit: PASS
+Scope: C8, 8 normal completed synthetic requests, 66/68 prompt tokens, 1024 output tokens each; 8/8 exact compatible with qualified P2-off run.
+Observed completed chains/steps: 4673/4673; drained blocks: 1.
+body: weighted mean 0.620737205 ms, n=4673, min=0.428032, max=0.689056.
+head_return: weighted mean 0.319315838 ms, n=4673, min=0.302496, max=0.364544.
+tail: weighted mean 0.030594232 ms, n=4673, min=0.022528, max=0.066656.
+Same-step sum of phase means: 0.970647275 ms (not engine wall time).
+Verdicts=4681; gap n=4680, mean=5.603772428 ms, max=818.959927 ms.
+Submitted-unreaped pump histogram=[3293396, 671338, 0, 0, 0, 0, 0, 0, 0]
+Unsubmitted-at-verdict histogram=[8, 4673, 0, 0, 0, 0, 0, 0, 0]
+Stage0 draft-not-ready scheduling attempts=665896; repeated attempts, neither unique jobs nor time.
+Each phase mean is sum_ms / observed step count across slots; not an unweighted mean of means.
+Source-stream intervals contain contention and dependencies. Body excludes pre-body residual staging. Head-return includes remote projection and mapped logits return.
+The three same-step phases sum to an observed draft-chain span, not whole-engine time, GPU occupancy, or a possible speedup. Cross-slot sums can overlap.
+Submitted-but-unreaped chains were 0 or 1 at pump entry; some may already have finished on GPU. These are pump samples, not duration shares.
+Unsubmitted verdict jobs were 0 or 1 by the eight-group/one-slot structure; they have not executed their bodies and do not form a post-attention ready queue.
+Stage0 draft-not-ready skips are repeated scheduling attempts. They prove this condition occurred, but not how many requests stalled or how much wall time was lost.
+Host verdict gaps include admission, prefill, drain/refill and scheduling. Their mean/max is not pure decode interarrival or measured GPU stage latency.
+This short-context instrumented run observes no multi-chain backlog at the sampled points. It does not establish profitable packing; waiting for a batch can add latency and requires a new experiment.
+No 100k or mixed-admission diagnostic was run. Instrumentation overhead has not been isolated with an observation off/on pair on the same binary.
+C8 compatibility validates eight normal completed outputs/usage/finish reasons, not cancellation, tool channels, or every workload.
+Keep P3 disabled; use qualified P1 binary. Treat P3 as diagnostic evidence only.

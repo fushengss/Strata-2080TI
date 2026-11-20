@@ -1,0 +1,237 @@
+[
+  {
+    "name": "cold-1",
+    "category": "cold-code",
+    "request_sha256": "a6b476d7ff0ac09ce1c637179acfe5b1d506a24bc602e716e444911e9d94a517",
+    "messages_sha256": "68282161ad30387cb73d7e23c41856e35f8e4b02a51c2b7aedf0f1a109ab7b95",
+    "max_tokens": 768,
+    "start_epoch": 1794040555.4465606,
+    "end_epoch": 1794040577.137781,
+    "ttft_s": 15.979177269851789,
+    "last_content_s": 21.68820464494638,
+    "total_s": 21.691220223903656,
+    "usage": {
+      "prompt_tokens": 101137,
+      "completion_tokens": 768,
+      "total_tokens": 101905,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\nimport threading\nfrom collections import OrderedDict\nimport unittest\n\n\nclass LRUCache:\n    \"\"\"Least Recently Used Cache implementation using OrderedDict.\"\"\"\n\n    def __init__(self, capacity: int):\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be positive\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n\n    def get(self, key):\n        \"\"\"Get value for key, moving it to end (most recently used).\"\"\"\n        if key not in self.cache:\n            return None\n        # Move to end to mark as recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n\n    def put(self, key, value):\n        \"\"\"Put key-value pair, evicting LRU item if at capacity.\"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        # Evict least recently used if over capacity\n        if len(self.cache) > self.capacity:\n            self.cache.popitem(last=False)\n\n    def delete(self, key):\n        \"\"\"Delete key from cache. Returns True if deleted, False if not found.\"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n\n    def __len__(self):\n        \"\"\"Return current number of items in cache.\"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeLRUCache:\n    \"\"\"Thread-safe wrapper around LRUCache using a lock.\"\"\"\n\n    def __init__(self, capacity: int):\n        self._cache = LRUCache(capacity)\n        self._lock = threading.Lock()\n\n    def get(self, key):\n        with self._lock:\n            return self._cache.get(key)\n\n    def put(self, key, value):\n        with self._lock:\n            self._cache.put(key, value)\n\n    def delete(self, key):\n        with self._lock:\n            return self._cache.delete(key)\n\n    def __len__(self):\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestLRUCache(unittest.TestCase):\n    \"\"\"Test suite for LRUCache and ThreadSafeLRUCache.\"\"\"\n\n    def test_basic_put_get(self):\n        \"\"\"Test basic put and get operations.\"\"\"\n        cache = LRUCache(2)\n        cache.put(\"a\", 1)\n        cache.put(\"b\", 2)\n        self.assertEqual(cache.get(\"a\"), 1)\n        self.assertEqual(cache.get(\"b\"), 2)\n\n    def test_eviction_lru(self):\n        \"\"\"Test that least recently used item is evicted.\"\"\"\n        cache = LRUCache(2)\n        cache.put(\"a\", 1)\n        cache.put(\"b\", 2)\n        # Access 'a' to make it recently used\n        cache.get(\"a\")\n        # Add 'c', should evict 'b' (least recently used)\n        cache.put(\"c\", 3)\n        self.assertIsNone(cache.get(\"b\"))\n        self.assertEqual(cache.get(\"a\"), 1)\n        self.assertEqual(cache.get(\"c\"), 3)\n\n    def test_update_existing_key(self):\n        \"\"\"Test updating an existing key moves it to most recently used.\"\"\"\n        cache = LRUCache(2)\n        cache.put(\"a\", 1)\n        cache.put(\"b\", 2)\n        # Update 'a'\n        cache.put(\"a\", 10)\n        #",
+    "reasoning_text": "",
+    "output_sha256": "c844347e5109546f142e0836ebdf2526089537f2beb2f9927caed9bd402c173b",
+    "delta_count": 687,
+    "decode_tps_usage_minus_one_estimate": 134.34862886557653,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 0,
+      "in_flight": 0,
+      "last_request_at": null
+    },
+    "activity_after": {
+      "requests": 1,
+      "in_flight": 0,
+      "last_request_at": 1794040577
+    },
+    "engine_lines": [
+      "strata serve: prompt 101137 tokens = 0 reused + 101137 read in 15495 ms (6526.9 tok/s), 768 generated in 6027 ms (127.4 tok/s), drafts accepted 473 of 571, 7 checkpoints",
+      "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+      "strata serve: KV streaming: 97.74% of 540712 block reads hit VRAM, 49.2 MiB read from RAM",
+      "strata serve: suffix drafts: 5 windows, 15 of 16 drafts accepted"
+    ],
+    "engine_prompt_records": [
+      {
+        "prompt_tokens": 101137,
+        "reused_tokens": 0,
+        "read_tokens": 101137,
+        "prefill_ms": 15495,
+        "prefill_tps": 6526.9,
+        "generated_tokens": 768,
+        "decode_ms": 6027,
+        "decode_tps": 127.4
+      }
+    ]
+  },
+  {
+    "name": "cold-2",
+    "category": "cold-code",
+    "request_sha256": "6cdb30cc4605ee61c7a74c5a0bbef45edb9853cb36a38b4fbe5b249da418a8d7",
+    "messages_sha256": "61a840d1c275436c0fa0c75904d1e10cc8fa7e3dfaa9ac079368e1e67743dbd4",
+    "max_tokens": 768,
+    "start_epoch": 1794040577.1732273,
+    "end_epoch": 1794040600.4656596,
+    "ttft_s": 17.685040713986382,
+    "last_content_s": 23.286056243116036,
+    "total_s": 23.292432191083208,
+    "usage": {
+      "prompt_tokens": 101137,
+      "completion_tokens": 768,
+      "total_tokens": 101905,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "```python\nimport threading\nfrom collections import OrderedDict\nimport unittest\n\n\nclass LRUCache:\n    \"\"\"\n    A Least Recently Used (LRU) Cache implementation.\n    \"\"\"\n\n    def __init__(self, capacity: int):\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be positive\")\n        self.capacity = capacity\n        self.cache = OrderedDict()\n\n    def get(self, key):\n        \"\"\"\n        Get the value of the key if it exists, otherwise return None.\n        Moves the accessed item to the end (most recently used).\n        \"\"\"\n        if key not in self.cache:\n            return None\n        # Move to end to mark as recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n\n    def put(self, key, value):\n        \"\"\"\n        Insert or update the value of the key.\n        If the cache exceeds capacity, remove the least recently used item.\n        \"\"\"\n        if key in self.cache:\n            # Update existing key and move to end\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        if len(self.cache) > self.capacity:\n            # Remove the first item (least recently used)\n            self.cache.popitem(last=False)\n\n    def delete(self, key):\n        \"\"\"\n        Delete the key from the cache if it exists.\n        Returns True if deleted, False otherwise.\n        \"\"\"\n        if key in self.cache:\n            del self.cache[key]\n            return True\n        return False\n\n    def __len__(self):\n        \"\"\"\n        Return the current number of items in the cache.\n        \"\"\"\n        return len(self.cache)\n\n\nclass ThreadSafeLRUCache:\n    \"\"\"\n    A thread-safe wrapper for LRUCache using a lock.\n    \"\"\"\n\n    def __init__(self, capacity: int):\n        self._cache = LRUCache(capacity)\n        self._lock = threading.Lock()\n\n    def get(self, key):\n        with self._lock:\n            return self._cache.get(key)\n\n    def put(self, key, value):\n        with self._lock:\n            self._cache.put(key, value)\n\n    def delete(self, key):\n        with self._lock:\n            return self._cache.delete(key)\n\n    def __len__(self):\n        with self._lock:\n            return len(self._cache)\n\n\nclass TestLRUCache(unittest.TestCase):\n    \"\"\"\n    Unit tests for LRUCache and ThreadSafeLRUCache.\n    \"\"\"\n\n    def test_basic_operations(self):\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        self.assertEqual(cache.get(1), 1)\n        cache.put(3, 3)  # evicts key 2\n        self.assertIsNone(cache.get(2))\n        cache.put(4, 4)  # evicts key 1\n        self.assertIsNone(cache.get(1))\n        self.assertEqual(cache.get(3), 3)\n        self.assertEqual(cache.get(4), 4)\n\n    def test_update_existing_key(self):\n        cache = LRUCache(2)\n        cache.put(1, 1)\n        cache.put(2, 2)\n        cache.put(1, 10)  # Update key 1, should not evict\n        self.assertEqual(cache.get(1), 10)\n        self.assertEqual(cache.get(2), 2",
+    "reasoning_text": "",
+    "output_sha256": "4bcb2a187e1b91f791ec21ff01438f7278ba46ff098f963120b3ab2fedfe6295",
+    "delta_count": 679,
+    "decode_tps_usage_minus_one_estimate": 136.93945249946213,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 1,
+      "in_flight": 0,
+      "last_request_at": 1794040577
+    },
+    "activity_after": {
+      "requests": 2,
+      "in_flight": 0,
+      "last_request_at": 1794040600
+    },
+    "engine_lines": [
+      "strata serve: prompt 101137 tokens = 0 reused + 101137 read in 17498 ms (5780.0 tok/s), 768 generated in 5623 ms (136.6 tok/s), drafts accepted 478 of 559, 7 checkpoints",
+      "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+      "strata serve: KV streaming: 97.76% of 533526 block reads hit VRAM, 48.2 MiB read from RAM",
+      "strata serve: suffix drafts: 5 windows, 14 of 20 drafts accepted"
+    ],
+    "engine_prompt_records": [
+      {
+        "prompt_tokens": 101137,
+        "reused_tokens": 0,
+        "read_tokens": 101137,
+        "prefill_ms": 17498,
+        "prefill_tps": 5780.0,
+        "generated_tokens": 768,
+        "decode_ms": 5623,
+        "decode_tps": 136.6
+      }
+    ]
+  },
+  {
+    "name": "cold-3",
+    "category": "cold-prose",
+    "request_sha256": "a51ed966889d0f23a6a143491ba75e7d759965782cb2242b244650fc972e65b9",
+    "messages_sha256": "66f91bad7df31fdb0bc7030a9597742ce0b406b56fa5a8695eb10c5fdb394c90",
+    "max_tokens": 512,
+    "start_epoch": 1794040600.5065613,
+    "end_epoch": 1794040624.671587,
+    "ttft_s": 17.901169470045716,
+    "last_content_s": 24.161273977952078,
+    "total_s": 24.165025693830103,
+    "usage": {
+      "prompt_tokens": 101111,
+      "completion_tokens": 512,
+      "total_tokens": 101623,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "**The Pulse of the Coast: A History and Life of Harbors**\n\nHarbors are far more than mere indentations in the coastline where ships can find shelter from the wind and waves. They are the living, breathing hearts of coastal civilization, serving as the critical interfaces between the land and the sea. For millennia, these natural or man-made havens have dictated the rise and fall of empires, shaped cultural identities, and sustained the livelihoods of millions. To understand a harbor is to understand the complex interplay of geography, history, and human resilience.\n\nThe history of harbors is inextricably linked to the history of trade and exploration. In the ancient world, the quality of a harbor often determined the fate of a city-state. Athens, for instance, relied heavily on the port of Piraeus to maintain its naval dominance and economic power, while Carthage’s artificial harbors, known as cothon, were marvels of engineering that allowed it to control Mediterranean trade routes. These early ports were not just commercial hubs; they were military fortresses. The ability to protect a fleet from storms and enemy attack was a strategic necessity that drove the development of breakwaters, lighthouses, and fortified quays.\n\nAs the Age of Exploration dawned, harbors became the launchpads for global connectivity. Ports like Lisbon, Seville, and later Amsterdam and London, transformed from local fishing villages into global metropolises. They became melting pots of culture, language, and religion, where spices from the East, gold from the Americas, and textiles from Asia converged. The architecture of these cities reflects this history; grand warehouses, customs houses, and merchant guild halls still stand as testaments to the wealth generated by maritime commerce. However, this era also had a dark side. Harbors were the primary points of entry for the transatlantic slave trade, serving as grim gateways where human beings were commodified and transported across the ocean. The legacy of this history remains visible in the demographic and cultural fabric of many port cities today.\n\nThe industrial revolution brought a new dimension to harbor life. The shift from sail to steam, and later to diesel, required massive infrastructure changes. Deep-water channels were dredged, and vast networks of railways were built to connect ports to inland markets. This era saw the rise of the dockworker, a figure central to the social history of coastal towns. These workers, often organized into powerful unions, faced dangerous conditions and irregular employment, yet they formed tight",
+    "reasoning_text": "",
+    "output_sha256": "8a7b166a2da79e6b52f9a7c3061521a89ea485ae54baad073282cc38f9d1fa35",
+    "delta_count": 508,
+    "decode_tps_usage_minus_one_estimate": 81.62803022770933,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 2,
+      "in_flight": 0,
+      "last_request_at": 1794040600
+    },
+    "activity_after": {
+      "requests": 3,
+      "in_flight": 0,
+      "last_request_at": 1794040624
+    },
+    "engine_lines": [
+      "strata serve: prompt 101111 tokens = 0 reused + 101111 read in 17712 ms (5708.5 tok/s), 512 generated in 6280 ms (81.5 tok/s), drafts accepted 236 of 392, 7 checkpoints",
+      "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+      "strata serve: KV streaming: 97.79% of 523767 block reads hit VRAM, 46.6 MiB read from RAM"
+    ],
+    "engine_prompt_records": [
+      {
+        "prompt_tokens": 101111,
+        "reused_tokens": 0,
+        "read_tokens": 101111,
+        "prefill_ms": 17712,
+        "prefill_tps": 5708.5,
+        "generated_tokens": 512,
+        "decode_ms": 6280,
+        "decode_tps": 81.5
+      }
+    ]
+  },
+  {
+    "name": "append-600",
+    "category": "append",
+    "request_sha256": "f668909dc8291e4f802548fe47dd243f8f13c99fad656e39da7cdb5ca74da569",
+    "messages_sha256": "00b4b0964ab6d246dfff0da9ae29131337a1ae4ef48be6998b98bef81fb21d34",
+    "max_tokens": 256,
+    "start_epoch": 1794040624.7402575,
+    "end_epoch": 1794040631.427082,
+    "ttft_s": 4.247433095006272,
+    "last_content_s": 6.682859279913828,
+    "total_s": 6.6868245110381395,
+    "usage": {
+      "prompt_tokens": 102543,
+      "completion_tokens": 256,
+      "total_tokens": 102799,
+      "prompt_tokens_details": {
+        "cached_tokens": 101905
+      }
+    },
+    "finish_reason": "length",
+    "finished_at_length": true,
+    "output_count_matches_limit": true,
+    "saw_done": true,
+    "error": null,
+    "output_text": "To extend an LRU cache with TTL (Time-To-Live) expiry, you need to store the expiration timestamp alongside each value. When retrieving an item, you must check if it has expired. If it has, treat it as a cache miss (and optionally remove it).\n\nHere is the Python code implementing an `LRUCacheWithTTL`:\n\n```python\nimport time\nfrom collections import OrderedDict\nimport threading\n\n\nclass LRUCacheWithTTL:\n    \"\"\"\n    Least Recently Used Cache with Time-To-Live (TTL) support.\n    \n    Each entry has an expiration time. If an entry is accessed after its\n    expiration time, it is considered invalid and removed.\n    \"\"\"\n\n    def __init__(self, capacity: int, default_ttl: float = None):\n        \"\"\"\n        Initialize the cache.\n        \n        Args:\n            capacity: Maximum number of items in the cache.\n            default_ttl: Default time-to-live in seconds. If None, items never expire\n                         unless a specific TTL is provided in put().\n        \"\"\"\n        if capacity <= 0:\n            raise ValueError(\"Capacity must be positive\")\n        self.capacity = capacity\n        self.default_ttl = default_ttl",
+    "reasoning_text": "",
+    "output_sha256": "946c452a0ff003f70e06a73e3233b387d721b5761ad0476efac0f9501353cb14",
+    "delta_count": 233,
+    "decode_tps_usage_minus_one_estimate": 104.70446675010983,
+    "decode_metric_note": "API completion tokens minus one divided by first-to-last content arrival; estimated because a chunk may contain multiple tokens.",
+    "activity_before": {
+      "requests": 3,
+      "in_flight": 0,
+      "last_request_at": 1794040624
+    },
+    "activity_after": {
+      "requests": 4,
+      "in_flight": 0,
+      "last_request_at": 1794040631
+    },
+    "engine_lines": [
+      "strata serve: prompt 102543 tokens = 101905 reused + 638 read in 4141 ms (154.1 tok/s), 256 generated in 2455 ms (104.3 tok/s), drafts accepted 141 of 205, 8 checkpoints",
+      "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+      "strata serve: KV streaming: 97.40% of 235176 block reads hit VRAM, 24.6 MiB read from RAM",
+      "strata serve: suffix drafts: 3 windows, 5 of 9 drafts accepted"
+    ],
+    "engine_prompt_records": [
+      {
+        "prompt_tokens": 102543,
+        "reused_tokens": 101905,
+        "read_tokens": 638,
+        "prefill_ms": 4141,
+        "prefill_tps": 154.1,
+        "generated_tokens": 256,
+        "decode_ms": 2455,
+        "decode_tps": 104.3
+      }
+    ]
+  }
+]

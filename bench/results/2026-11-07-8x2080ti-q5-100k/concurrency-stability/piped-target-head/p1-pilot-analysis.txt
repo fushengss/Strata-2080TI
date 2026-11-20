@@ -1,0 +1,24 @@
+P1 first-pilot independent audit — one off/on pair, not a stable-benefit conclusion
+C8 API: 285.903320 -> 300.118680 tokens/s (+4.972%). Both8192 tokens; full API durations28.6530s ->27.2959s.
+C8 native: 297.779396 -> 312.583591 emitted rows/s (+4.972%). Both8180 rows;27.470s ->26.169s; MTP3499/4675 identical.
+Independent correctness:8 C8 +13 normal correctness requests have exact request/output/reasoning hashes, finish and logical usage. One cancelled request has183 ->215 output characters with the same valid shorter prefix; full cancelled hashes differ as allowed. Recovery controls pass in both arms.
+Recomputed132 saved hashes across44 records. All match. Old c9305 ->new off independently passes all8 C8 cases; no cross-version performance comparison.
+Correctness native diagnostic: 175.864 -> 174.533 rows/s (-0.757%). Includes cancellation; do not generalize C8 gain to this workload.
+Off common decode window: 2026-11-07T23:03:14.907263+08:00 to 2026-11-07T23:03:31.624110+08:00.
+On common decode window: 2026-11-07T23:06:58.025537+08:00 to 2026-11-07T23:07:13.583019+08:00.
+Windows are eight-stream content intersections trimmed1s at each end. GPU CSV UTC verified against metadata epochs.
+GPU | n off/on | active% off/on | W off/on | SM MHz off/on | mean C off/on | sw_power_cap active/valid off/on
+0 | 28/26 | 64.18/69.54 | 225.75/230.97 | 1869.64/1864.04 | 58.86/58.00 | 14/28 ->5/26
+1 | 28/26 | 57.18/60.81 | 210.57/217.84 | 1860.00/1860.58 | 63.14/62.38 | 7/28 ->9/26
+2 | 28/26 | 57.54/74.88 | 209.72/249.22 | 1873.93/1847.88 | 55.54/57.31 | 0/28 ->26/26
+3 | 28/26 | 66.07/70.04 | 214.68/223.59 | 1819.82/1820.77 | 66.18/66.38 | 0/28 ->0/26
+4 | 28/26 | 54.86/74.27 | 210.87/248.01 | 1835.36/1823.65 | 62.07/62.81 | 0/28 ->26/26
+5 | 28/26 | 64.25/69.62 | 224.54/229.94 | 1839.11/1834.62 | 61.64/60.69 | 25/28 ->20/26
+6 | 28/26 | 54.68/59.54 | 194.49/199.29 | 1873.93/1865.77 | 58.54/57.96 | 0/28 ->0/26
+7 | 28/26 | 96.89/80.46 | 248.92/249.78 | 1671.43/1851.92 | 62.18/62.27 | 28/28 ->26/26
+Equal-GPU mean active: 64.46% ->69.89%; total mean power1739.54W ->1848.65W.
+GPU7 work shifts to GPU2/4: GPU7 busy96.89% ->80.46%, while GPU2/4 rise to74.88%/74.27%. On-arm target route proves4681 windows/9356 verification rows offloaded to2+4; verification rows are not outputs.
+All sampled cards retain250W enforced caps and6800MHz memory clocks. All selected SW/HW thermal and HW power-brake flags are inactive. GPU7 remains power-capped at every sample; GPUs2/4 also become power-capped at every on-arm sample.
+The recorded2000MHz lock request succeeded, but achieved clocks remain lower under the observed constraints. Do not report an achieved fixed2000MHz frequency.
+No prefill result exists in this pilot. No deployment/nonregression conclusion; next reverse order should include100k prefill, C4mixed injections, budget and long suites.
+Reproduce locally: python3 p1-pilot-analysis.py

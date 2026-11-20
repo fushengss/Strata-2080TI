@@ -1,0 +1,1560 @@
+From b4c45a6cc8167ac61407f07c1171b6b4995eec10 Mon Sep 17 00:00:00 2001
+From: fusheng <2259418425@qq.com>
+Date: Sat, 7 Nov 2026 19:14:17 +0800
+Subject: [PATCH] feat(engine): shard the solo MTP draft head across two GPUs
+
+---
+ CMakeLists.txt                   |   6 +-
+ docs/MTP_HEAD_SHARDS.md          | 127 ++++++++++
+ include/strata/core/mtp.hpp      |  22 +-
+ include/strata/core/mtp_head.hpp |  51 ++++
+ metal/CMakeLists.txt             |   2 +-
+ src/core/mtp.cpp                 | 127 ++++++++--
+ src/core/mtp_head.cpp            | 213 ++++++++++++++++
+ src/program/generate.cpp         |  50 ++++
+ tests/core/local_tp_bench.cu     | 413 +++++++++++++++++++++++++++++++
+ tests/core/mtp_head_test.cpp     | 285 +++++++++++++++++++++
+ 10 files changed, 1270 insertions(+), 26 deletions(-)
+ create mode 100644 docs/MTP_HEAD_SHARDS.md
+ create mode 100644 include/strata/core/mtp_head.hpp
+ create mode 100644 src/core/mtp_head.cpp
+ create mode 100644 tests/core/local_tp_bench.cu
+ create mode 100644 tests/core/mtp_head_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5487272c..62d54360 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -708,7 +708,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
+   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+     src/core/remote_expert_opt.cu
+-    src/core/expert_cache.cpp src/core/native_head.cpp src/core/decode_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
++    src/core/expert_cache.cpp src/core/native_head.cpp src/core/decode_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/mtp_head.cpp src/core/dflash2.cpp
+     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+@@ -717,6 +717,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     # Manual integration test: two GPUs and --gguf are required; do not run it implicitly in CTest.
+     add_executable(decode_head_test tests/core/decode_head_test.cpp)
+     target_link_libraries(decode_head_test PRIVATE strata_engine Threads::Threads)
++    add_executable(mtp_head_test tests/core/mtp_head_test.cpp)
++    target_link_libraries(mtp_head_test PRIVATE strata_engine Threads::Threads)
++    add_executable(local_tp_bench tests/core/local_tp_bench.cu)
++    target_link_libraries(local_tp_bench PRIVATE strata_engine Threads::Threads)
+     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
+     target_include_directories(host_graph_launch_test PRIVATE include)
+     target_link_libraries(host_graph_launch_test PRIVATE CUDA::cudart Threads::Threads)
+diff --git a/docs/MTP_HEAD_SHARDS.md b/docs/MTP_HEAD_SHARDS.md
+new file mode 100644
+index 00000000..c3c558da
+--- /dev/null
++++ b/docs/MTP_HEAD_SHARDS.md
+@@ -0,0 +1,127 @@
++# Experimental MTP draft-head row sharding
++
++`STRATA_MTP_HEAD_GPU=D1,D2` places two vocabulary-row shards of the MTP draft head on two other GPUs. It is
++**off by default**. The draft layer's body, K/V state and probability calculation stay on the original MTP GPU.
++This setting is independent of `STRATA_DECODE_HEAD_GPU`, which controls the main verifier head.
++
++The current implementation is limited to a plain, unpacked **Q6_K draft-vocabulary subset** and eligible greedy
++solo `--pipeline-windows 2` chains in a layer split. It does not replace the ordinary draft graphs or the batch
++and prefill paths. See [multi-GPU settings](MULTI_GPU.md) for the existing layer split and PW2 requirements.
++
++## Selecting the targets
++
++For example, with the drafter on visible CUDA device 7:
++
++```sh
++STRATA_MTP_HEAD_GPU=3,5
++```
++
++The values are CUDA device indices as seen by the process, after `CUDA_VISIBLE_DEVICES`. Both targets must be
++distinct, belong to the configured layer split and differ from the drafter's device. `2,4` is also valid when
++those devices meet the same requirements. Selecting devices already used by the main head may introduce
++contention; the best pair must be measured on the actual split and workload.
++
++Unset, empty or `-1` disables the feature. A single value such as `0` is not a disable switch. Malformed values,
++missing PW2/MTP support, invalid target devices, an unsupported head layout, or a failed allocation/capture
++cause a clear startup error when the option was requested. The engine does not silently claim that an
++unsupported requested configuration is active.
++
++The supported subset must be owned by the main drafter, contain at least 256 rows and use the original Q6_K
++layout. Full-vocabulary heads, shared slot-drafter heads, `--mtp-q4` head copies, `STRATA_Q6_PACKED=1` and other
++weight types/layouts are rejected. Each target owns only its row shard; the original source head remains
++available for the ordinary paths.
++
++## Request eligibility and fallback
++
++Only the solo PW2 path enables the shards for a request, and only when the request is greedy with no history
++penalty, logit bias or active coupled draft sampling. Sampled requests, requests with penalties/bias, prefill,
++serial drafts and batch execution retain their original graphs. The chain entry also checks coupled sampling
++internally before selecting the split graphs.
++
++The startup log identifies the two targets and the source. At the end of a PW2 request,
++`strata MTP head: CUDA3+5, N draft steps offloaded in this request` reports the number of actually queued split
++steps. A zero count is expected for a request that takes a fallback path. No MTP head shards, mapped buffers,
++target streams, events or split graphs are allocated or captured when the feature is disabled.
++
++## Preserving the draft result
++
++The round and each chain step have a separate body and tail in the opt-in path. Their order is:
++
++1. The original source body produces the same Q8_1 activation, including its original FP16 scale and sum.
++2. A source event orders its exact bytes through portable pinned memory to two private target streams.
++3. Each target runs the original single-row MMVQ over its contiguous vocabulary rows. The split starts at a
++   multiple of 128 rows, preserving the original row/tile phase.
++4. Both targets write their complete logits into disjoint ranges of mapped memory. Separate target events
++   order a source-stream copy of all logits, in the original subset order.
++5. The original source tail runs the original argmax or greedy sampler, `row_top_prob` or `row_top_prob_split`,
++   subset-to-global vocabulary mapping, `mtp_select`, and teacher-forcing update.
++
++No target-side softmax or probability reduction is used. In particular, shard-local probabilities are never
++combined: the original full-row probability reduction determines `chain_prob`, preserving the draft admission
++decision. Odd row counts use exact 32-bit word copies; they do not pad or read/write beyond the real logit count.
++
++The entire chain is queued in one host call, without polling after each head. Every step has distinct producer
++and completion events. The next body/activation write follows the previous source tail, so the shared pinned
++buffers cannot be reused before both target heads and the source logit consumer have finished. Normal request
++drain/cancellation waits for the source stream, which includes all target waits and tails. The helper's drain
++and destruction also wait for source consumption before freeing buffers or events.
++
++The implementation is in [mtp.cpp](../src/core/mtp.cpp) and [mtp_head.cpp](../src/core/mtp_head.cpp), with the
++low-level interface in [mtp_head.hpp](../include/strata/core/mtp_head.hpp).
++
++## Validation status, 2026-11-07
++
++CUDA 13 / sm75 built successfully on the 8×RTX 2080 Ti 22 GiB machine. The low-level test used source CUDA7 and
++targets CUDA3/5, with peer access unavailable and never enabled. It gathered the actual Q6_K draft subset from
++the model: 106299 rows × 2560 columns, split into 53120 and 53179 rows.
++
++The [manual parity test](../tests/core/mtp_head_test.cpp) passed:
++
++- 144 cases, comparing 15307056 complete logits bitwise, plus the original probability bits and exact
++  subset-to-global token mapping. This covers both argmax implementations and both probability implementations.
++- 128 outputs across 16 repeated eight-step chains, queued without a host synchronization between steps,
++  exercising per-step events and shared-buffer reuse.
++- Default/unsupported helper contracts. Request-level fallback remains a separate engine integration check.
++
++The log is `/srv/bench100k-20261107-mtp-head-build/mtp2-parity.log` on the test host. A manual rerun, with the
++model and its matching draft-vocabulary file available and GPUs reserved for testing, uses:
++
++```sh
++engine/mtp_head_test --gguf MODEL.gguf --draft-vocab draft_vocab.bin --source 7 --target 3 --target2 5
++```
++
++HIP and SYCL have not been built or tested for this feature. Metal has only local C++ syntax checks for the
++shared drafter and an explicit unavailable stub; there is no full Metal build or device validation.
++
++## Measured 100k result
++
++On 2026-11-07, the same 8-GPU host ran the actual Q5_K_M model with all experts resident, six layers per GPU,
++eight slots, groups=8 and PW2. The existing main head stayed on GPUs 2/4. The MTP setting alone alternated
++off/on/on/off, with three fixed code prompts and three prose prompts, each around 101k tokens, tested cold
++and warm with 768 output tokens. All four launches used the same candidate executable.
++
++| Workload | Cold decode off/on, token/s | Cold read off/on, seconds | Matched cold/warm decode gain |
++|---|---:|---:|---:|
++| Code | 143.10 / 146.50 | 16.405 / 16.352 | +2.276% |
++| Prose | 81.75 / 83.20 | 16.6275 / 16.5505 | +1.681% |
++
++Cold rates and read times are pooled medians. The gain is computed separately: for each fixed cold/warm
++case, divide the two on-run mean decode rates by the two off-run means, then take the median of six case gains.
++All six cases improved in each workload. The initial-to-final baseline drift median was -0.067% for code and
++0% for prose. These are measurements of these fixed workloads, not a guarantee for other prompts or GPUs.
++
++The 92 main requests had matching corresponding outputs and token counts. Four integration suites completed
++44 requests plus four cancellation scenarios; all six pairs of suites had exact completed outputs. The
++108 compared API logprob values covered one-token admission only. Sampled requests, penalties, bias and
++concurrent work exercised the unchanged fallback paths. All required routing checks passed, with no observed
++CUDA or API failure.
++
++Cold prefill medians changed by -0.323% and -0.463%. Warm and append cases had no consistent regression:
++matched read-time changes ranged from -5.265% to +1.208% for warm requests and -0.316% to +0.776% for append.
++Each matching request reused the same number of tokens across all four arms. The prefill graph, weights,
++K/V/GDN state, placement, buffers and batch slots were retained. Small run-to-run variation remains visible.
++
++Raw evidence and the frozen evaluation are under `/srv/bench100k-20261107-mtp-head/abba-final` on the test host.
++The candidate SHA256 is `113a4ea9bf2101a9ad9a3449ae611f8a21f892cc62293fa9a779d302dc2df96f`.
++Original-binary default-off compatibility and the deployment receipt are recorded separately in that task's
++benchmark directory; the ABBA result alone does not establish those checks.
+diff --git a/include/strata/core/mtp.hpp b/include/strata/core/mtp.hpp
+index 709aba74..4349cf5c 100644
+--- a/include/strata/core/mtp.hpp
++++ b/include/strata/core/mtp.hpp
+@@ -20,6 +20,7 @@
+ #pragma once
+ 
+ #include "strata/core/layer.hpp"
++#include "strata/core/mtp_head.hpp"
+ #include "strata/core/pinned_ring.hpp"
+ #include "strata/core/session.hpp"
+ #include "strata/kernels/sampler.hpp"
+@@ -177,6 +178,13 @@ public:
+     void set_source_R(const float* rows) { src_R_ = rows; }
+     /// Capture the round graphs for T = 1..max_t and every step graph now (a capture syncs the drafter's stream).
+     bool prepare_chain(std::string& err);
++    /// Opt-in solo PW2 draft-head row sharding. Call after bind and before prepare_chain, with no work in flight.
++    /// Only plain Q6_K subset rows are supported; unsupported layouts return a clear error. The caller enables
++    /// this per request only for supported greedy solo PW2 work. Ordinary draft/prefill/batch graphs stay intact.
++    bool prepare_head_shards(int target0, int target1, std::string& err);
++    void set_head_shards_active(bool on) { head_shards_active_ = on && head_shards_.initialized(); }
++    bool head_shards_enabled() const { return head_shards_.initialized(); }
++    uint64_t head_shard_steps() const { return head_shard_steps_; }
+     /// The catch-up over T cells from `p` (as draft()), then `n_out` outputs from row `a`: output j is the chain's
+     /// own pick, and step j (1 <= j <= n_force) takes force[j - 1] as its input token instead of output j - 1.
+     /// `n_early`: an event after each of the first `n_early` outputs (chain_outputs_ready).
+@@ -229,7 +237,7 @@ public:
+     }
+ 
+ private:
+-    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
++    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, bool head_body_only = false);
+     /// False (with `err`) while the experts are lent to a prompt: the prompt path's ring is pointed at their bytes
+     /// (STRATA_MTP_ROOM_MIN), so a decode pass would read the prompt's staged blobs as experts.  Every decode entry
+     /// checks this before it launches anything.
+@@ -242,12 +250,14 @@ private:
+     bool record_front(int T, int row0, cudaStream_t cs, std::string& err);
+     /// The rest for row 0 at step row `step_row`: the attention from the q projection, the MLP, the final mixer,
+     /// the head, the draft and its probability.  Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
+-    bool record_rest(int step_row, cudaStream_t cs, std::string& err);
++    bool record_rest(int step_row, cudaStream_t cs, std::string& err, bool head_body_only = false);
++    bool record_head_pick(int step_row, cudaStream_t cs, std::string& err);
+     void norm_rope(float* data, const float* gamma, int rows, int cols, const int32_t* p, cudaStream_t cs);
+     bool capture_prefill(int T, std::string& err);
+     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
+-    bool capture_round(int T, bool coupled, std::string& err);
+-    bool capture_step(int j, bool coupled, std::string& err);
++    bool capture_round(int T, bool coupled, std::string& err, bool head_body_only = false);
++    bool capture_step(int j, bool coupled, std::string& err, bool head_body_only = false);
++    bool capture_head_tail(int j, std::string& err);
+     cudaGraphExec_t step_exec_[9] = {};
+     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
+     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
+@@ -291,6 +301,10 @@ private:
+     // --pipeline-windows 2 (chain_launch)
+     bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
+     bool force_on_ = false, chain_live_ = false;
++    MtpHeadShards head_shards_;
++    bool head_shards_active_ = false;
++    uint64_t head_shard_steps_ = 0;
++    cudaGraphExec_t head_round_body_[9] = {}, head_step_body_[9] = {}, head_tail_[9] = {};
+     const float* src_R_ = nullptr;
+     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
+     cudaEvent_t ev_chain_ = nullptr;
+diff --git a/include/strata/core/mtp_head.hpp b/include/strata/core/mtp_head.hpp
+new file mode 100644
+index 00000000..81057240
+--- /dev/null
++++ b/include/strata/core/mtp_head.hpp
+@@ -0,0 +1,51 @@
++#pragma once
++
++#include <cuda_runtime.h>
++#include <cstddef>
++#include <string>
++
++namespace strata::core {
++
++/// Two row shards of a plain Q6_K draft head. No probability or token reduction runs on the target cards:
++/// the complete logits return in their original row order, for the caller's unchanged source-card tail.
++/// init() owns a copy of each half of source_weights. The source stream passed to enqueue() must outlive reset().
++/// A chain may enqueue steps 0..7 without a host wait. Enqueue the source tail before the next body/enqueue;
++/// that source-stream ordering protects the shared activation/logits buffers. Drain before reusing a step index.
++class MtpHeadShards {
++public:
++    MtpHeadShards() = default;
++    ~MtpHeadShards();
++    MtpHeadShards(const MtpHeadShards&) = delete;
++    MtpHeadShards& operator=(const MtpHeadShards&) = delete;
++
++    bool init(const void* source_weights, int source_device, int type, int n, int vocab,
++              int target0, int target1, std::string& err);
++    /// Copies exact Q8_1 bytes, records source-ready, queues both head graphs, then source waits and a full-logit copy.
++    /// Does not synchronize or poll. The caller can immediately enqueue the original argmax/probability tail.
++    bool enqueue(cudaStream_t source_stream, const void* source_q8, float* source_logits, int step, std::string& err);
++    bool drain(std::string& err);
++    void reset() noexcept;
++    bool initialized() const { return ready_; }
++    size_t row_bytes() const { return q8_bytes_; }
++    int row_begin(int shard) const { return shard >= 0 && shard < 2 ? shards_[shard].begin : -1; }
++    int row_count(int shard) const { return shard >= 0 && shard < 2 ? shards_[shard].count : 0; }
++
++private:
++    struct Shard {
++        int device = -1, begin = 0, count = 0;
++        void *weights = nullptr, *q8 = nullptr, *activation = nullptr;
++        float *logits = nullptr, *mapped_logits = nullptr;
++        cudaStream_t stream = nullptr;
++        cudaGraphExec_t graph = nullptr;
++        cudaEvent_t finished[8] = {};
++    } shards_[2];
++    int source_ = -1, n_ = 0, vocab_ = 0;
++    size_t q8_bytes_ = 0;
++    bool ready_ = false;
++    void *activation_host_ = nullptr, *activation_source_ = nullptr;
++    float *logits_host_ = nullptr, *logits_source_ = nullptr;
++    cudaEvent_t producer_[8] = {};
++    cudaStream_t last_source_stream_ = nullptr;
++};
++
++}  // namespace strata::core
+diff --git a/metal/CMakeLists.txt b/metal/CMakeLists.txt
+index 17d6f654..fef2e3ce 100644
+--- a/metal/CMakeLists.txt
++++ b/metal/CMakeLists.txt
+@@ -96,7 +96,7 @@ set(S ${STRATA_ROOT}/src)
+ set(STRATA_METAL_HOST_SOURCES
+   ${S}/core/device.cu ${S}/core/pinned.cu ${S}/platform/memory.cpp ${S}/core/graph.cpp ${S}/core/weights.cpp ${S}/core/layout.cpp
+   ${S}/core/layer.cpp ${S}/core/session.cpp ${S}/core/expert_source.cpp ${S}/core/remote_experts.cpp ${S}/core/expert_cache.cpp
+-  ${S}/core/native_head.cpp ${S}/core/native_dense.cpp ${S}/core/verify.cpp ${S}/core/mtp.cpp
++  ${S}/core/native_head.cpp ${S}/core/native_dense.cpp ${S}/core/verify.cpp ${S}/core/mtp.cpp ${S}/core/mtp_head.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/src/decode_head_stub.cpp
+   ${S}/core/conversation_snapshot.cpp ${S}/core/conversation_state.cpp ${S}/core/conversation_memory.cpp
+   ${S}/core/peer_experts.cpp ${S}/core/arch_defaults.cpp ${S}/core/vmm.cpp ${S}/core/conversation_file.cpp
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index 5403cdc2..212c25e9 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -141,7 +141,12 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
+ }  // namespace
+ 
+ MtpDrafter::~MtpDrafter() {
++    const OnDevice on_device(device_);
+     if (cs_) cudaStreamSynchronize(cs_);
++    head_shards_.reset();  // its cross-device events and buffers outlive every queued chain tail
++    for (auto& e : head_round_body_) if (e) cudaGraphExecDestroy(e);
++    for (auto& e : head_step_body_) if (e) cudaGraphExecDestroy(e);
++    for (auto& e : head_tail_) if (e) cudaGraphExecDestroy(e);
+     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
+     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
+     if (pf_dev_) cudaFree(pf_dev_);
+@@ -1020,12 +1025,12 @@ bool mtp_head_mix_multi_on() {
+ }  // namespace
+ 
+ // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
+-bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err) {
++bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, bool head_body_only) {
+     // step_row0 >= 0: the full layer on step rows [step_row0, +T); step_row0 < 0: K/V only on rows [-1 - step_row0, +T)
+     const bool full = step_row0 >= 0;
+     if (full && T != 1) { err = "mtp: the full layer runs one row at a time (its attention scratch is sized for one)"; return false; }
+     if (!record_front(T, full ? step_row0 : -1 - step_row0, cs, err)) return false;
+-    return !full || record_rest(step_row0, cs, err);
++    return !full || record_rest(step_row0, cs, err, head_body_only);
+ }
+ 
+ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err) {
+@@ -1151,7 +1156,7 @@ void MtpDrafter::norm_rope(float* data, const float* gamma, int rows, int cols,
+     else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st_.cos_tab, st_.sin_tab, p, cs);
+ }
+ 
+-bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
++bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err, bool head_body_only) {
+     using namespace strata::kernels;
+     if (!decode_ready(err)) return false;   // this is the 512 experts' only reader
+     const ModelGeometry& g = *g_;
+@@ -1350,10 +1355,26 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
+         }
+         g_mp.stamp(13, cs);
+         if (!q8_head) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
++        if (head_body_only) return true;  // the chain exports these exact Q8_1 bytes to both row shards
+         const bool sub = dhead_ != nullptr;
+         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
+         native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
+                     (int) nv, T, cs);
++        return record_head_pick(step_row, cs, err);
++    } catch (const std::exception& e) {
++        err = std::string("mtp: ") + e.what();
++        return false;
++    }
++    return true;
++}
++
++bool MtpDrafter::record_head_pick(int step_row, cudaStream_t cs, std::string& err) {
++    using namespace strata::kernels;
++    const int T = 1;
++    const bool sub = dhead_ != nullptr;
++    const int64_t nv = sub ? n_dvocab_ : n_vocab_;
++    const int32_t* step = step_ + step_row * 4;
++    try {
+         g_mp.stamp(14, cs);
+         if (coupled_rec_) {
+             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
+@@ -1380,7 +1401,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
+         if (sub) map_ids(out_ids_, dvocab_, T, cs);
+         g_mp.stamp(15, cs);
+     } catch (const std::exception& e) {
+-        err = std::string("mtp: ") + e.what();
++        err = std::string("mtp head tail: ") + e.what();
+         return false;
+     }
+     return true;
+@@ -1429,8 +1450,9 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
+     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
+ }
+ 
+-bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
+-    cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
++bool MtpDrafter::capture_round(int T, bool coupled, std::string& err, bool head_body_only) {
++    if (head_body_only && coupled) { err = "mtp head: coupled body capture is unsupported"; return false; }
++    cudaGraphExec_t& exec = head_body_only ? head_round_body_[T] : coupled ? round_exec_c_[T] : round_exec_[T];
+     if (exec) return true;
+     using namespace strata::kernels;
+     const int64_t HCN = g_->hc * g_->n_embd;
+@@ -1458,20 +1480,21 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
+         }
+         coupled_rec_ = coupled;
+         coupled_j_ = 0;
+-        ok = record_rest(ra, cs_, err);
++        ok = record_rest(ra, cs_, err, head_body_only);
+         coupled_rec_ = false;
+     }
+-    if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+-    if (ok) g_mp.stamp(16, cs_);
++    if (ok && !head_body_only) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
++    if (ok && !head_body_only) g_mp.stamp(16, cs_);
+     g_mp.base = -1;
+-    if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
+-    return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
++    if (ok && !head_body_only && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
++    return finish_capture(cs_, ok, exec, head_body_only ? "round (head body)" : coupled ? "round (coupled)" : "round", err);
+ }
+ 
+ // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
+ // residual and token (left in Rin_[0] / tok_[0] by mtp_select); draft j and its probability to the mapped outputs.
+-bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
+-    cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
++bool MtpDrafter::capture_step(int j, bool coupled, std::string& err, bool head_body_only) {
++    if (head_body_only && coupled) { err = "mtp head: coupled body capture is unsupported"; return false; }
++    cudaGraphExec_t& exec = head_body_only ? head_step_body_[j] : coupled ? step_exec_c_[j] : step_exec_[j];
+     if (exec) return true;
+     using namespace strata::kernels;
+     const int64_t HCN = g_->hc * g_->n_embd;
+@@ -1484,13 +1507,30 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
+     coupled_rec_ = coupled;
+     coupled_j_ = j;
+     g_mp.base = j < kMpGraphs ? j : -1;
+-    bool ok = record_forward(1, row, cs_, err);
++    bool ok = record_forward(1, row, cs_, err, head_body_only);
+     coupled_rec_ = false;
+-    if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
++    if (ok && !head_body_only) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
++    if (ok && !head_body_only) g_mp.stamp(16, cs_);
++    g_mp.base = -1;
++    if (ok && !head_body_only && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
++    return finish_capture(cs_, ok, exec, head_body_only ? "step (head body)" : coupled ? "step (coupled)" : "step", err);
++}
++
++bool MtpDrafter::capture_head_tail(int j, std::string& err) {
++    if (head_tail_[j]) return true;
++    using namespace strata::kernels;
++    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
++        err = "mtp head: begin tail capture"; return false;
++    }
++    const int row = j == 0 ? 2 * max_t_ - 1 : max_t_ + j - 1;
++    g_mp.base = j < kMpGraphs ? j : -1;
++    coupled_rec_ = false;
++    bool ok = record_head_pick(row, cs_, err);
++    if (ok) mtp_select(R_, g_->hc * g_->n_embd, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+     if (ok) g_mp.stamp(16, cs_);
+     g_mp.base = -1;
+-    if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
+-    return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
++    if (ok && force_on_) force_token(tok_, m_force_, j, cs_);
++    return finish_capture(cs_, ok, head_tail_[j], "draft head tail", err);
+ }
+ 
+ void MtpDrafter::kv_restore(int64_t upto) {
+@@ -1925,6 +1965,26 @@ bool MtpDrafter::stage_source_R(int T, std::string& err) {
+     return true;
+ }
+ 
++bool MtpDrafter::prepare_head_shards(int target0, int target1, std::string& err) {
++    const OnDevice on_device(device_);
++    if (head_shards_.initialized()) { err = "mtp head: already prepared"; return false; }
++    if (!force_on_ || !cs_ || !g_ || !head_ || chain_live_ || max_t_ < 2 || max_t_ > 8) {
++        err = "mtp head: prepare after bind on an idle solo PW2 drafter, before prepare_chain";
++        return false;
++    }
++    if (!owns_draft_head_ || !dhead_ || !dvocab_ || !dhead_plain_ || dhead_type_ != 14 || q4_head_ ||
++        n_dvocab_ < 2 || n_dvocab_ > 0x7fffffff) {
++        err = "mtp head: requires an owned plain Q6_K draft-vocabulary subset; full/repacked/Q4/shared heads unsupported";
++        return false;
++    }
++    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp head: source stream is not idle"; return false; }
++    if (!head_shards_.init(dhead_, device_, dhead_type_, (int) g_->n_embd, (int) n_dvocab_, target0, target1, err))
++        return false;
++    std::fprintf(stderr, "strata mtp head: CUDA%d+%d, %lld Q6_K subset rows, exact full logits returned to CUDA%d; solo PW2 greedy only\n",
++                 target0, target1, (long long) n_dvocab_, device_);
++    return true;
++}
++
+ bool MtpDrafter::prepare_chain(std::string& err) {
+     const OnDevice on_device(device_);
+     if (!force_on_ || h_force_ == nullptr) { err = "mtp: chains need set_force_capture before load"; return false; }
+@@ -1932,6 +1992,14 @@ bool MtpDrafter::prepare_chain(std::string& err) {
+         if (!capture_round(T, false, err)) return false;
+     for (int j = 1; j <= max_t_ - 2; ++j)
+         if (!capture_step(j, false, err)) return false;
++    if (head_shards_.initialized()) {
++        for (int T = 1; T <= max_t_; ++T)
++            if (!capture_round(T, false, err, true)) return false;
++        for (int j = 1; j <= max_t_ - 2; ++j)
++            if (!capture_step(j, false, err, true)) return false;
++        for (int j = 0; j <= max_t_ - 2; ++j)
++            if (!capture_head_tail(j, err)) return false;
++    }
+     if (ev_chain_ == nullptr && cudaEventCreateWithFlags(&ev_chain_, cudaEventDisableTiming) != cudaSuccess) {
+         err = "mtp: event creation failed";
+         return false;
+@@ -1958,6 +2026,14 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
+     if (round_exec_[T] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
+     for (int j = 1; j < n_out; ++j)
+         if (step_exec_[j] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
++    // Request eligibility is controlled by the solo PW2 caller. Coupled sampling can never take the greedy
++    // split tail, even if a caller accidentally leaves the opt-in active across requests.
++    const bool head_split = head_shards_active_ && head_shards_.initialized() && !coupled_active_;
++    if (head_split) {
++        if (!head_round_body_[T] || !head_tail_[0]) { err = "mtp head: split round graphs not prepared"; return false; }
++        for (int j = 1; j < n_out; ++j)
++            if (!head_step_body_[j] || !head_tail_[j]) { err = "mtp head: split step graphs not prepared"; return false; }
++    }
+     const Clock::time_point t0 = Clock::now();
+     const int64_t NH = g_->n_head;
+     auto put = [&](int row, int64_t cell) {
+@@ -1979,14 +2055,25 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+     if (!stage_source_R(T, err)) return false;
+     chain_early_ = std::max(0, std::min(n_early, n_out));
+-    bool ok = cudaGraphLaunch(round_exec_[T], cs_) == cudaSuccess;
++    auto launch = [&](int j) {
++        if (!head_split) return cudaGraphLaunch(j == 0 ? round_exec_[T] : step_exec_[j], cs_) == cudaSuccess;
++        if (cudaGraphLaunch(j == 0 ? head_round_body_[T] : head_step_body_[j], cs_) != cudaSuccess) return false;
++        if (!head_shards_.enqueue(cs_, xq_, head_logits_, j, err)) return false;
++        if (cudaGraphLaunch(head_tail_[j], cs_) != cudaSuccess) return false;
++        ++head_shard_steps_;
++        return true;
++    };
++    bool ok = launch(0);
+     if (ok && chain_early_ >= 1) ok = cudaEventRecord(ev_step_[0], cs_) == cudaSuccess;
+     for (int j = 1; ok && j < n_out; ++j) {
+-        ok = cudaGraphLaunch(step_exec_[j], cs_) == cudaSuccess;
++        ok = launch(j);
+         if (ok && j < chain_early_) ok = cudaEventRecord(ev_step_[j], cs_) == cudaSuccess;
+     }
+     if (!ok || cudaEventRecord(ev_chain_, cs_) != cudaSuccess) {
+-        err = std::string("mtp chain: ") + cudaGetErrorString(cudaGetLastError());
++        if (err.empty()) err = std::string("mtp chain: ") + cudaGetErrorString(cudaGetLastError());
++        // A partially submitted split chain still owns its shared pinned records. Finish every submitted
++        // producer/head/tail before the caller can reuse inputs or destroy the drafter during error cleanup.
++        if (head_split) { std::string drain_error; (void) head_shards_.drain(drain_error); }
+         return false;
+     }
+     (void) cudaStreamQuery(cs_);   // WDDM: submit now
+diff --git a/src/core/mtp_head.cpp b/src/core/mtp_head.cpp
+new file mode 100644
+index 00000000..8394b5a8
+--- /dev/null
++++ b/src/core/mtp_head.cpp
+@@ -0,0 +1,213 @@
++#include "strata/core/mtp_head.hpp"
++
++#if defined(STRATA_GPU_METAL)
++namespace strata::core {
++MtpHeadShards::~MtpHeadShards() = default;
++bool MtpHeadShards::init(const void*, int, int, int, int, int, int, std::string& err) {
++    err = "mtp head: CUDA row-shard graphs are unavailable on Metal"; return false;
++}
++bool MtpHeadShards::enqueue(cudaStream_t, const void*, float*, int, std::string& err) {
++    err = "mtp head: unavailable on Metal"; return false;
++}
++bool MtpHeadShards::drain(std::string&) { return true; }
++void MtpHeadShards::reset() noexcept {}
++}  // namespace strata::core
++#else
++
++#include "strata/kernels/native_mmvq.hpp"
++#include "strata/kernels/elementwise.hpp"
++
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <vector>
++
++namespace strata::core {
++namespace {
++struct DeviceScope {
++    int previous = -1;
++    cudaError_t status = cudaSuccess;
++    bool changed = false;
++    explicit DeviceScope(int device) {
++        status = cudaGetDevice(&previous);
++        if (status == cudaSuccess && previous != device) {
++            status = cudaSetDevice(device);
++            changed = status == cudaSuccess;
++        }
++    }
++    ~DeviceScope() { if (changed) (void) cudaSetDevice(previous); }
++};
++bool checked(cudaError_t status, const char* operation, std::string& err) {
++    if (status == cudaSuccess) return true;
++    err = std::string("mtp head: ") + operation + ": " + cudaGetErrorString(status);
++    return false;
++}
++}  // namespace
++
++MtpHeadShards::~MtpHeadShards() { reset(); }
++
++bool MtpHeadShards::drain(std::string& err) {
++    bool ok = true;
++    // All target waits refer to source-ready events already recorded by enqueue(). Source waits are installed
++    // only after both target completion records succeed, so an enqueue failure cannot leave an unrecorded wait.
++    if (source_ >= 0 && last_source_stream_) {
++        const DeviceScope source(source_);
++        if (!checked(source.status, "select source to drain", err) ||
++            !checked(cudaStreamSynchronize(last_source_stream_), "drain source", err)) ok = false;
++    }
++    for (auto& s : shards_) if (s.device >= 0 && s.stream) {
++        const DeviceScope target(s.device);
++        if (!checked(target.status, "select target to drain", err) ||
++            !checked(cudaStreamSynchronize(s.stream), "drain target", err)) ok = false;
++    }
++    return ok;
++}
++
++void MtpHeadShards::reset() noexcept {
++    // No allocation or CUDA call on the default-off path.
++    if (source_ < 0) return;
++    std::string ignored;
++    (void) drain(ignored);
++    for (auto& s : shards_) if (s.device >= 0) {
++        const DeviceScope target(s.device);
++        // A failed device selection must not free a different card's handles. During unrecoverable CUDA
++        // shutdown these resources can only be reclaimed by context teardown.
++        if (target.status != cudaSuccess) continue;
++        if (s.graph) (void) cudaGraphExecDestroy(s.graph);
++        for (auto e : s.finished) if (e) (void) cudaEventDestroy(e);
++        if (s.stream) (void) cudaStreamDestroy(s.stream);
++        if (s.weights) (void) cudaFree(s.weights);
++        if (s.q8) (void) cudaFree(s.q8);
++        if (s.logits) (void) cudaFree(s.logits);
++        s = {};
++    }
++    {
++        const DeviceScope source(source_);
++        if (source.status == cudaSuccess) {
++            for (auto& e : producer_) { if (e) (void) cudaEventDestroy(e); e = nullptr; }
++            if (activation_host_) (void) cudaFreeHost(activation_host_);
++            if (logits_host_) (void) cudaFreeHost(logits_host_);
++        }
++    }
++    source_ = -1; n_ = vocab_ = 0; q8_bytes_ = 0; ready_ = false;
++    activation_host_ = activation_source_ = nullptr;
++    logits_host_ = logits_source_ = nullptr;
++    last_source_stream_ = nullptr;
++}
++
++bool MtpHeadShards::init(const void* weights, int source_device, int type, int n, int vocab,
++                         int target0, int target1, std::string& err) {
++    using namespace strata::kernels;
++    if (source_ >= 0) { err = "mtp head: already initialized"; return false; }
++    if (!weights || source_device < 0 || target0 < 0 || target1 < 0 || target0 == target1 ||
++        target0 == source_device || target1 == source_device || n <= 0 || n % 256 || vocab < 256) {
++        err = "mtp head: invalid devices or row shape"; return false;
++    }
++    if (type != 14 || native_q6_k_packed_enabled()) {
++        err = "mtp head: only original unpacked Q6_K rows are supported (disable Q6_PACKED / mtp-q4)";
++        return false;
++    }
++    const DeviceScope source(source_device);
++    if (!checked(source.status, "select source", err)) return false;
++    int devices = 0;
++    if (!checked(cudaGetDeviceCount(&devices), "count devices", err)) return false;
++    if (source_device >= devices || target0 >= devices || target1 >= devices) {
++        err = "mtp head: target device is outside the visible device set"; return false;
++    }
++    source_ = source_device; n_ = n; vocab_ = vocab;
++    auto fail = [&]() { reset(); return false; };
++    try {
++        q8_bytes_ = native_q8_1_bytes(n, 1);
++        if (!checked(cudaHostAlloc(&activation_host_, q8_bytes_, cudaHostAllocMapped | cudaHostAllocPortable), "allocate activation", err) ||
++            !checked(cudaHostGetDevicePointer(&activation_source_, activation_host_, 0), "map source activation", err) ||
++            !checked(cudaHostAlloc((void**) &logits_host_, (size_t) vocab * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable), "allocate full logits", err) ||
++            !checked(cudaHostGetDevicePointer((void**) &logits_source_, logits_host_, 0), "map source logits", err)) return fail();
++        std::memset(activation_host_, 0, q8_bytes_);
++        std::memset(logits_host_, 0, (size_t) vocab * sizeof(float));
++        for (auto& e : producer_)
++            if (!checked(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "create producer event", err)) return fail();
++        const size_t weight_row = native_mmvq_weight_bytes(type, n, 1);
++        // Preserve the original MMVQ row/tile phase at the second shard, including the odd 106299-row subset.
++        const int split = (vocab / 2 / 128) * 128;
++        for (int i = 0; i < 2; ++i) {
++            auto& s = shards_[i];
++            s.device = i == 0 ? target0 : target1;
++            s.begin = i == 0 ? 0 : split;
++            s.count = i == 0 ? split : vocab - split;
++            // Stage only this half, preserving the gathered subset's exact bytes and row order. No P2P required.
++            std::vector<unsigned char> host((size_t) s.count * weight_row);
++            if (!checked(cudaMemcpy(host.data(), (const unsigned char*) weights + (size_t) s.begin * weight_row,
++                                    host.size(), cudaMemcpyDeviceToHost), "read shard weights", err)) return fail();
++            const DeviceScope target(s.device);
++            if (!checked(target.status, "select target", err)) return fail();
++            int lo = 0, hi = 0;
++            const char* priority = std::getenv("STRATA_MTP_PRIORITY");
++            if ((!priority || std::atoi(priority) != 0) &&
++                !checked(cudaDeviceGetStreamPriorityRange(&lo, &hi), "get target priority", err)) return fail();
++            if (!checked(cudaStreamCreateWithPriority(&s.stream, cudaStreamNonBlocking, hi), "create target stream", err) ||
++                !checked(cudaMalloc(&s.weights, host.size()), "allocate shard weights", err) ||
++                !checked(cudaMemcpy(s.weights, host.data(), host.size(), cudaMemcpyHostToDevice), "copy shard weights", err) ||
++                !checked(cudaMalloc(&s.q8, q8_bytes_), "allocate target Q8_1", err) ||
++                !checked(cudaMalloc((void**) &s.logits, (size_t) s.count * sizeof(float)), "allocate target logits", err) ||
++                !checked(cudaHostGetDevicePointer(&s.activation, activation_host_, 0), "map target activation", err) ||
++                !checked(cudaHostGetDevicePointer((void**) &s.mapped_logits, logits_host_, 0), "map target logits", err)) return fail();
++            for (auto& e : s.finished)
++                if (!checked(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "create target event", err)) return fail();
++            if (!checked(cudaStreamBeginCapture(s.stream, cudaStreamCaptureModeThreadLocal), "begin head capture", err)) return fail();
++            bool ok = true;
++            try {
++                copy_from_mapped((float*) s.q8, (const float*) s.activation, (int64_t) q8_bytes_ / sizeof(float), s.stream);
++                native_mmvq(type, s.weights, s.q8, s.logits, n, s.count, 1, s.stream);
++                // A vocabulary/subset need not contain a multiple of four rows (106299 -> 53120/53179).
++                // Copy the exact 32-bit words: no float arithmetic, padding, or access beyond this shard.
++                copy_i32_from_mapped((int32_t*) (s.mapped_logits + s.begin), (const int32_t*) s.logits, s.count, s.stream);
++            } catch (const std::exception& e) { err = std::string("mtp head: capture: ") + e.what(); ok = false; }
++            cudaGraph_t graph = nullptr;
++            const cudaError_t ended = cudaStreamEndCapture(s.stream, &graph);
++            if (ok) ok = checked(ended, "end head capture", err);
++            if (ok) ok = checked(cudaGraphInstantiate(&s.graph, graph, nullptr, nullptr, 0), "instantiate head", err);
++            if (graph) (void) cudaGraphDestroy(graph);
++            if (ok) ok = checked(cudaGraphUpload(s.graph, s.stream), "upload head", err);
++            if (ok) ok = checked(cudaStreamSynchronize(s.stream), "finish head upload", err);
++            if (!ok) return fail();
++        }
++        ready_ = true;
++        return true;
++    } catch (const std::exception& e) {
++        err = std::string("mtp head: init: ") + e.what();
++        return fail();
++    }
++}
++
++bool MtpHeadShards::enqueue(cudaStream_t source_stream, const void* q8, float* logits, int step, std::string& err) {
++    using namespace strata::kernels;
++    if (!ready_ || !source_stream || !q8 || !logits || step < 0 || step >= 8) {
++        err = "mtp head: enqueue needs initialized shards, a source stream and step 0..7"; return false;
++    }
++    const DeviceScope source(source_);
++    if (!checked(source.status, "select enqueue source", err)) return false;
++    last_source_stream_ = source_stream;
++    try {
++        copy_from_mapped((float*) activation_source_, (const float*) q8, (int64_t) q8_bytes_ / sizeof(float), source_stream);
++    } catch (const std::exception& e) { err = std::string("mtp head: publish activation: ") + e.what(); return false; }
++    if (!checked(cudaEventRecord(producer_[step], source_stream), "record producer", err)) return false;
++    for (auto& s : shards_) {
++        const DeviceScope target(s.device);
++        if (!checked(target.status, "select enqueue target", err) ||
++            !checked(cudaStreamWaitEvent(s.stream, producer_[step], 0), "wait for source", err) ||
++            !checked(cudaGraphLaunch(s.graph, s.stream), "launch target head", err) ||
++            !checked(cudaEventRecord(s.finished[step], s.stream), "record target completion", err)) return false;
++    }
++    for (auto& s : shards_)
++        if (!checked(cudaStreamWaitEvent(source_stream, s.finished[step], 0), "wait for target", err)) return false;
++    try {
++        // The source's original tail reads precisely vocab_ logits; its existing allocation is not padded here.
++        copy_i32_from_mapped((int32_t*) logits, (const int32_t*) logits_source_, vocab_, source_stream);
++    }
++    catch (const std::exception& e) { err = std::string("mtp head: gather full logits: ") + e.what(); return false; }
++    return true;
++}
++
++}  // namespace strata::core
++#endif
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 19b0461f..7168ca35 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -11801,6 +11801,43 @@ int main(int argc, char** argv) {
+                          (unsigned long long) (decode_head_owner.head[0].weight_bytes() >> 20),
+                          second ? " (two vocabulary shards, greedy only)" : " only");
+         }
++        // Keep the drafter's body/KV and prefill in place. Only explicitly selected solo PW2 chains may
++        // use these two vocabulary shards, and their full logits return before the original probability tail.
++        std::vector<int> mtp_head_devices;
++        if (const char* v = std::getenv("STRATA_MTP_HEAD_GPU"); v != nullptr && v[0] != '\0' && std::strcmp(v, "-1") != 0) {
++            const char* at = v;
++            while (*at) {
++                char* end = nullptr;
++                const long d = std::strtol(at, &end, 10);
++                if (end == at || (*end != '\0' && *end != ',') || d < 0 || d > 31 ||
++                    mtp_head_devices.size() >= 2 || (*end == ',' && end[1] == '\0')) {
++                    std::fprintf(stderr, "strata serve: STRATA_MTP_HEAD_GPU must be -1 (off) or D1,D2\n");
++                    return 1;
++                }
++                mtp_head_devices.push_back((int) d);
++                at = *end == ',' ? end + 1 : end;
++            }
++            if (mtp_head_devices.size() != 2 || mtp_head_devices[0] == mtp_head_devices[1] ||
++                !use_mtp || !pipe || o.pipeline_windows != 2 || !pl_snap_ok) {
++                std::fprintf(stderr, "strata serve: MTP head shards need PW2 and two distinct GPUs in the layer split\n");
++                return 1;
++            }
++            for (const int target : mtp_head_devices) {
++                bool in_split = target == 0;
++                for (const auto& st : stages) in_split = in_split || st->dev == target;
++                if (!in_split || target == mtp.device()) {
++                    std::fprintf(stderr, "strata serve: MTP head targets must differ from the drafter and belong to the layer split\n");
++                    return 1;
++                }
++            }
++            if (!mtp.prepare_head_shards(mtp_head_devices[0], mtp_head_devices[1], err)) {
++                std::fprintf(stderr, "strata serve: MTP head shards: %s\n", err.c_str());
++                return 1;
++            }
++            std::fprintf(stderr, "strata serve: MTP draft head on CUDA%d+%d: two vocabulary shards, full logits "
++                                 "returned for the original probability tail; solo greedy PW2 only, prefill unchanged\n",
++                         mtp_head_devices[0], mtp_head_devices[1]);
++        }
+         cudaEvent_t pl_mtp_ev[2] = {nullptr, nullptr};
+         bool pl_mtp_live[2] = {false, false};
+         bool pl_prepared = false;
+@@ -17992,6 +18029,15 @@ int main(int argc, char** argv) {
+                     ~DecodeHeadScope() { a.set_decode_head_active(false); b.set_decode_head_active(false); }
+                 } decode_scope(*PV[1][0], *PV[1][1]);
+                 const uint64_t head_windows_before = PV[1][0]->decode_head_windows() + PV[1][1]->decode_head_windows();
++                struct MtpHeadScope {
++                    strata::core::MtpDrafter& drafter;
++                    MtpHeadScope(strata::core::MtpDrafter& d, bool active) : drafter(d) {
++                        drafter.set_head_shards_active(active);
++                    }
++                    ~MtpHeadScope() { drafter.set_head_shards_active(false); }
++                } mtp_head_scope(mtp, mtp.head_shards_enabled() && req_sp.greedy &&
++                                     req_sp.penalty_last_n == 0 && req_bias.empty() && !mtp.coupled());
++                const uint64_t mtp_head_steps_before = mtp.head_shard_steps();
+                 struct PW {
+                     int T = 0, seq = 0;
+                     int64_t p = 0;
+@@ -18611,6 +18657,10 @@ int main(int argc, char** argv) {
+                     std::fprintf(stderr, "strata decode head: CUDA%d, %llu PW2 windows offloaded in this request\n",
+                                  decode_head_device, (unsigned long long) (PV[1][0]->decode_head_windows() +
+                                  PV[1][1]->decode_head_windows() - head_windows_before));
++                if (!mtp_head_devices.empty())
++                    std::fprintf(stderr, "strata MTP head: CUDA%d+%d, %llu draft steps offloaded in this request\n",
++                                 mtp_head_devices[0], mtp_head_devices[1],
++                                 (unsigned long long) (mtp.head_shard_steps() - mtp_head_steps_before));
+                 if (dec_timing) {
+                     auto avg = [](double s_, double n_) { return n_ > 0 ? s_ / n_ : 0.0; };
+                     std::fprintf(stderr, "strata pipeline: %lld windows in %.0f ms (%.2f ms/window): %lld speculative, %lld on "
+diff --git a/tests/core/local_tp_bench.cu b/tests/core/local_tp_bench.cu
+new file mode 100644
+index 00000000..aea2ac87
+--- /dev/null
++++ b/tests/core/local_tp_bench.cu
+@@ -0,0 +1,413 @@
++// Standalone diagnostic, never part of the serving engine. Root schedules GPU execution.
++// local_tp_bench --gguf MODEL.gguf --devices 0,1[,2,3] [--layers 3,6]
++// Compare a decomposed, complete-dot routed MoE with output-row TP and with production fused experts.
++// No P2P: all communication traverses portable pinned host memory, with cross-device event ordering.
++#include "strata/artifact/gguf_reader.hpp"
++#include "strata/kernels/iq_kernels.hpp"
++#include "strata/kernels/native_mmvq.hpp"
++#include "strata/kernels/native_moe.hpp"
++#include <cuda_runtime.h>
++#include <algorithm>
++#include <chrono>
++#include <climits>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <functional>
++#include <memory>
++#include <numeric>
++#include <set>
++#include <sstream>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace K = strata::kernels;
++namespace {
++constexpr int N = 2560, FF = 640, MT = 8;
++constexpr size_t XQ = N / 32 * 36, HQ = FF / 32 * 36;
++using Clock = std::chrono::steady_clock;
++void check(bool b, const std::string& s) { if (!b) throw std::runtime_error(s); }
++void cu(cudaError_t e) { if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e)); }
++double elapsed_us(Clock::time_point a) { return std::chrono::duration<double, std::micro>(Clock::now() - a).count(); }
++std::vector<int> ints(const std::string& s) {
++    std::vector<int> v; std::stringstream ss(s); std::string p;
++    while (std::getline(ss, p, ',')) { size_t n = 0; const int x = std::stoi(p, &n); check(n == p.size(), "bad integer list"); v.push_back(x); }
++    check(!v.empty(), "empty integer list"); return v;
++}
++// Raw bits only; Q8_1 bytes may resemble floating point NaNs.
++__global__ void publish(const uint32_t* src, uint32_t* dst, int width, int pitch, int offset, int rows) {
++    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < width * rows; i += blockDim.x * gridDim.x)
++        dst[(i / width) * pitch + offset + i % width] = src[i];
++    __threadfence_system();
++}
++__global__ void acquire(const uint32_t* src, uint32_t* dst, int words) {
++    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < words; i += blockDim.x * gridDim.x) dst[i] = src[i];
++}
++__global__ void transpose_parts(const float* src, float* dst, int experts, int t, int width) {
++    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < experts * t * width; i += blockDim.x * gridDim.x) {
++        const int c = i % width, r = i / width;
++        dst[((r % t) * experts + r / t) * width + c] = src[i];
++    }
++}
++int blocks(int words) { return std::max(1, std::min(128, (words + 255) / 256)); }
++void put(const void* src, void* host, int width_bytes, int pitch_bytes, int offset_bytes, int rows, cudaStream_t s) {
++    check((width_bytes | pitch_bytes | offset_bytes) % 4 == 0, "copy requires whole words");
++    publish<<<blocks(width_bytes / 4 * rows),256,0,s>>>((const uint32_t*) src, (uint32_t*) host,
++        width_bytes / 4, pitch_bytes / 4, offset_bytes / 4, rows); cu(cudaPeekAtLastError());
++}
++void get(const void* host, void* dst, size_t bytes, cudaStream_t s) {
++    check(bytes % 4 == 0 && bytes / 4 <= INT_MAX, "invalid acquire size");
++    acquire<<<blocks((int) bytes / 4),256,0,s>>>((const uint32_t*) host, (uint32_t*) dst, (int) bytes / 4);
++    cu(cudaPeekAtLastError());
++}
++struct Pinned {
++    void* host = nullptr;
++    std::vector<void*> alias;
++    Pinned(size_t bytes, const std::vector<int>& devices) {
++        cu(cudaHostAlloc(&host, bytes, cudaHostAllocPortable | cudaHostAllocMapped));
++        std::memset(host, 0, bytes);
++        for (int d : devices) { cu(cudaSetDevice(d)); void* p = nullptr; cu(cudaHostGetDevicePointer(&p, host, 0)); alias.push_back(p); }
++    }
++    ~Pinned() { if (host) cudaFreeHost(host); }
++    Pinned(const Pinned&) = delete;
++};
++struct Device {
++    int id;
++    cudaStream_t stream = nullptr;
++    std::vector<void*> allocations;
++    std::vector<cudaEvent_t> events;
++    explicit Device(int d) : id(d) { select(); cu(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)); }
++    void select() const { cu(cudaSetDevice(id)); }
++    void sync() const { select(); cu(cudaStreamSynchronize(stream)); }
++    template<class T> T* alloc(size_t n) {
++        select(); void* p = nullptr; cu(cudaMalloc(&p, n * sizeof(T))); allocations.push_back(p); return (T*) p;
++    }
++    template<class T> T* upload(const std::vector<T>& v) {
++        T* p = alloc<T>(v.size()); cu(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice)); return p;
++    }
++    cudaEvent_t event(bool timing = false) {
++        select(); cudaEvent_t e = nullptr; cu(cudaEventCreateWithFlags(&e, timing ? cudaEventDefault : cudaEventDisableTiming));
++        events.push_back(e); return e;
++    }
++    ~Device() {
++        cudaSetDevice(id); if (stream) cudaStreamSynchronize(stream);
++        for (auto e : events) cudaEventDestroy(e);
++        for (void* p : allocations) cudaFree(p);
++        if (stream) cudaStreamDestroy(stream);
++    }
++    Device(const Device&) = delete;
++};
++struct Graph {
++    int device = -1;
++    cudaGraphExec_t exec = nullptr;
++    void make(Device& d, const std::function<void()>& fn) {
++        device = d.id; d.select(); fn(); d.sync(); // initialize lazy dispatch outside capture
++        cu(cudaStreamBeginCapture(d.stream, cudaStreamCaptureModeThreadLocal));
++        cudaGraph_t g = nullptr;
++        try { fn(); cu(cudaStreamEndCapture(d.stream, &g)); }
++        catch (...) { cudaStreamEndCapture(d.stream, &g); if (g) cudaGraphDestroy(g); throw; }
++        const cudaError_t e = cudaGraphInstantiate(&exec, g, nullptr, nullptr, 0);
++        cudaGraphDestroy(g); cu(e); cu(cudaGraphUpload(exec, d.stream)); d.sync();
++    }
++    void launch(Device& d) { d.select(); cu(cudaGraphLaunch(exec, d.stream)); }
++    ~Graph() { if (exec) { cudaSetDevice(device); cudaGraphExecDestroy(exec); } }
++    Graph() = default; Graph(const Graph&) = delete;
++};
++struct Diff { size_t words = 0, different = 0, nonfinite = 0; double max_abs = 0, max_rel = 0; };
++Diff diff(const std::vector<float>& a, const std::vector<float>& b) {
++    check(a.size() == b.size(), "comparison shape mismatch"); Diff d; d.words = a.size();
++    for (size_t i = 0; i < a.size(); ++i) {
++        d.different += std::memcmp(&a[i], &b[i], 4) != 0;
++        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) { ++d.nonfinite; continue; }
++        const double z = std::abs((double) a[i] - b[i]);
++        d.max_abs = std::max(d.max_abs, z); d.max_rel = std::max(d.max_rel, z / (std::abs((double) a[i]) + 1e-8));
++    }
++    return d;
++}
++void print_diff(const char* name, const Diff& d) {
++    std::printf("\"%s\":{\"words\":%zu,\"different\":%zu,\"nonfinite\":%zu,\"max_abs\":%.12g,\"max_rel\":%.12g}",
++        name, d.words, d.different, d.nonfinite, d.max_abs, d.max_rel);
++}
++template<class T> std::vector<T> read(Device& d, const T* p, size_t n) {
++    d.sync(); std::vector<T> v(n); cu(cudaMemcpy(v.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost)); return v;
++}
++double event_us(cudaEvent_t a, cudaEvent_t b) { float ms = 0; cu(cudaEventElapsedTime(&ms, a, b)); return ms * 1000.0; }
++double percentile(std::vector<double> v, double q) {
++    std::sort(v.begin(), v.end()); return v[(size_t) std::floor(q * (v.size() - 1))];
++}
++struct Sample { double wall = 0, kernel_max = 0, kernel_sum = 0; };
++struct Timings {
++    std::vector<double> wall, maximum, sum;
++    void add(Sample s) { wall.push_back(s.wall); maximum.push_back(s.kernel_max); sum.push_back(s.kernel_sum); }
++    void print(const char* name) const {
++        std::printf("\"%s\":{\"samples\":%zu,\"wall_us_p50\":%.6f,\"wall_us_p95\":%.6f,\"kernel_phase_max_rank_us_p50\":%.6f,\"kernel_phase_sum_ranks_us_p50\":%.6f}",
++            name, wall.size(), percentile(wall,.5), percentile(wall,.95), percentile(maximum,.5), percentile(sum,.5));
++    }
++};
++struct Weights {
++    int layer, gu_type, down_type, experts;
++    size_t grow, drow, gate_bytes, down_bytes;
++    K::NativeExpertLayout layout;
++    std::vector<uint8_t> gate, up, down, blobs;
++    Weights(const strata::GgufModel& m, int l, const std::vector<int>& ids) : layer(l), experts((int) ids.size()) {
++        const char* names[] = {"gate", "up", "down"}; const strata::TensorInfo* ti[3]; const uint8_t* ptr[3];
++        for (int k = 0; k < 3; ++k) {
++            size_t shard = 0; ti[k] = m.find("blk." + std::to_string(l) + ".ffn_" + names[k] + "_exps.weight", &shard);
++            check(ti[k] && m.in_bounds(*ti[k], shard), "missing or invalid expert tensor");
++            const auto& s = ti[k]->shape;
++            check(s.size() == 3 && s[0] == (k == 2 ? FF : N) && s[1] == (k == 2 ? N : FF), "unexpected expert shape");
++            for (int id : ids) check(id >= 0 && id < (int) s[2], "expert id out of bounds");
++            ptr[k] = m.shard(shard).tensor_data(*ti[k]);
++        }
++        gu_type = (int) ti[0]->type; down_type = (int) ti[2]->type;
++        check(gu_type == 13 && ti[1]->type == 13 && (down_type == 7 || down_type == 8), "this diagnostic requires Q5_K GU and Q5_1/Q8_0 down");
++        layout = K::native_expert_layout(gu_type, down_type, N, FF);
++        grow = K::native_mmvq_weight_bytes(gu_type, N, 1); drow = K::native_mmvq_weight_bytes(down_type, FF, 1);
++        gate_bytes = grow * FF; down_bytes = drow * N;
++        check(layout.up_off == gate_bytes && layout.down_off == 2 * gate_bytes && layout.bytes == 2 * gate_bytes + down_bytes,
++            "production expert layout is not raw GU/down rows");
++        gate.resize(experts * gate_bytes); up.resize(gate.size()); down.resize(experts * down_bytes); blobs.resize(experts * layout.bytes);
++        for (int e = 0; e < experts; ++e) {
++            std::memcpy(gate.data() + e * gate_bytes, ptr[0] + ids[e] * gate_bytes, gate_bytes);
++            std::memcpy(up.data() + e * gate_bytes, ptr[1] + ids[e] * gate_bytes, gate_bytes);
++            std::memcpy(down.data() + e * down_bytes, ptr[2] + ids[e] * down_bytes, down_bytes);
++            auto* b = blobs.data() + e * layout.bytes;
++            std::memcpy(b, gate.data() + e * gate_bytes, gate_bytes);
++            std::memcpy(b + gate_bytes, up.data() + e * gate_bytes, gate_bytes);
++            std::memcpy(b + 2 * gate_bytes, down.data() + e * down_bytes, down_bytes);
++        }
++    }
++};
++struct Rank {
++    Device d;
++    int ff0, ff, n0, n, E;
++    uint8_t *wg, *wu, *wd, *xq, *hq_local, *hq_full;
++    float *g, *u, *parts_et, *parts_te, *weights, *out, *full_out;
++    cudaEvent_t published, finished, gu0, gu1, dn0, dn1;
++    Graph gu, dn;
++    Rank(int device, int rank, int nr, const Weights& w) : d(device), ff0(rank * FF / nr), ff(FF / nr),
++        n0(rank * N / nr), n(N / nr), E(w.experts) {
++        check(ff % 32 == 0 && n % 4 == 0, "row shard violates quantization/combine alignment");
++        std::vector<uint8_t> a(E * ff * w.grow), b(a.size()), c(E * n * w.drow);
++        for (int e = 0; e < E; ++e) {
++            std::memcpy(a.data() + e * ff * w.grow, w.gate.data() + e * w.gate_bytes + ff0 * w.grow, ff * w.grow);
++            std::memcpy(b.data() + e * ff * w.grow, w.up.data() + e * w.gate_bytes + ff0 * w.grow, ff * w.grow);
++            std::memcpy(c.data() + e * n * w.drow, w.down.data() + e * w.down_bytes + n0 * w.drow, n * w.drow);
++        }
++        wg = d.upload(a); wu = d.upload(b); wd = d.upload(c);
++        xq = d.alloc<uint8_t>(MT * XQ); hq_local = d.alloc<uint8_t>(E * MT * ff / 32 * 36); hq_full = d.alloc<uint8_t>(E * MT * HQ);
++        g = d.alloc<float>(E * MT * ff); u = d.alloc<float>(E * MT * ff);
++        parts_et = d.alloc<float>(E * MT * n); parts_te = d.alloc<float>(E * MT * n);
++        out = d.alloc<float>(MT * n); full_out = d.alloc<float>(MT * N);
++        std::vector<float> rw(E * MT);
++        for (int t = 0; t < MT; ++t) for (int e = 0; e < E; ++e) rw[t * E + e] = float(e + 1) / float(E * (E + 1) / 2);
++        weights = d.upload(rw);
++        published = d.event(); finished = d.event(); gu0 = d.event(true); gu1 = d.event(true); dn0 = d.event(true); dn1 = d.event(true);
++    }
++    void gate_up(const Weights& w, int t) {
++        d.select();
++        for (int e = 0; e < E; ++e) {
++            K::native_mmvq(w.gu_type, wg + e * ff * w.grow, xq, g + e * t * ff, N, ff, t, d.stream);
++            K::native_mmvq(w.gu_type, wu + e * ff * w.grow, xq, u + e * t * ff, N, ff, t, d.stream);
++            K::native_swiglu_quantize_q8_1(g + e * t * ff, u + e * t * ff, hq_local + e * t * ff / 32 * 36, ff, t, d.stream);
++        }
++    }
++    void down_combine(const Weights& w, int t, bool full_reference = false) {
++        d.select(); const auto* hidden = full_reference ? hq_local : hq_full;
++        for (int e = 0; e < E; ++e)
++            K::native_mmvq(w.down_type, wd + e * n * w.drow, hidden + e * t * HQ, parts_et + e * t * n, FF, n, t, d.stream);
++        transpose_parts<<<blocks(E * t * n),256,0,d.stream>>>(parts_et, parts_te, E, t, n); cu(cudaPeekAtLastError());
++        K::native_moe_combine_multi(parts_te, weights, nullptr, out, n, E, t, d.stream);
++    }
++};
++struct Production {
++    Device& d;
++    const Weights& w;
++    const uint8_t* xq;
++    float *parts, *out, *weights;
++    uint8_t *blob, *scratch;
++    unsigned long long* ptr;
++    int32_t *start, *count, *dst, *tok;
++    Graph graph;
++    Production(Rank& r, const Weights& weights_) : d(r.d), w(weights_), xq(r.xq), weights(r.weights) {
++        blob = d.upload(w.blobs); parts = d.alloc<float>(MT * w.experts * N); out = d.alloc<float>(MT * N);
++        scratch = d.alloc<uint8_t>(K::native_expert_scratch_bytes(MT * w.experts, FF));
++        std::vector<unsigned long long> p(w.experts);
++        for (int e = 0; e < w.experts; ++e) p[e] = (unsigned long long) (blob + e * w.layout.bytes);
++        ptr = d.upload(p); start = d.alloc<int32_t>(w.experts + 1); count = d.upload(std::vector<int32_t>{w.experts});
++        dst = d.alloc<int32_t>(MT * w.experts); tok = d.alloc<int32_t>(MT * w.experts);
++    }
++    void prepare(int t) {
++        std::vector<int32_t> st(w.experts + 1), di(w.experts * t), ti(di.size());
++        for (int e = 0; e < w.experts; ++e) {
++            st[e] = e * t;
++            for (int j = 0; j < t; ++j) { di[e * t + j] = j * w.experts + e; ti[e * t + j] = j; }
++        }
++        st[w.experts] = w.experts * t; d.select();
++        cu(cudaMemcpy(start, st.data(), st.size()*4, cudaMemcpyHostToDevice));
++        cu(cudaMemcpy(dst, di.data(), di.size()*4, cudaMemcpyHostToDevice));
++        cu(cudaMemcpy(tok, ti.data(), ti.size()*4, cudaMemcpyHostToDevice));
++    }
++    void run(int t) {
++        K::native_expert_grouped(w.layout, ptr, start, count, dst, tok, w.experts * t, w.experts * t, xq, scratch, parts, d.stream);
++        K::native_moe_combine_multi(parts, weights, nullptr, out, N, w.experts, t, d.stream);
++    }
++};
++struct Tp {
++    std::vector<int> devices;
++    std::vector<std::unique_ptr<Rank>> ranks;
++    Pinned input, hidden, output;
++    int t, E;
++    cudaEvent_t input_ready;
++    Tp(const std::vector<int>& devs, const Weights& w, int rows) : devices(devs), input(MT*XQ,devs),
++        hidden(w.experts*MT*HQ,devs), output(MT*N*4,devs), t(rows), E(w.experts) {
++        for (size_t i = 0; i < devs.size(); ++i) ranks.emplace_back(std::make_unique<Rank>(devs[i], (int)i, (int)devs.size(), w));
++        input_ready = ranks[0]->d.event();
++        for (auto& r : ranks) {
++            // Initialize every input read during lazy warmup/capture to valid zero blocks.
++            r->d.select(); cu(cudaMemset(r->xq,0,MT*XQ)); cu(cudaMemset(r->hq_full,0,E*MT*HQ));
++            r->gu.make(r->d,[&]{ r->gate_up(w,t); });
++            r->dn.make(r->d,[&]{ r->down_combine(w,t); });
++        }
++    }
++    void set_input(const std::vector<uint8_t>& q) {
++        auto& r = *ranks[0]; r.d.select(); cu(cudaMemcpy(r.xq,q.data(),q.size(),cudaMemcpyHostToDevice));
++    }
++    Sample run() {
++        const auto begin = Clock::now();
++        auto& source = *ranks[0]; source.d.select();
++        put(source.xq,input.alias[0],(int)XQ,(int)XQ,0,t,source.d.stream); cu(cudaEventRecord(input_ready,source.d.stream));
++        for (size_t i = 0; i < ranks.size(); ++i) {
++            auto& r = *ranks[i]; r.d.select();
++            if (i) { cu(cudaStreamWaitEvent(r.d.stream,input_ready,0)); get(input.alias[i],r.xq,t*XQ,r.d.stream); }
++            cu(cudaEventRecord(r.gu0,r.d.stream)); r.gu.launch(r.d); cu(cudaEventRecord(r.gu1,r.d.stream));
++            put(r.hq_local,hidden.alias[i],r.ff/32*36,(int)HQ,r.ff0/32*36,E*t,r.d.stream);
++            cu(cudaEventRecord(r.published,r.d.stream));
++        }
++        for (size_t i = 0; i < ranks.size(); ++i) {
++            auto& r = *ranks[i]; r.d.select();
++            for (auto& p : ranks) cu(cudaStreamWaitEvent(r.d.stream,p->published,0));
++            get(hidden.alias[i],r.hq_full,E*t*HQ,r.d.stream);
++            cu(cudaEventRecord(r.dn0,r.d.stream)); r.dn.launch(r.d); cu(cudaEventRecord(r.dn1,r.d.stream));
++            put(r.out,output.alias[i],r.n*4,N*4,r.n0*4,t,r.d.stream); cu(cudaEventRecord(r.finished,r.d.stream));
++        }
++        for (size_t i = 0; i < ranks.size(); ++i) {
++            auto& r = *ranks[i]; r.d.select();
++            for (auto& p : ranks) cu(cudaStreamWaitEvent(r.d.stream,p->finished,0));
++            get(output.alias[i],r.full_out,t*N*4,r.d.stream);
++        }
++        for (auto& r : ranks) r->d.sync();
++        Sample s; s.wall = elapsed_us(begin);
++        for (auto& r : ranks) { r->d.select(); const double x = event_us(r->gu0,r->gu1)+event_us(r->dn0,r->dn1); s.kernel_max=std::max(s.kernel_max,x); s.kernel_sum+=x; }
++        return s;
++    }
++    ~Tp() { for (auto& r : ranks) { cudaSetDevice(r->d.id); cudaStreamSynchronize(r->d.stream); } }
++};
++Sample single(Device& d, Graph& g, cudaEvent_t a, cudaEvent_t b) {
++    const auto begin=Clock::now(); d.select(); cu(cudaEventRecord(a,d.stream)); g.launch(d); cu(cudaEventRecord(b,d.stream)); d.sync();
++    Sample s; s.wall=elapsed_us(begin); s.kernel_max=s.kernel_sum=event_us(a,b); return s;
++}
++std::vector<uint8_t> activation(Rank& r, int t, int seed) {
++    std::vector<float> h(t*N); uint32_t state=(uint32_t)seed;
++    if (seed) for(float& x:h) { state=1664525u*state+1013904223u; x=float(int(state>>16)-32768)/32768.0f; }
++    float* x=r.full_out; r.d.select(); cu(cudaMemcpy(x,h.data(),h.size()*4,cudaMemcpyHostToDevice));
++    K::native_quantize_q8_1(x,r.xq,N,t,r.d.stream); return read(r.d,r.xq,t*XQ);
++}
++void collective(const std::vector<int>& devs, int bytes, int t, int warm, int iters) {
++    Pinned h((size_t)bytes*t,devs); std::vector<std::unique_ptr<Device>> ds;
++    std::vector<uint32_t*> src,dst; std::vector<cudaEvent_t> ready,a,b; const int width=bytes/(int)devs.size();
++    check(bytes%((int)devs.size()*4)==0,"collective payload must divide into words");
++    for(size_t i=0;i<devs.size();++i) {
++        ds.emplace_back(std::make_unique<Device>(devs[i])); auto& d=*ds.back();
++        std::vector<uint32_t> v((size_t)width/4*t); for(size_t j=0;j<v.size();++j) v[j]=uint32_t(i*1048576+j);
++        src.push_back(d.upload(v)); dst.push_back(d.alloc<uint32_t>((size_t)bytes/4*t));
++        ready.push_back(d.event()); a.push_back(d.event(true)); b.push_back(d.event(true));
++    }
++    Timings results;
++    for(int it=-warm;it<iters;++it) {
++        const auto begin=Clock::now();
++        for(size_t i=0;i<ds.size();++i) { auto& d=*ds[i]; d.select(); cu(cudaEventRecord(a[i],d.stream)); put(src[i],h.alias[i],width,bytes,(int)i*width,t,d.stream); cu(cudaEventRecord(ready[i],d.stream)); }
++        for(size_t i=0;i<ds.size();++i) { auto& d=*ds[i]; d.select(); for(auto e:ready)cu(cudaStreamWaitEvent(d.stream,e,0)); get(h.alias[i],dst[i],(size_t)bytes*t,d.stream); cu(cudaEventRecord(b[i],d.stream)); }
++        for(auto& d:ds)d->sync(); Sample s; s.wall=elapsed_us(begin);
++        for(size_t i=0;i<ds.size();++i) { ds[i]->select(); const double z=event_us(a[i],b[i]); s.kernel_max=std::max(s.kernel_max,z); s.kernel_sum+=z; }
++        if(it>=0)results.add(s);
++    }
++    bool ok=true;
++    for(size_t i=0;i<ds.size();++i) {
++        const auto v=read(*ds[i],dst[i],(size_t)bytes/4*t);
++        for(int row=0;row<t;++row)for(size_t p=0;p<ds.size();++p)for(int j=0;j<width/4;++j)
++            ok &= v[(size_t)row*bytes/4+p*width/4+j]==uint32_t(p*1048576+row*width/4+j);
++    }
++    std::printf("{\"kind\":\"host_allgather\",\"ranks\":%zu,\"bytes_per_row\":%d,\"T\":%d,\"bitwise\":%s,\"device_event_includes_wait_and_copy\":true,",devs.size(),bytes,t,ok?"true":"false");
++    results.print("timing"); std::puts("}"); check(ok,"collective bitwise failure");
++}
++} // namespace
++
++int main(int argc,char** argv) {
++    try {
++        std::string gguf; auto devices=std::vector<int>{0,1}; auto layers=std::vector<int>{3,6};
++        auto ids=std::vector<int>{5,42,79,116,153,190,227,264,301,338};
++        int warm=10,iters=100,cases=4; bool collective_only=false;
++        for(int i=1;i<argc;++i) {
++            const std::string a=argv[i];
++            if(a=="--collective-only"){collective_only=true;continue;}
++            check(i+1<argc,"missing argument for "+a); const std::string v=argv[++i];
++            if(a=="--gguf")gguf=v; else if(a=="--devices")devices=ints(v); else if(a=="--layers")layers=ints(v);
++            else if(a=="--experts")ids=ints(v); else if(a=="--warmup")warm=std::stoi(v); else if(a=="--iterations")iters=std::stoi(v);
++            else if(a=="--parity-cases")cases=std::stoi(v); else throw std::runtime_error("unknown argument "+a);
++        }
++        check((devices.size()==2||devices.size()==4)&&std::set<int>(devices.begin(),devices.end()).size()==devices.size(),"devices must be two or four distinct GPUs");
++        check(warm>=1&&iters>=3&&cases>=2&&ids.size()==10,"warmup>=1, iterations>=3, parity-cases>=2, exactly ten expert ids required");
++        check(collective_only||!gguf.empty(),"--gguf is required unless --collective-only");
++        int count=0; const auto status=cudaGetDeviceCount(&count);
++        if(status!=cudaSuccess||*std::min_element(devices.begin(),devices.end())<0||*std::max_element(devices.begin(),devices.end())>=count) {
++            std::fprintf(stderr,"SKIP: requested GPUs unavailable; count=%d CUDA=%s\n",count,cudaGetErrorString(status));return 77;
++        }
++        setvbuf(stdout,nullptr,_IONBF,0);
++        std::printf("{\"kind\":\"configuration\",\"warmup\":%d,\"iterations\":%d,\"parity_cases\":%d,\"devices\":[",warm,iters,cases);
++        for(size_t i=0;i<devices.size();++i)std::printf("%s%d",i?",":"",devices[i]);
++        std::puts("],\"scope\":\"routed MoE only; fixed ten experts shared by all token rows; excludes router/shared/HC/attention\",\"timing\":\"interleaved graph replays; wall includes host submissions, mapped-host communication and all-rank synchronization; compute-event sums are not critical-path times\"}");
++        for(int d:devices){cudaDeviceProp p{};cu(cudaGetDeviceProperties(&p,d));std::fprintf(stderr,"device=%d name=%s cc=%d%d SM=%d memory=%zu\n",d,p.name,p.major,p.minor,p.multiProcessorCount,p.totalGlobalMem);}
++        if(!collective_only) {
++            strata::GgufModel model(strata::gguf_split_paths(gguf)); bool all_tp=true,all_prod=true;
++            for(int layer:layers) {
++                Weights w(model,layer,ids);
++                for(int t:{1,2,3,8}) {
++                    Rank ref(devices[0],0,1,w); ref.d.select();cu(cudaMemset(ref.xq,0,MT*XQ));
++                    Production prod(ref,w);prod.prepare(t); Graph baseline,production;
++                    baseline.make(ref.d,[&]{ref.gate_up(w,t);ref.down_combine(w,t,true);});
++                    production.make(ref.d,[&]{prod.run(t);}); Tp tp(devices,w,t);
++                    const auto ev0=ref.d.event(true),ev1=ref.d.event(true);
++                    bool tp_ok=true,prod_ok=true;
++                    for(int c=0;c<cases;++c) {
++                        const auto q=activation(ref,t,c==0?0:17+layer*131+c*997+t);tp.set_input(q);
++                        single(ref.d,baseline,ev0,ev1);const auto expected=read(ref.d,ref.out,t*N);const auto eh=read(ref.d,ref.hq_local,w.experts*t*HQ);
++                        single(ref.d,production,ev0,ev1);const auto actual=read(ref.d,prod.out,t*N);tp.run();
++                        const auto got=read(tp.ranks[0]->d,tp.ranks[0]->full_out,t*N);
++                        const Diff td=diff(expected,got),pd=diff(actual,got);
++                        const bool hidden_ok=std::memcmp(eh.data(),tp.hidden.host,eh.size())==0;
++                        tp_ok &= td.different==0&&td.nonfinite==0&&hidden_ok;prod_ok &= pd.different==0&&pd.nonfinite==0;
++                        std::printf("{\"kind\":\"parity\",\"layer\":%d,\"T\":%d,\"case\":%d,\"hidden_q8_bitwise\":%s,",layer,t,c,hidden_ok?"true":"false");
++                        print_diff("tp_vs_decomposed",td);std::printf(",");print_diff("tp_vs_production",pd);std::puts("}");
++                    }
++                    // Fixed nonzero input for timing; model weights, captures and allocations are outside timing.
++                    tp.set_input(activation(ref,t,8191+layer+t));Timings a,b,c;
++                    for(int i=-warm;i<iters;++i)for(int k=0;k<3;++k) {
++                        const int arm=((i+warm)%3+k)%3;Sample s;
++                        if(arm==0)s=single(ref.d,production,ev0,ev1);else if(arm==1)s=single(ref.d,baseline,ev0,ev1);else s=tp.run();
++                        if(i>=0){if(arm==0)a.add(s);else if(arm==1)b.add(s);else c.add(s);}
++                    }
++                    std::printf("{\"kind\":\"routed_moe\",\"layer\":%d,\"T\":%d,\"ranks\":%zu,\"GU_type\":%d,\"down_type\":%d,\"experts\":%d,\"production_cap_groups\":%d,\"tp_bitwise_decomposed\":%s,\"tp_bitwise_production\":%s,",layer,t,devices.size(),w.gu_type,w.down_type,w.experts,w.experts*t,tp_ok?"true":"false",prod_ok?"true":"false");
++                    a.print("production_fused");std::printf(",");b.print("decomposed_single_gpu");std::printf(",");c.print("row_tp");std::puts("}");
++                    all_tp &= tp_ok;all_prod &= prod_ok;
++                }
++            }
++            std::printf("{\"kind\":\"parity_summary\",\"all_tp_bitwise_decomposed\":%s,\"all_tp_bitwise_production\":%s,\"production_exact_candidate\":%s}\n",all_tp?"true":"false",all_prod?"true":"false",all_tp&&all_prod?"true":"false");
++            check(all_tp,"TP differs from the complete-dot decomposed reference");
++        }
++        for(int bytes:{6912,7200,10240,24576,40960})for(int t:{1,2,3,8})collective(devices,bytes,t,warm,iters);
++        return 0;
++    }catch(const std::exception& e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
++}
+diff --git a/tests/core/mtp_head_test.cpp b/tests/core/mtp_head_test.cpp
+new file mode 100644
+index 00000000..8ec2f6e0
+--- /dev/null
++++ b/tests/core/mtp_head_test.cpp
+@@ -0,0 +1,285 @@
++// Manual three-GPU parity test. No running engine or peer-access enablement is needed.
++// mtp_head_test --gguf MODEL.gguf --draft-vocab draft_vocab.bin --source 7 --target 3 --target2 5
++#include "strata/artifact/gguf_reader.hpp"
++#include "strata/core/mtp_head.hpp"
++#include "strata/core/on_device.hpp"
++#include "strata/kernels/native_mmvq.hpp"
++#include "strata/kernels/sampler.hpp"
++#include "strata/kernels/verify_kernels.hpp"
++
++#include <cuda_runtime.h>
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <functional>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace {
++constexpr int kN = 2560, kVocab = 106299, kSteps = 8;
++void require(bool ok, const std::string& why) { if (!ok) throw std::runtime_error(why); }
++void gpu(cudaError_t e) { require(e == cudaSuccess, cudaGetErrorString(e)); }
++uint32_t bits(float v) { uint32_t b; std::memcpy(&b, &v, sizeof b); return b; }
++void current_is(int device) {
++    int actual = -1; gpu(cudaGetDevice(&actual));
++    require(actual == device, "helper changed the caller's current CUDA device");
++}
++void default_env(const char* name, const char* value) {
++#if defined(_WIN32)
++    if (!std::getenv(name)) _putenv_s(name, value);
++#else
++    if (!std::getenv(name)) setenv(name, value, 0);
++#endif
++}
++
++// Source lifetime encloses the helper, including on exceptions. All result/input slots are pinned:
++// pageable cudaMemcpyAsync would introduce an unintended host wait in the chain test.
++struct Source {
++    int device;
++    cudaStream_t stream = nullptr;
++    std::vector<void*> allocations, pinned;
++    std::vector<cudaGraphExec_t> graphs;
++    explicit Source(int d) : device(d) { gpu(cudaSetDevice(d)); gpu(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)); }
++    ~Source() {
++        const strata::core::OnDevice on(device);
++        if (stream) (void) cudaStreamSynchronize(stream);
++        for (auto g : graphs) (void) cudaGraphExecDestroy(g);
++        for (auto p : allocations) (void) cudaFree(p);
++        for (auto p : pinned) (void) cudaFreeHost(p);
++        if (stream) (void) cudaStreamDestroy(stream);
++    }
++    template<class T> T* device_buffer(size_t n) {
++        void* p = nullptr; gpu(cudaMalloc(&p, n * sizeof(T))); allocations.push_back(p); return (T*) p;
++    }
++    template<class T> T* host_buffer(size_t n) {
++        void* p = nullptr; gpu(cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocPortable)); pinned.push_back(p); return (T*) p;
++    }
++    cudaGraphExec_t capture(const std::function<void()>& record) {
++        gpu(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
++        try { record(); }
++        catch (...) {
++            cudaGraph_t abandoned = nullptr; (void) cudaStreamEndCapture(stream, &abandoned);
++            if (abandoned) (void) cudaGraphDestroy(abandoned);
++            throw;
++        }
++        cudaGraph_t graph = nullptr; gpu(cudaStreamEndCapture(stream, &graph));
++        cudaGraphExec_t exec = nullptr;
++        const cudaError_t instantiated = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
++        (void) cudaGraphDestroy(graph); gpu(instantiated);
++        graphs.push_back(exec); gpu(cudaGraphUpload(exec, stream));
++        gpu(cudaStreamSynchronize(stream));
++        return exec;
++    }
++};
++struct Tail {
++    float *logits, *prob;
++    int32_t *local, *mapped;
++    void *arg_scratch, *prob_scratch;
++    float *host_logits, *host_prob;
++    int32_t *host_local, *host_mapped;
++    explicit Tail(Source& s) {
++        using namespace strata::kernels;
++        logits = s.device_buffer<float>(kVocab); prob = s.device_buffer<float>(1);
++        local = s.device_buffer<int32_t>(1); mapped = s.device_buffer<int32_t>(1);
++        arg_scratch = s.device_buffer<uint8_t>(argmax_rows_scratch_bytes(1));
++        prob_scratch = s.device_buffer<uint8_t>(std::max<uint64_t>(1, row_top_prob_scratch_bytes(1)));
++        gpu(cudaMemset(arg_scratch, 0, argmax_rows_scratch_bytes(1)));
++        gpu(cudaMemset(prob_scratch, 0, std::max<uint64_t>(1, row_top_prob_scratch_bytes(1))));
++        host_logits = s.host_buffer<float>((size_t) kSteps * kVocab);
++        host_prob = s.host_buffer<float>(kSteps);
++        host_local = s.host_buffer<int32_t>(kSteps); host_mapped = s.host_buffer<int32_t>(kSteps);
++    }
++    void record(bool split_prob, bool rows_argmax, const int32_t* vocab, cudaStream_t stream) {
++        using namespace strata::kernels;
++        if (rows_argmax) argmax_rows(logits, 1, kVocab, arg_scratch, local, stream);
++        else { SamplerParams sp; sp.greedy = true; sample_tokens(logits, 1, kVocab, nullptr, 0, sp, local, stream); }
++        if (split_prob) row_top_prob_split(logits, 1, kVocab, local, prob, prob_scratch, stream);
++        else row_top_prob(logits, 1, kVocab, local, prob, stream);
++        gpu(cudaMemcpyAsync(mapped, local, sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
++        map_ids(mapped, vocab, 1, stream);
++    }
++    void save(int step, cudaStream_t stream) {
++        gpu(cudaMemcpyAsync(host_logits + (size_t) step * kVocab, logits, kVocab * sizeof(float), cudaMemcpyDeviceToHost, stream));
++        gpu(cudaMemcpyAsync(host_prob + step, prob, sizeof(float), cudaMemcpyDeviceToHost, stream));
++        gpu(cudaMemcpyAsync(host_local + step, local, sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
++        gpu(cudaMemcpyAsync(host_mapped + step, mapped, sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
++    }
++};
++
++std::vector<int32_t> read_vocab(const std::string& path) {
++    std::ifstream f(path, std::ios::binary | std::ios::ate);
++    require((bool) f && f.tellg() == (std::streamoff) kVocab * sizeof(int32_t),
++            "draft vocabulary must contain exactly 106299 raw int32 ids");
++    std::vector<int32_t> v(kVocab); f.seekg(0); f.read((char*) v.data(), v.size() * sizeof(int32_t));
++    require((bool) f, "cannot read draft vocabulary"); return v;
++}
++std::vector<uint8_t> read_subset(const std::string& path, const std::vector<int32_t>& ids) {
++    using namespace strata::kernels;
++    const strata::GgufModel model(strata::gguf_split_paths(path));
++    size_t shard = 0; const auto* t = model.find("output.weight", &shard);
++    require(t && t->type == 14 && t->shape.size() == 2 && t->shape[0] == kN && model.in_bounds(*t, shard),
++            "test requires real, in-bounds Q6_K output.weight with N=2560");
++    const size_t row = native_mmvq_weight_bytes(14, kN, 1);
++    require(row == 2100, "unexpected Q6_K row byte count");
++    const uint8_t* data = model.shard(shard).tensor_data(*t);
++    std::vector<uint8_t> seen((size_t) t->shape[1], 0), subset(ids.size() * row);
++    for (size_t i = 0; i < ids.size(); ++i) {
++        require(ids[i] >= 0 && (uint64_t) ids[i] < t->shape[1], "draft vocab id outside full vocabulary");
++        require(!seen[ids[i]], "draft vocabulary contains duplicate ids"); seen[ids[i]] = 1;
++        std::memcpy(subset.data() + i * row, data + (size_t) ids[i] * row, row);
++    }
++    return subset;
++}
++void fill_inputs(float* p, int cycle, int steps) {
++    for (int j = 0; j < steps; ++j) {
++        uint32_t state = 0x591223a5u + 997u * cycle + 1619u * j;
++        for (int i = 0; i < kN; ++i) {
++            state = state * 1664525u + 1013904223u;
++            p[(size_t) j * kN + i] = cycle == 0 && j == 0 ? 0.0f :
++                (float) ((int) (state >> 16) - 32768) / (cycle % 2 ? 8192.0f : 32768.0f);
++        }
++    }
++}
++void compare(const Tail& reference, const Tail& candidate, int step, const std::vector<int32_t>& ids,
++             const std::string& label) {
++    const float* a = reference.host_logits + (size_t) step * kVocab;
++    const float* b = candidate.host_logits + (size_t) step * kVocab;
++    for (int i = 0; i < kVocab; ++i) {
++        if (bits(a[i]) != bits(b[i])) {
++            char diff[160]; std::snprintf(diff, sizeof diff, " row=%d reference=0x%08x candidate=0x%08x", i, bits(a[i]), bits(b[i]));
++            throw std::runtime_error(label + " full-logit mismatch" + diff);
++        }
++        if (!std::isfinite(a[i])) throw std::runtime_error(label + " nonfinite logit at row " + std::to_string(i));
++    }
++    require(reference.host_local[step] == candidate.host_local[step], label + " local argmax mismatch");
++    const int32_t local = reference.host_local[step];
++    require(local >= 0 && local < kVocab, label + " invalid local argmax");
++    require(reference.host_mapped[step] == candidate.host_mapped[step] && candidate.host_mapped[step] == ids[local],
++            label + " draft vocabulary mapping mismatch");
++    if (bits(reference.host_prob[step]) != bits(candidate.host_prob[step])) {
++        char diff[120]; std::snprintf(diff, sizeof diff, " reference=0x%08x candidate=0x%08x",
++                                    bits(reference.host_prob[step]), bits(candidate.host_prob[step]));
++        throw std::runtime_error(label + " probability mismatch" + diff);
++    }
++    require(std::isfinite(candidate.host_prob[step]) && candidate.host_prob[step] > 0 && candidate.host_prob[step] <= 1,
++            label + " probability outside (0,1]");
++}
++void default_contract() {
++    strata::core::MtpHeadShards h; std::string err;
++    require(!h.initialized() && h.row_bytes() == 0 && h.row_count(0) == 0, "default helper must be inert");
++    require(!h.enqueue(nullptr, nullptr, nullptr, 0, err) && !err.empty(), "default helper accepted enqueue");
++    err.clear(); require(h.drain(err), "default helper failed drain"); h.reset();
++    // Type rejection must happen before CUDA allocation or dereferencing the placeholder address.
++    err.clear(); require(!h.init((const void*) 1, 7, 13, kN, kVocab, 2, 4, err) && !err.empty() && !h.initialized(),
++                         "unsupported Q5 head was accepted");
++    err.clear(); require(!h.init((const void*) 1, 7, 14, kN, kVocab, 2, 2, err) && !err.empty() && !h.initialized(),
++                         "duplicate target devices were accepted");
++}
++}  // namespace
++
++int main(int argc, char** argv) {
++    try {
++        default_env("STRATA_SM75_PERF", "1"); default_env("STRATA_ARGMAX_ROWS_SM70", "1");
++        default_contract();
++        if (argc == 2 && std::strcmp(argv[1], "--contract-only") == 0) {
++            std::puts("PASS: MTP_HEAD_DEFAULT_UNSUPPORTED_CONTRACT"); return 0;
++        }
++        std::string model, vocab_file; int source = 7, target0 = 2, target1 = 4, cycles = 4;
++        for (int i = 1; i < argc; ++i) {
++            const std::string a = argv[i]; require(i + 1 < argc, "missing value for " + a);
++            if (a == "--gguf") model = argv[++i];
++            else if (a == "--draft-vocab") vocab_file = argv[++i];
++            else if (a == "--source") source = std::stoi(argv[++i]);
++            else if (a == "--target") target0 = std::stoi(argv[++i]);
++            else if (a == "--target2") target1 = std::stoi(argv[++i]);
++            else if (a == "--cycles") cycles = std::stoi(argv[++i]);
++            else throw std::runtime_error("unknown option " + a);
++        }
++        require(!model.empty() && !vocab_file.empty() && cycles >= 3 && source >= 0 && target0 >= 0 && target1 >= 0 &&
++                    source != target0 && source != target1 && target0 != target1,
++                "usage: mtp_head_test --gguf MODEL --draft-vocab FILE --source 7 --target 2 --target2 4 [--cycles 4, minimum 3]");
++        int count = 0; const cudaError_t counted = cudaGetDeviceCount(&count);
++        if (counted != cudaSuccess || std::max({source, target0, target1}) >= count) {
++            std::fprintf(stderr, "SKIP: requested three GPUs unavailable (count=%d, CUDA=%s)\n", count, cudaGetErrorString(counted)); return 77;
++        }
++        using namespace strata::kernels;
++        require(!native_q6_k_packed_enabled(), "test requires original unpacked Q6_K (Q6_PACKED must be off)");
++        const auto ids = read_vocab(vocab_file); auto subset = read_subset(model, ids);
++        Source s(source);
++        uint8_t* weights = s.device_buffer<uint8_t>(subset.size());
++        gpu(cudaMemcpy(weights, subset.data(), subset.size(), cudaMemcpyHostToDevice));
++        subset.clear(); subset.shrink_to_fit();
++        int32_t* dvocab = s.device_buffer<int32_t>(kVocab);
++        gpu(cudaMemcpy(dvocab, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
++        float* mixed = s.device_buffer<float>(kN);
++        void* q8 = s.device_buffer<uint8_t>(native_q8_1_bytes(kN, 1));
++        float* inputs = s.host_buffer<float>((size_t) kSteps * kN);
++        Tail reference(s), candidate(s);
++        // The body, reference head, and source tails are independent single-device captures.
++        // All cross-device waits/launches happen outside stream capture in helper.enqueue().
++        const auto body = s.capture([&] { native_quantize_q8_1(mixed, q8, kN, 1, s.stream); });
++        const auto original = s.capture([&] { native_mmvq(14, weights, q8, reference.logits, kN, kVocab, 1, s.stream); });
++        strata::core::MtpHeadShards helper; std::string err;
++        require(helper.init(weights, source, 14, kN, kVocab, target0, target1, err), err);
++        current_is(source);
++        require(helper.row_begin(0) == 0 && helper.row_begin(1) == helper.row_count(0) &&
++                    helper.row_count(0) + helper.row_count(1) == kVocab && helper.row_bytes() == native_q8_1_bytes(kN, 1),
++                "shards do not cover the complete subset in row order");
++        for (int target : {target0, target1}) {
++            int p2p = -1; gpu(cudaDeviceCanAccessPeer(&p2p, source, target));
++            std::printf("topology: CUDA%d->CUDA%d peer_capable=%d; test never enables peer access\n", source, target, p2p);
++        }
++        err.clear(); require(!helper.enqueue(s.stream, q8, candidate.logits, 8, err) && !err.empty(), "invalid step accepted");
++        err.clear();
++        std::printf("shape: Q6_K subset=%d N=%d shards=%d+%d; STRATA_SM75_PERF=%s STRATA_ARGMAX_ROWS_SM70=%s\n",
++                    kVocab, kN, helper.row_count(0), helper.row_count(1), std::getenv("STRATA_SM75_PERF"), std::getenv("STRATA_ARGMAX_ROWS_SM70"));
++        size_t cases = 0, chained = 0;
++        std::vector<uint32_t> canonical_prob;
++        std::vector<int32_t> canonical_local, canonical_mapped;
++        for (bool rows_argmax : {true, false}) for (bool split_prob : {false, true}) {
++            const auto ref_tail = s.capture([&] { reference.record(split_prob, rows_argmax, dvocab, s.stream); });
++            const auto got_tail = s.capture([&] { candidate.record(split_prob, rows_argmax, dvocab, s.stream); });
++            size_t index = 0;
++            for (int steps : {1, kSteps}) for (int cycle = 0; cycle < cycles; ++cycle) {
++                fill_inputs(inputs, cycle, steps);
++                for (int j = 0; j < steps; ++j) {
++                    gpu(cudaMemcpyAsync(mixed, inputs + (size_t) j * kN, kN * sizeof(float), cudaMemcpyHostToDevice, s.stream));
++                    gpu(cudaGraphLaunch(body, s.stream));
++                    gpu(cudaGraphLaunch(original, s.stream)); gpu(cudaGraphLaunch(ref_tail, s.stream));
++                    reference.save(j, s.stream);
++                    require(helper.enqueue(s.stream, q8, candidate.logits, j, err), err);
++                    gpu(cudaGraphLaunch(got_tail, s.stream)); candidate.save(j, s.stream);
++                    // No host wait here: the next body must respect the source waits installed by enqueue().
++                }
++                require(helper.drain(err), err); current_is(source);
++                for (int j = 0; j < steps; ++j, ++index) {
++                    const std::string label = "argmax=" + std::to_string(rows_argmax) + " split_prob=" + std::to_string(split_prob) +
++                        " steps=" + std::to_string(steps) + " cycle=" + std::to_string(cycle) + " step=" + std::to_string(j);
++                    compare(reference, candidate, j, ids, label);
++                    if (rows_argmax && !split_prob) {
++                        canonical_prob.push_back(bits(reference.host_prob[j])); canonical_local.push_back(reference.host_local[j]);
++                        canonical_mapped.push_back(reference.host_mapped[j]);
++                    } else {
++                        require(canonical_prob[index] == bits(reference.host_prob[j]) && canonical_local[index] == reference.host_local[j] &&
++                                    canonical_mapped[index] == reference.host_mapped[j], label + " original tail modes differ");
++                    }
++                    if (cycle == 0 && j == 0) require(candidate.host_local[j] == 0, "zero-input tie must pick subset row zero");
++                    ++cases; if (steps > 1) ++chained;
++                }
++            }
++            std::printf("tail: argmax_rows=%d split_probability=%d passed %zu T1 outputs\n", rows_argmax, split_prob, index);
++            std::fflush(stdout);
++        }
++        helper.reset(); require(!helper.initialized(), "reset left helper initialized"); current_is(source);
++        std::printf("PASS: MTP_HEAD_BITWISE_LOGITS_PROBABILITIES cases=%zu logits=%zu dvocab_mapping=exact\n", cases, cases * kVocab);
++        std::printf("PASS: MTP_HEAD_CHAIN_REUSE outputs=%zu steps=8 repeated_chains=%d\n", chained, cycles * 4);
++        std::puts("PASS: MTP_HEAD_DEFAULT_UNSUPPORTED_CONTRACT (engine fallback requires separate integration test)");
++        return 0;
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "FAIL: MTP head parity: %s\n", e.what()); return 1;
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

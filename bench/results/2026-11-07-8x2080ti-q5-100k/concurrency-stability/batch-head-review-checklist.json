@@ -1,0 +1,109 @@
+{
+  "status": "Prepared independent review checklist; implementation diff pending. No new implementation, build, GPU test, service action or inference request performed.",
+  "baseline_commit": "862caa974fde10672a425de9c25c3b75c38f35fc",
+  "design": "batch-head-design.md",
+  "scope": "Opt-in pipelined slot draft-head sharing: immutable target weight bank plus private per-slot asynchronous workspaces. GPU7 is a measured load hotspot; draft critical path and speed benefit remain hypotheses.",
+  "checklist": [
+    {
+      "id": "ownership",
+      "severity": "blocker",
+      "invariant": "Shared bank owns only immutable target weight allocations and validated layout/device metadata. Each workspace holds a strong reference. Workspace reset first drains source consumption and target work, destroys graphs/events/scratch, then releases its bank reference. Last-reference destructor frees weights on their owning devices.",
+      "verification": "Owner-helper reset/destruction while eight clones are queued must not invalidate any clone. Reinit owner uses a new bank while existing clones retain the old one.",
+      "status": "pending_diff_and_evidence"
+    },
+    {
+      "id": "full_drafter_owner_lifetime",
+      "severity": "blocker",
+      "invariant": "Do not confuse bank ownership with all MtpDrafter ownership: dense/expert/dhead/dvocab pointers are still borrowed by existing clones. Main MtpDrafter must continue to outlive all slot drafters. Tests of early bank-owner destruction must not imply that destroying the full borrowed-weight owner is supported.",
+      "verification": "Review generate declaration/destruction order and early-return cleanup; distinguish bank-owner test from whole-drafter-owner test.",
+      "status": "pending_diff_and_evidence"
+    },
+    {
+      "id": "workspace_isolation",
+      "severity": "blocker",
+      "invariant": "Every slot owns distinct activation/logit mapped pages, per-target Q8/logits, source producer and target-finished events, target streams, graph executables and last-source-stream state. Only bank weight pointers may alias. Distinct slots all use step0 without colliding.",
+      "verification": "Queue all eight sources before any host synchronize or drain; use distinct pinned inputs and output destinations; repeat same-step0 reuse after completion.",
+      "status": "pending_diff_and_evidence"
+    },
+    {
+      "id": "dependency_order",
+      "severity": "blocker",
+      "invariant": "Per workspace: source body/Q8 publish -> producer record -> target waits -> target graph/logits publish -> target finished records -> both source waits -> full-logit gather -> original tail -> next body. Never record ordinary target kernels inside source stream capture.",
+      "verification": "Exercise actual cross-device event path with no pageable-copy-induced sync or host polls between launch steps. Chain steps0..7 once and repeated chains.",
+      "status": "pending_diff_and_evidence"
+    },
+    {
+      "id": "source_reuse",
+      "severity": "blocker",
+      "invariant": "A workspace is tied to its drafter source stream while in flight. chain_live and final completion event protect all mapped buffers, inputs and event indices until reuse. Receiving early output readiness is not sufficient to reuse a workspace.",
+      "verification": "Read outputs/complete slots in a different order from enqueue; reuse one completed slot while other seven are still live.",
+      "status": "pending_diff_and_evidence"
+    },
+    {
+      "id": "failure_cleanup",
+      "severity": "blocker",
+      "invariant": "Install source waits only after both target completion records succeeded. Any partially submitted split chain must drain all submitted source/target work before input reuse, fallback or reset. Propagate runtime CUDA failures; never silently rerun a partially executed body as though no state changed.",
+      "verification": "Review every failure after publish, first target launch, second target launch, source wait/gather, tail launch and final chain event. Safe partial-init cleanup and idempotent reset. Inject failure only through an explicit test seam if implemented; invalid preconditions alone do not cover mid-flight failures.",
+      "status": "pending_diff_and_evidence"
+    },
+    {
+      "id": "cancel_and_handoff",
+      "severity": "blocker",
+      "invariant": "Cancellation, budget continuation, cache save/restore, slot reuse, slot-to-solo handoff and shutdown must settle the slot chain and stage commits before mutable state is touched. Disabling the feature flag is not itself a drain.",
+      "verification": "Integration: cancel one slot while seven continue, immediately reuse canceled slot, recover same request, and verify other outputs/state. Use captrue on both arms for thinking-boundary cases.",
+      "status": "pending_diff_and_evidence"
+    },
+    {
+      "id": "shared_layout_validation",
+      "severity": "blocker",
+      "invariant": "Explicit shared prepare must validate source device, geometry N, vocabulary count, head/subset/dvocab identity and layout/type. Propagate trusted dhead_plain metadata. Preserve owned-head checks on the standalone initializer; do not broadly allow borrowed/repacked/Q4/full-vocab heads.",
+      "verification": "Negative shared-init tests for uninitialized owner, wrong source/type/shape/target metadata and already initialized workspace; rejected calls leave owner and other clones intact.",
+      "status": "pending_diff_and_evidence"
+    },
+    {
+      "id": "numerical_tail",
+      "severity": "blocker",
+      "invariant": "Keep exact raw Q6_K53120/53179 row shards from106299 subset, N2560, exact Q8_1 bytes and original row order. Preserve arbitrary-N32-bit word copies for odd logits counts. Run original source argmax, both probability variants, dvocab mapping, mtp_select and forced-token logic.",
+      "verification": "For each of8 slots and multiple steps compare all106299 logits bitwise, probabilities by float bits, local argmax/global mapping and nonfinite checks. Include zero/tie inputs and differing slot inputs.",
+      "status": "pending_diff_and_evidence"
+    },
+    {
+      "id": "sampled_target_guard",
+      "severity": "blocker",
+      "invariant": "Eligibility is actual drafter greedy state (!coupled_active_), not target request temperature. Existing piped proposals remain greedy even for sampled/penalized/biased target requests. If coupled draft sampling activates, select the original supported path or explicitly reject; never run greedy split tail under coupled mode.",
+      "verification": "Integration covers sampled targets, greedy targets, penalties and bias; separate negative coupled-drafter guard check. Record actual offloaded slot steps, not just startup flag.",
+      "status": "pending_diff_and_evidence"
+    },
+    {
+      "id": "default_off_scope",
+      "severity": "blocker",
+      "invariant": "New flag defaults off and is gated by actual piped_mtp, prepared solo bank and supported backend. No slot workspace allocation/capture when off. Admission draft_first, prefill paths, normal solo behavior and existing flag semantics stay unchanged.",
+      "verification": "Source review plus same-binary flagoff parity and original rebuilt/deployed defaultoff compatibility as required. Unsupported Metal stub remains linkable; HIP compile support must not be described as GPU validated.",
+      "status": "pending_diff_and_evidence"
+    },
+    {
+      "id": "evidence_and_capacity",
+      "severity": "release_gate",
+      "invariant": "Shared weights uploaded once per two-target bank, with per-slot workspace memory measured after all graph capture. Keep8slots, all experts and own3.80GiB prompt buffers; compare exact W16 allocation evidence and100k matching. Freeze source/binary/lib/server/harness and distinguish captrue/capfalse.",
+      "verification": "After low-level pass, same-binary headflagoff/on with ordinary pipedMTP and captrue fixed: C4/C8 exact correctness/cancel/continuation, actual per-slot route counters, acceptance, completed API token throughput, worst-lane gaps,100k prefill and per-card memory/clocks/power. No deployment conclusion from GPU utilization alone.",
+      "status": "pending_diff_and_evidence"
+    }
+  ],
+  "review_file_anchors": [
+    "include/strata/core/mtp_head.hpp",
+    "src/core/mtp_head.cpp::init/enqueue/drain/reset",
+    "src/core/mtp.cpp::~MtpDrafter/bind/prepare_head_shards/prepare_chain/chain_launch/chain_poll",
+    "src/program/generate.cpp::slot_mtp initialization/pmtp_verdict/pmtp_settle",
+    "tests/core/mtp_head_test.cpp (single-helper coverage is insufficient for concurrent clones)"
+  ],
+  "minimum_new_gpu_test_markers_suggested": [
+    "MTP_HEAD_SHARED_8_SLOT_BITWISE",
+    "MTP_HEAD_SHARED_OWNER_LIFETIME",
+    "MTP_HEAD_SHARED_STEP0_REUSE"
+  ],
+  "limits": [
+    "Review checkpoints are requirements, not claims that tests have passed.",
+    "Early workspace/bank owner destruction and early full MtpDrafter destruction are different contracts.",
+    "No runtime speed or correctness guarantee is inferred from this checklist."
+  ]
+}

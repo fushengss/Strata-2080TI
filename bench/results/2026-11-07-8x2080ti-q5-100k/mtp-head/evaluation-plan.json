@@ -1,0 +1,23 @@
+{
+  "hardware": "10.100.3.3, 8x RTX 2080 Ti 22 GiB",
+  "baseline": "Deployed 235e2021 main head on GPU2,4, groups8, uniform six-layer stages; candidate MTP_HEAD flag=-1.",
+  "cold_prefill": "Each code/prose prompt has an uncached ~101k prefix; compare engine read time, also report client TTFT",
+  "decode": "Matched fixed prompts, output hashes and token counts; engine full-decode and client first-to-last rates reported separately",
+  "validation": "Same-binary ABBA, 3 repeats per code/prose, cold and warm, short append; fixed-seed/fallback correctness, two concurrent requests, cancellation recovery, logprobs compatibility; final internal logits, argmax, probabilities and token mapping bitwise parity; chained asynchronous events and buffer reuse.",
+  "deployment_conditions": {
+    "output_parity": "All corresponding requests exact; low-level full logits and shard merge parity pass",
+    "decode": "At least 1% median benefit on both code and prose, with most matched cases improving; single pilot insufficient",
+    "prefill": "No sustained regression: cold read medians no more than 2% slower per workload; inspect warm restore and append separately, rerun any material regression",
+    "runtime": "No CUDA/nonfinite/API failures, intended routes actually used; all original prefill flags and layers unchanged"
+  },
+  "not_a_guarantee": "Fixed synthetic workloads and actual Q5. No Q4 model switch. Need independent default-off old-binary comparison. Original prefill, main-head, slots and CPU policy stay fixed.",
+  "candidate": "MTP draft-head rows split across GPU3,5, exact complete logits returned to GPU7 for unchanged probability tail; greedy solo PW2 only."
+  ,"frozen_configuration": {
+    "main_head": "STRATA_DECODE_HEAD_GPU=2,4 in every arm",
+    "variable": "STRATA_MTP_HEAD_GPU=-1 versus 3,5",
+    "candidate_sha256": "113a4ea9bf2101a9ad9a3449ae611f8a21f892cc62293fa9a779d302dc2df96f",
+    "original_sha256": "372da958cd4b1ba25b2ab42a7e92480c4cb31973994ebc8d8355e5644766fc22"
+  },
+  "performance_evidence": "Fixed performance requests must finish at length with completion_tokens=max_tokens. Require one matched full-request draft acceptance record with 0<=accepted<=proposed; report accepted/proposed and rate (null when proposed=0). Require equal finish reasons across corresponding arms.",
+  "freeze": "Runner records and checks hashes of all five execution scripts, both evaluators and this plan before every arm; hash manifest is external to these files."
+}

@@ -1,0 +1,137 @@
+{
+  "plan": {
+    "version": 1,
+    "objective": "Prioritize concurrent decode stability while admitting intermittent new prefills; no engine or service changes.",
+    "primary_resident_concurrency": 4,
+    "resident_concurrency_levels": [
+      4,
+      2,
+      8
+    ],
+    "resident_context_nominal_tokens": 10000,
+    "resident_output_tokens": 2048,
+    "injected_prefill_nominal_tokens": [
+      10000,
+      60000
+    ],
+    "injected_output_tokens": 64,
+    "baseline_seconds": 5,
+    "injection_interval_seconds": 8,
+    "recovery_seconds": 10,
+    "recovery_bin_seconds": 2,
+    "recovery_baseline_fraction": 0.9,
+    "recovery_consecutive_bins": 2,
+    "resident_ready_timeout_seconds": 120,
+    "request_ttft_timeout_seconds": 45,
+    "request_silence_timeout_seconds": 30,
+    "request_total_timeout_seconds": 240,
+    "resident_drain_timeout_seconds": 30,
+    "scenario_total_timeout_seconds": 240,
+    "occupancy_sample_seconds": 0.25,
+    "prompt_count_tolerance_fraction": 0.1,
+    "temperature": 0.8,
+    "seed": 20261107,
+    "schedule": [
+      "Refuse to begin unless the existing loopback service is loaded and reports zero requests in flight.",
+      "Run each selected concurrency level sequentially. Levels count resident workers; one injected request is additional admission pressure.",
+      "Require all resident streams to have produced nonempty reasoning/content/tool output and to remain active with output in the last second for the stable-ready interval before baseline.",
+      "Measure resident-only baseline, then inject the six nominal 10k/60k requests at fixed planned offsets, serializing injections if an earlier one is still pending.",
+      "Resident requests refill after natural completion, reusing their lane's synthetic prefix. Record refill/admission gaps rather than assuming constant active decode.",
+      "After the last injected request completes, measure recovery, stop refills, and allow bounded natural drain. Close only this client's sockets if a timeout occurs.",
+      "Never clear caches, read serving logs, send administrative requests, start/stop servers, or change configuration."
+    ],
+    "cold_request_rule": "Fresh synthetic early prefix for each injected request; confirm exact prompt_tokens and cached_tokens from API usage. A nonzero or missing cached count is not labeled verified zero-cache.",
+    "admission_note": "Eight resident streams plus one injected request intentionally exceed an eight-slot engine; resulting queue TTFT is measured, not treated as nine active GPU slots.",
+    "metrics": {
+      "latency": [
+        "TTFT to first nonempty reasoning/content/tool delta; first visible content, first reasoning and first tool delta are separate",
+        "Per-channel and combined inter-output-chunk gap p50/p95/p99/max; no per-token TBT",
+        "Terminal silence lower bound for failed/cancelled streams; active-stream counter with no new output in the last second"
+      ],
+      "throughput": [
+        "all-output UTF-8 bytes per second (reasoning/content/tool name+arguments); visible-content byte rate separately",
+        "usage-weighted per-chunk token estimates where final usage is available",
+        "byte/4 fallback explicitly marked heuristic for incomplete streams",
+        "completed-request API token count divided by whole scenario time; lower bound if usage is missing"
+      ],
+      "fairness": "Per-resident-lane all-output byte rate and Jain index in the same wall-time windows; includes reasoning/tool text, refills and zero-output intervals. This is a progress proxy, not equal work or token fairness.",
+      "recovery": "First of the configured consecutive bins after injection completion reaching 90% of baseline aggregate resident all-output byte rate; descriptive progress metric.",
+      "occupancy": "Client-side requests in flight and streams that have produced first content, sampled every 250 ms; neither equals confirmed GPU occupancy."
+    },
+    "interpretation": [
+      "SSE chunks can contain multiple tokens or partial textual tokens. There is no per-token timestamp; inter-chunk gaps must not be called token TBT.",
+      "Per-chunk token allocation from final usage and visible bytes is a throughput estimate, never measured token boundary timing.",
+      "TTFT includes client processing, queue/admission, prefix handling, prefill and first output. The first-content bound is only a prefill/admission proxy.",
+      "The default six injections give only three observations per prompt size and level; p95/p99 are descriptive order statistics, not stable tail-SLO estimates.",
+      "Prioritize lower resident tail gaps/stalls and injected TTFT, fair progress and recovery. Throughput alone does not pass a candidate.",
+      "Compare matched configurations and actual prompt/cache counts; no automatic performance pass threshold or deployment is performed."
+    ],
+    "execution_guard": "Dry-run by default; short profile by default. Sending HTTP requires --execute --exclusive-benchmark --port --config --out, loopback only.",
+    "thinking_enabled": true,
+    "resident_ready_stable_seconds": 2,
+    "minimum_baseline_occupancy_fraction": 0.95,
+    "profiles": {
+      "full": {
+        "resident_concurrency_levels": [
+          1,
+          2,
+          4,
+          8
+        ]
+      },
+      "short": {
+        "resident_concurrency_levels": [
+          4,
+          2,
+          8
+        ],
+        "resident_context_nominal_tokens": 10000,
+        "resident_output_tokens": 2048,
+        "injected_prefill_nominal_tokens": [
+          10000,
+          60000
+        ],
+        "baseline_seconds": 5,
+        "injection_interval_seconds": 8,
+        "recovery_seconds": 10,
+        "recovery_bin_seconds": 2,
+        "resident_ready_timeout_seconds": 120,
+        "request_ttft_timeout_seconds": 45,
+        "request_silence_timeout_seconds": 30,
+        "request_total_timeout_seconds": 240,
+        "resident_drain_timeout_seconds": 30,
+        "scenario_total_timeout_seconds": 240
+      }
+    },
+    "sampling_profiles": {
+      "greedy": {
+        "temperature": 0
+      },
+      "sampled": {
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "top_k": 20
+      }
+    },
+    "profile_notes": [
+      "short is an admission/stability qualification with nominal 10k resident contexts, not a 100k result; --resident-context-tokens 100000 can explicitly override it.",
+      "Run greedy and sampled as separate invocations/directories with otherwise matched plan/configuration. Do not pool their metrics.",
+      "Prioritize short level4, then level2; level8+intruder is a capacity/queue case, not a four-resident preemption case.",
+      "No tools are executed. Parsing recognizes content, reasoning and tool-call deltas, with separate first-arrival and channel-gap clocks."
+    ],
+    "top_p": 0.95,
+    "top_k": 20,
+    "profile": "short",
+    "sampling_profile": "sampled"
+  },
+  "levels": [
+    4
+  ],
+  "fixture_id": "piped-read-guard-v1",
+  "port": 8092,
+  "exclusive_benchmark_acknowledged": true,
+  "script_sha256": "3c019afbcd75d7a183ce1089aea49ffd21abadf8aba85445573c369996c43b8f",
+  "plan_sha256": "7cff12d7353c1fdf3d5847bd8e50debe16318ca8a90449535a080fe16a35f426",
+  "started_epoch": 1794058249.7575915,
+  "privacy": "Only synthetic request/response hashes, byte counts and timings; no text, credentials, logs or tools executed."
+}

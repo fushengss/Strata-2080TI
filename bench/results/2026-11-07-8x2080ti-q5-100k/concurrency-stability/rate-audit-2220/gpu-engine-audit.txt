@@ -1,0 +1,88 @@
+GPU 利用率与并发 decode 调度：只读引擎审计
+日期：2026-11-07
+源码：/Users/fu/project/HAI/Strata-decode-head
+范围：源码与已有本地测量。未运行新推理，未操作远端 GPU，未修改服务代码或配置。
+
+结论
+
+当前 8 slots / PP8 / groups8 的并发工作主要是八组请求的流水线，不是每张 GPU 同时算八请求的大矩阵。最重要的新发现是：已配置的 main head GPU2/4 只接入 solo PW2 路径；当前 batch/piped verifier 的主输出 head 仍在 GPU7。已接入并发的 offload 是 MTP draft 词表 head GPU3/5。GPU7 因此仍承担末段六层、主词表投影、各 slot 的 MTP body/KV/最终选择，以及 sampled target 的采样。
+
+已有 head-reverse/01-on C8 同时出流区间的 GPU 审计显示：GPU0..6 平均 utilization 约 54–65%，GPU7 96.57%，GPU7 平均 248.85 W、SM 1647.5 MHz，其他卡 SM 约 1810–1860 MHz。见同目录 gpu-util-audit.*。这是末段不均衡的直接观测，与上述代码位置相符；它不能独自量化每个内核的占比，也不能仅凭功率和时钟就断言 power cap。不要将八卡平均利用率解释成每张卡都有同样比例的空闲，更不要据此承诺尚有 1/0.6 倍的性能。
+
+主控完成的新 C8 复跑补证（本审计者未运行）：同日台北 22:40:10.195–22:40:26.801 共同出流窗口，裁两端各 1 秒后每卡 27 个采样点。GPU7 utilization 97.81%，248.91 W / enforced 250 W，SM 1688.3 MHz；sw_power_cap 27/27，SW/HW thermal 与 power-brake 均 0/27。其他卡 utilization 55.44–65.78%，只有 GPU5 间歇 sw_power_cap 4/27。API 整场 272.1246 tok/s、native batch 300.3 rows/s。见同目录 gpu-power-live-audit.json/txt。这次有 throttle reason，已直接确认窗口中 GPU7 持续受功率上限约束；仍不能从这些标量单独计算卸载某内核的收益。两种吞吐的时间区间不同，不能混作一个端到端指标。
+
+1. 首要原因：batch 主输出 head 尚未分担，末段还有所有 slot 的 MTP body
+
+代码事实：
+- /Users/fu/project/HAI/Strata-decode-head/src/core/verify.cpp:4327 的 batch_launch_rows 只启动 exec_bm_，随后启动 save_bm_；4339–4340 没有选择或调用 remote main head。
+- /Users/fu/project/HAI/Strata-decode-head/src/core/verify.cpp:4670：stage_batch 明确清除 last_decode_head_。
+- /Users/fu/project/HAI/Strata-decode-head/src/core/verify.cpp:5208：prepare_decode_head 只在局部作用域把 record_decode_head_ 设为 true（5212–5215），准备的是单窗口 capture(T) 图。
+- /Users/fu/project/HAI/Strata-decode-head/src/core/verify.cpp:5322 明确注明“Only PW2 decode enables this”；5323–5338 才在 pl_launch 选择 exec_decode_head_ 并启动 helper。它不是 batch_launch_rows 所走的分支。
+- /Users/fu/project/HAI/Strata-decode-head/src/core/verify.cpp:2618：只有 record_decode_head_ 才发布 Q8 activation 并跳过本地 head；普通 batch 图继续执行 2630–2635 的 native_mmvq_il/native_mmvq，位于 last stage。
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:7108：MTP 主体与 last-stage residual 同卡；7196–7222 的全部 slot drafter 共享该设备上的权重、拥有自己的状态/stream。
+- /Users/fu/project/HAI/Strata-decode-head/src/core/mtp.cpp:1160：record_rest 包括 draft attention/专家/混合等 body，1165 的 T=1。1359 的 head_body_only 只在最终 Q8 activation 形成后退出。
+- /Users/fu/project/HAI/Strata-decode-head/src/core/mtp.cpp:2082：split chain 仍先在 source stream 跑 body，然后调用 head_shards_.enqueue，再在 source 跑 head_tail。
+- /Users/fu/project/HAI/Strata-decode-head/src/core/mtp_head.cpp:243–257：activation 经 portable mapped buffer 到 helpers，source 等两路完成并收回完整 draft logits，原 tail 仍由 source 执行。
+- /Users/fu/project/HAI/Strata-decode-head/docs/MTP_HEAD_SHARDS.md:88–91 也明确说明 target verification 不变。
+
+推断：最后一段比其他六层分段承担更多工作，其他段会等最慢段。当前 GPU7 高忙碌率与此一致。不能把这些空档简单理解为可以再塞任意内核；应先减少限制整条流水线的末段工作。
+
+2. 请求并发主要填 PP，不自动形成每 GPU 的 batch8 GEMM
+
+代码事实：
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:14769：GS = o.batch / o.batch_groups。8/8=1。
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:14773–14774：每组 row capacity = GS * (1 + pm_drafts)。当前 pm_drafts=1，所以通常是一个请求的 current token + 一个 proposal。
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:15130–15146：实际窗口逐 slot 构行，idle slot 不参与，每个 slot 的 draft 行跟在自身 current 行后面。
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:15098、15189–15195：每 stage 同时只持有一个 stage_group；该组的 1–2 行送进 batch_launch_rows。
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:15110–15118：组必须没有旧窗口 inflight 且所有本组 draft chain 已就绪，才能开始下一轮；不就绪则尝试另一组。
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:14940–14961：新 draft 要等最后 stage 的 residual，先复制并用 event 串起 chain，随后该组才具备下一轮启动条件。
+
+因此并非完全“没有 batching”：验证器有 multi-row kernel，MoE 调用 grouped expert kernel（/Users/fu/project/HAI/Strata-decode-head/src/core/verify.cpp:2378），PLE 投影也有 multi-row 形式（1508–1519）。但当前每组最多两个相关 token，不是八个独立请求的八行共享权重计算。all-resident 消除了专家搬入，不会消除小矩阵、数据依赖与流水线气泡。
+
+推断：单组循环的末段/head/draft 延迟、阶段间不均衡和 ready 组数量共同限制 occupancy。不能套用训练 GPipe 的单个固定填充/排空公式来计算这条连续自回归闭环的实际利用率。
+
+3. stage 推进依赖主机轮询；sampled target 还会阻塞整个 pump
+
+代码事实：
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:15029–15042：主机逐 stage batch_poll，确认完成后才把组移到下一 stage；后面的 15097–15195 再启动等待组。
+- /Users/fu/project/HAI/Strata-decode-head/src/core/verify.cpp:5072–5079：batch_poll 查询 compute/copy stream，最后 stage 再 sample_rows。
+- /Users/fu/project/HAI/Strata-decode-head/src/core/verify.cpp:4924–4942：sample_rows 对每个需要抽样/penalty/bias 的 row 调用 sample_tokens，然后 cudaStreamSynchronize(cs_)。这一同步位于公共 pump 线程内；等待期间它不能继续推进其他 stage。plain greedy 在 4896 直接跳过这部分。
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:11326–11335：段间 handoff 是 cudaHostAllocMapped | cudaHostAllocPortable 分配的 host buffer。
+- /Users/fu/project/HAI/Strata-decode-head/src/core/verify.cpp:1443–1448、2520–2529：每 stage 从 handoff 读 residual/bo/inject、结束时写下一段 handoff。当前无 P2P 并不意味着专家仍从 CPU 计算，但这些段间依赖与 host-mapped 传输仍存在。
+
+重要排除项：不能把当前全显存 steady decode 泛称为“逐层 CPU 专家等待”。/Users/fu/project/HAI/Strata-decode-head/src/core/verify.cpp:2386–2389 明确使用 all-resident device plan，no doorbell/no CPU rows；4974–4988 的 batch_serve 在 ar_on() 时绕过逐层服务，只保留需要的 PLE flag。是否实际出现 residency loan/miss 必须检查对应窗口统计。
+
+推断：sampled 与 greedy 的 host stall 差异值得单独测；mapped handoff/host polling 的存在不能证明 PCIe 带宽饱和或 CPU 是主要瓶颈。要分开测 GPU7 关键路径、stage wait 和 host launch/poll 时间。
+
+4. 新 prompt admission 会排空并打断 decode，不能拿业务全程平均值代替 steady decode
+
+代码事实：
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:15278–15285：新指令/请求进入时先 pipe_drain，活跃组先完成。
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:15266–15269：drain 后还 pmtp_settle；14967–14975 等 draft chain 和各段 commit stream。
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:14212–14240：即便使用已默认启用的 direct slot copy，也要在所有 stage device 上复制前/后同步；14278–14288 另复制 MTP KV 并同步。
+- /Users/fu/project/HAI/Strata-decode-head/serve/server.py:4251–4252 开启 direct copy/batchsync，不能错误声称当前默认走旧 host roundtrip，但 direct copy 本身仍有同步边界。
+- /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:17303–17320：prefill 与 decode 的真正 concurrent read 是另一个显式 opt-in 路径；未设置 STRATA_PIPED_CONCURRENT 时关闭。当前配置按 root 已核验的状态为关闭。
+
+已有测量：/Users/fu/project/HAI/Strata/bench/results/2026-11-07-8x2080ti-q5-100k/concurrency-stability/RESULTS.md:36 报告混合阶段仍有约 10 秒 SSE gap；53–63 的独立 guard 测试虽然将最大 gap 10.246→6.470 秒，却令整场吞吐 104.817→91.165 tok/s（−13.024%），52k read 9.972→22.608 秒。该方案未部署。不能为了提高仪表上的忙碌率直接重启该切片策略。
+
+下一步优先级与正确性边界（建议，尚未实现或测得收益）
+
+P1：把主输出 head 的分担接入 batch/piped deferred-commit verifier。
+- 首先只改 decode 目标验证路径，保留原 prefill 层分配、buffer、chunk 和 admission 路径。复用已有 GPU2/4 head 权重/分片的可能性需要确认对象生命周期和 workspace；不要按 slot 重复上传整份 head。
+- 当前 solo TP2 fastpath 只能合并 greedy argmax。/Users/fu/project/HAI/Strata-decode-head/src/core/verify.cpp:5326 明确排除了双 helper 的 sampled 情况。并发业务不能把 sampled target 偷换成 greedy。
+- 第一版应让 helpers 计算完整词表各自分片，逐位重建原 logits，并保留原 slot_row_draw/sample_tokens 的 Philox(seed,position)、temperature/top-k/top-p、penalty/history、bias 与 nonfinite 处理。之后才讨论跨分片抽样算法；不能只交换每分片 argmax。
+- 必须保持每组/每 slot 的 row 映射、saved state、accepted prefix 和最终 residual。若要在 remote head 尚未完成时释放 GPU7 body 给下一个组，要为这些数据与 logits 提供独立 workspace/event 和 pending-head 状态，避免现有 vk.final_R_all()/last_rows_/head_logits_ 被后续组覆盖。
+- 验证至少覆盖 mixed sampled+greedy、MTP 接受/拒绝、cancel/reuse、预算边界、长上下文；对照完整输出/usage/finish，并验证 100k prefill 不退化。新增明确 per-path counter，防止仅看到配置就以为路径生效。
+
+P2：将 sampled batch 的同步尾部改为异步完成状态。
+- sample_rows 仍在 GPU 上执行正确原算法，但 completion 用 event/poll 分阶段收尾，不让公共 pump 在 GPU7 采样上 cudaStreamSynchronize。
+- 必须保护每组采样参数、position/history 和输出 buffer 生命周期，不能为了非阻塞而读取未完成结果。这项收益需与主 head offload 分开 A/B。
+
+P3：确认 P1/P2 后仍由 MTP body 限制，再做局部 packing 或移动 body 的评估。
+- 优先研究同一 GPU7 上多个 ready slot 的 MTP body 合批以复用共享权重，或只在一个 stage 已有多个 ready group 时合并 kernel 的行。它们都需要严格保留各 slot 的 KV、position、采样和 commit 语义。
+- 不应笼统把 groups8 改 groups4：固定 8 slots 会从八组变四组，行数增加但同时在八段内流动的组数减半，可能加大空泡。增加至 16 slots 同样要先核对 KV/drafter 显存和长上下文 admission 成本，不能假设专家已放下就有足够所有状态显存。
+- 若移动整个 MTP body，需要处理 draft dense/expert 权重与 KV 所在设备；只加 GPU 参与并不自动产生收益。此项比主 head 接入 batch 的改动和正确性边界更大，应后置。
+
+验证方向
+
+现成 /Users/fu/project/HAI/Strata-decode-head/include/strata/program/pipe_probe.hpp:5–10 的 STRATA_P4_TIMING/TRACE 可分别记录 stage duration、stage gap、ready/starved、host launch/poll、inflight groups。与真正共同 decode 窗口的 GPU clocks/power/throttle/accepted-output counter 对齐，再用有限 kernel profile 拆 GPU7 的目标六层、main head、MTP body、采样和等待。P4 的 launch-to-done 是 stage in-flight wall time，不能当作 GPU kernel active 时间。当前审计未开启这些开关，也未新增推理。

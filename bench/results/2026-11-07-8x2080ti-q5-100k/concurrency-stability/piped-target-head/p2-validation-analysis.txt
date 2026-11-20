@@ -1,0 +1,93 @@
+Independent P2 validation audit
+Status: COMPLETE_CORRECTNESS_IDENTITY_PASS
+Recommendation: REVIEW_PERFORMANCE_AND_PREFILL_SPREAD_NO_AUTOMATIC_DEPLOYMENT
+off: COMPLETE
+  prefill: COMPLETE
+    async windows=0, sampled rows=0; work counters, not accepted outputs.
+    cold median read 16.364 s, TTFT 16.550 s, solo decode 122.200 tok/s; n=3.
+    warm median read 2.199 s, TTFT 2.296 s, solo decode 123.400 tok/s; n=3.
+  c8: COMPLETE
+    async windows=0, sampled rows=0; work counters, not accepted outputs.
+    API 284.346 tok/s including request admission/drain; native 313.112 emitted rows/s.
+  correctness: COMPLETE
+    async windows=0, sampled rows=0; work counters, not accepted outputs.
+    mixed-greedy: history=128, completed=384, reaches window=True.
+    mixed-sampled: history=32, completed=448, reaches window=True.
+    mixed-penalties: history=257, completed=512, reaches window=True.
+  c4mixed: COMPLETE
+    async windows=0, sampled rows=0; work counters, not accepted outputs.
+    Whole scenario API 106.285 tok/s; mixed maximum silence 10.489 s; byte-rate Jain 0.991393.
+  budget: COMPLETE
+    async windows=0, sampled rows=0; work counters, not accepted outputs.
+  long: COMPLETE
+    async windows=0, sampled rows=0; work counters, not accepted outputs.
+    API 26.245 tok/s including request admission/drain; native 34.429 emitted rows/s.
+on: COMPLETE
+  prefill: COMPLETE
+    async windows=0, sampled rows=0; work counters, not accepted outputs.
+    cold median read 16.555 s, TTFT 16.754 s, solo decode 122.400 tok/s; n=3.
+    warm median read 2.215 s, TTFT 2.321 s, solo decode 123.000 tok/s; n=3.
+  c8: COMPLETE
+    async windows=2395, sampled rows=4788; work counters, not accepted outputs.
+    API 283.843 tok/s including request admission/drain; native 312.323 emitted rows/s.
+  correctness: COMPLETE
+    async windows=3402, sampled rows=6795; work counters, not accepted outputs.
+    mixed-greedy: history=128, completed=384, reaches window=True.
+    mixed-sampled: history=32, completed=448, reaches window=True.
+    mixed-penalties: history=257, completed=512, reaches window=True.
+  c4mixed: COMPLETE
+    async windows=5170, sampled rows=10335; work counters, not accepted outputs.
+    Whole scenario API 106.516 tok/s; mixed maximum silence 10.449 s; byte-rate Jain 0.994074.
+  budget: COMPLETE
+    async windows=1652, sampled rows=3298; work counters, not accepted outputs.
+  long: COMPLETE
+    async windows=559, sampled rows=1118; work counters, not accepted outputs.
+    API 25.678 tok/s including request admission/drain; native 34.380 emitted rows/s.
+prefill: exact matched cases=True
+  cold_read_ms_median: 16364 -> 16555 (+1.167% on vs off)
+  cold_ttft_s_median: 16.549945888109505 -> 16.753797290846705 (+1.232% on vs off)
+  cold_decode_tps_median: 122.2 -> 122.4 (+0.164% on vs off)
+  warm_read_ms_median: 2199 -> 2215 (+0.728% on vs off)
+  warm_ttft_s_median: 2.2961222296580672 -> 2.3212283249013126 (+1.093% on vs off)
+  warm_decode_tps_median: 123.4 -> 123.0 (-0.324% on vs off)
+c8: exact matched cases=True
+  api_tokens_per_s: 284.34570679939236 -> 283.8425915296893 (-0.177% on vs off)
+  native_tokens_per_s: 313.11236987140234 -> 312.3234328472169 (-0.252% on vs off)
+  ttft_median_s: 5.346545696258545 -> 5.320419907569885 (-0.489% on vs off)
+  ttft_max_s: 8.08514928817749 -> 8.11397099494934 (+0.356% on vs off)
+  max_inter_chunk_gap_s: 5.4103779792785645 -> 5.44972562789917 (+0.727% on vs off)
+correctness: exact matched cases=True
+c4mixed: exact matched cases=True
+  whole_scenario_api_tokens_per_s: 106.28467293409196 -> 106.51640513397057 (+0.218% on vs off)
+  native_tokens_per_s: 114.08050776682813 -> 114.36704621567314 (+0.251% on vs off)
+  baseline_resident_output_bytes_per_s: 995.3646877609399 -> 997.3603843116698 (+0.200% on vs off)
+  baseline_resident_token_rate_estimate: 251.68345742895346 -> 252.21832667485734 (+0.213% on vs off)
+  baseline_max_observed_no_output_interval_s: 0.0261690616607666 -> 0.02668452262878418 (+1.970% on vs off)
+  baseline_jain_fairness_of_output_byte_rates: 0.9926528825110401 -> 0.99372415715423 (+0.108% on vs off)
+  mixed_resident_output_bytes_per_s: 108.04019218026795 -> 102.28953017691843 (-5.323% on vs off)
+  mixed_resident_token_rate_estimate: 27.459197345306343 -> 25.985739028314125 (-5.366% on vs off)
+  mixed_max_observed_no_output_interval_s: 10.488993644714355 -> 10.448572158813477 (-0.385% on vs off)
+  mixed_jain_fairness_of_output_byte_rates: 0.9913934454491053 -> 0.9940735888868588 (+0.270% on vs off)
+  recovery_resident_output_bytes_per_s: 947.2822707990986 -> 946.4834817431299 (-0.084% on vs off)
+  recovery_resident_token_rate_estimate: 239.84212617187225 -> 239.642704764026 (-0.083% on vs off)
+  recovery_max_observed_no_output_interval_s: 0.026873111724853516 -> 0.027049541473388672 (+0.657% on vs off)
+  recovery_jain_fairness_of_output_byte_rates: 0.9985847757169016 -> 0.998547035564664 (-0.004% on vs off)
+  first_sustained_recovery_start_s: 0.0 -> 0.0 (n/a on vs off)
+  injected-0-10000_ttft_s: 5.809509567916393 -> 5.837159594986588 (+0.476% on vs off)
+  injected-1-60000_ttft_s: 10.087592402938753 -> 10.040379440877587 (-0.468% on vs off)
+budget: exact matched cases=True
+long: exact matched cases=True
+  api_tokens_per_s: 26.244882203654413 -> 25.677663025749595 (-2.161% on vs off)
+  native_tokens_per_s: 34.429217579153445 -> 34.379897871479855 (-0.143% on vs off)
+  ttft_median_s: 44.19281409098767 -> 45.93352270848118 (+3.939% on vs off)
+  ttft_max_s: 70.1621150909923 -> 71.98686308506876 (+2.601% on vs off)
+Pending files, incomplete metadata or missing cleanup/comparison evidence are not a successful test.
+One off/on pair is descriptive; no confidence interval, stable SLO, automatic deployment or promised speedup.
+History coverage proves actual sent 32/128/257 parameters and suite-level asynchronous sampling; there is no independent per-history-row GPU counter.
+Cancellation compares nonempty common prefixes, not equal truncation lengths or cancelled usage. Recovery proves post-cancel correctness, not reuse of a specific physical slot.
+C8 and long API rates use completed logical tokens divided by earliest request start to latest end. Long includes cold prefill/admission and drain.
+Native piped rows are emitted output rows, but native busy-block boundaries differ from API boundaries. Target verification rows and async sampled rows are work, not accepted tokens.
+SSE gaps are chunk-arrival gaps, not per-token TBT. Mixed phase byte rates/fairness and usage-weighted token estimates are progress proxies.
+Mixed resident refills/cancellations may differ by scheduling. Unmatched records are disclosed and never treated as exact output equality.
+Prefill/mixed/long raw text is intentionally absent; channel-digest composition can be verified, but original text bytes cannot be independently rehashed.
+Prefill has only three cold and three warm samples per arm. A small median increase requires review/repetition, not an automatic assertion of regression or no regression.

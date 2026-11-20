@@ -1,0 +1,58 @@
+{
+  "decision": "recommend_not_deploy_this_guard_configuration",
+  "parameters": {
+    "off": [
+      0,
+      0,
+      0
+    ],
+    "on": [
+      16384,
+      1,
+      400
+    ]
+  },
+  "scope": "One guard-only sequential off/on pair, same c930 engine and40c5 server; shared concurrent head and batch/piped MTP on in both.",
+  "all_56_integrity_and_correctness_checks_passed": true,
+  "exact_pairs": {
+    "solo100k_cold_warm": 6,
+    "c4_resident_and_injected": 6
+  },
+  "whole_api_tps_change_pct": -13.024263366457756,
+  "reason": "Longest mixed gap improved, but p99 rose, larger injected prompt TTFT/read cost more than doubled, and whole completed-token throughput fell13.0%.",
+  "mixed": {
+    "off": {
+      "duration_s": 20.67412233352661,
+      "pooled_gap_p99_s": 5.886738964822143,
+      "pooled_gap_max_s": 10.246346982661635,
+      "clipped_stall_counts": {
+        "over_1s": 12,
+        "over_5s": 8
+      },
+      "sampled_any_stalled_over_1s_fraction": 0.7349397590361446,
+      "sampled_any_stalled_over_5s_fraction": 0.3132530120481928
+    },
+    "on": {
+      "duration_s": 33.23753571510315,
+      "pooled_gap_p99_s": 6.218547887168825,
+      "pooled_gap_max_s": 6.47020706301555,
+      "clipped_stall_counts": {
+        "over_1s": 24,
+        "over_5s": 16
+      },
+      "sampled_any_stalled_over_1s_fraction": 0.706766917293233,
+      "sampled_any_stalled_over_5s_fraction": 0.15789473684210525
+    }
+  },
+  "qualification": [
+    "Actual C4 resident context8776, injected8776/52063; nominal10k/60k tolerance fails in both arms and is retained.",
+    "Stall counts span different mixed durations20.674/33.238s; counts are not normalized rates.",
+    "400ms is requested decode budget, not guaranteed maximum output gap.",
+    "No claim of a stable effect or confidence interval from one pair."
+  ],
+  "evidence_sha256": {
+    "analyze.py": "4991ade9bb7e084ff30629f80bddb283e7360b12ef63763ecfc9d73907f34076",
+    "summary.json": "950adda9393898e9e22fd3d59d2b75243996161bc57662b93e8ff827c126ccbe",
+    "README.md": "caddecd812db6c37251e8126e464a3b0f03b2cce0f4a5429fe5e66f6754d80a4"
+  }
+}

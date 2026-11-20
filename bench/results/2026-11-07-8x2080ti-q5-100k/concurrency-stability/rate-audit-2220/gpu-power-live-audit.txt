@@ -1,0 +1,20 @@
+Current-configuration C8 power audit — local analysis only
+Window: 2026-11-07T22:40:10.195380+08:00 to 2026-11-07T22:40:26.801411+08:00 (16.606s), 8-stream content intersection trimmed 1s per side.
+Short prompts, 8x1024 outputs; not 21:44 or 100k. Source CSV UTC agrees with metadata epoch bounds.
+GPU | n | GPU active % | mem active % | W / enforced limit | SM MHz mean(min-max) | temp C min-max | sw_power_cap active/valid
+0 | 27 | 65.78 | 48.81 | 222.31/250 | 1876.1(1860-1890) | 49-59 | 0/27
+1 | 27 | 57.93 | 40.78 | 205.97/250 | 1872.2(1860-1875) | 52-62 | 0/27
+2 | 27 | 57.59 | 40.74 | 207.45/250 | 1885.6(1875-1905) | 47-55 | 0/27
+3 | 27 | 65.52 | 45.85 | 209.43/250 | 1827.8(1815-1845) | 55-65 | 0/27
+4 | 27 | 55.44 | 41.04 | 204.57/250 | 1854.4(1845-1875) | 50-60 | 0/27
+5 | 27 | 65.74 | 45.04 | 218.10/250 | 1850.6(1845-1860) | 49-60 | 4/27
+6 | 27 | 55.96 | 40.85 | 189.19/250 | 1879.4(1875-1890) | 48-57 | 0/27
+7 | 27 | 97.81 | 74.93 | 248.91/250 | 1688.3(1665-1725) | 54-62 | 27/27
+Eight-GPU mean busy 65.222%; mean total power 1705.92W.
+GPU7: 27/27 sw_power_cap Active; 0/27 each SW/HW thermal slowdown and HW power brake. Power-cap activity is directly observed at every sample, with temperature 54–62C.
+GPU5: sw_power_cap 4/27 (14.81%); all other GPUs 0/27. All GPUs have 0 thermal/HW power-brake flags in this selected window.
+All GPUs memory clocks 6800MHz throughout selected samples. GPU7 SM clock is 1665–1725MHz, others 1815–1905MHz.
+Previous 21:17 run also had GPU7 96.57% busy, 248.85W and 1647.5MHz; it did not record reason flags. Current controlled run reproduces imbalance and identifies GPU7 power-cap activity.
+Full API throughput 8192/30.1038575s=272.1246 tokens/s; native batch 8181/27.247s=300.3 rows/s rounded. These full-run denominators differ from the selected interior window.
+No measured claim about speedup from raising power limit. No restart, configuration edit or power-limit change according to probe metadata.
+Reproduce: python3 gpu-power-live-audit.py

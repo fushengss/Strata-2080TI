@@ -1,0 +1,514 @@
+{
+  "purpose": "Reproduce the semantics of the deployed webpage Decode now / legacy ANSWER rate",
+  "synthetic_timeline_only": true,
+  "network_or_gpu_used": false,
+  "source_modified": false,
+  "provenance": {
+    "server_path": "/Users/fu/project/HAI/Strata-decode-head/serve/server.py",
+    "server_sha256": "40c5e9dfc96ab208b6514bd2f5f48986afb3e01b3927f873cff8d358d62528c9",
+    "function": "Service._rate_of",
+    "function_line": 5589,
+    "function_end_line": 5597,
+    "function_source": "def _rate_of(s, rate):\n        if not s.get(\"busy\") or not s.get(\"first_token\"):\n            return 0.0\n        now = time.time()\n        newest = rate[-1] if rate else None\n        oldest = next(((t, g) for t, g in rate if now - t <= RATE_WINDOW_S), None)\n        if newest and oldest and newest[0] - oldest[0] >= RATE_MIN_SPAN_S:\n            return max(0.0, (newest[1] - oldest[1]) / (newest[0] - oldest[0]))\n        return s[\"generated\"] / max(RATE_MIN_SPAN_S, now - s[\"first_token\"])",
+    "function_source_sha256": "bde4d33705e69c805dfa0471271de99704bde8e860e383c7bdd128ce6a3762c6",
+    "constants": {
+      "RATE_WINDOW_S": 2.0,
+      "RATE_MIN_SPAN_S": 0.25
+    },
+    "constant_lines": {
+      "RATE_WINDOW_S": 312,
+      "RATE_MIN_SPAN_S": 313
+    },
+    "per_request_deque_line": 6298,
+    "per_request_deque_source": "rate = collections.deque(maxlen=32) if par else self.rate",
+    "per_request_deque_maxlen": 32,
+    "append_per_token_line": 6147,
+    "aggregation_line": 5576,
+    "execution": "AST extraction; original _rate_of body unchanged; only time.time is a fixed clock"
+  },
+  "script_sha256": "320ae7910a8a95e0e5478b54d9aab81ff5792968b5fd9e45b7ee596ba704c37b",
+  "all_checks_passed": true,
+  "cases": [
+    {
+      "name": "steady_50_tps",
+      "now": 100.0,
+      "seconds_without_output": 0.0,
+      "state": {
+        "busy": true,
+        "first_token": 70.0,
+        "generated": 1501
+      },
+      "rate_samples": [
+        [
+          99.38,
+          1470
+        ],
+        [
+          99.4,
+          1471
+        ],
+        [
+          99.42,
+          1472
+        ],
+        [
+          99.44,
+          1473
+        ],
+        [
+          99.46000000000001,
+          1474
+        ],
+        [
+          99.48,
+          1475
+        ],
+        [
+          99.5,
+          1476
+        ],
+        [
+          99.52,
+          1477
+        ],
+        [
+          99.53999999999999,
+          1478
+        ],
+        [
+          99.56,
+          1479
+        ],
+        [
+          99.58,
+          1480
+        ],
+        [
+          99.6,
+          1481
+        ],
+        [
+          99.62,
+          1482
+        ],
+        [
+          99.64,
+          1483
+        ],
+        [
+          99.66,
+          1484
+        ],
+        [
+          99.68,
+          1485
+        ],
+        [
+          99.7,
+          1486
+        ],
+        [
+          99.72,
+          1487
+        ],
+        [
+          99.74,
+          1488
+        ],
+        [
+          99.76,
+          1489
+        ],
+        [
+          99.78,
+          1490
+        ],
+        [
+          99.8,
+          1491
+        ],
+        [
+          99.82,
+          1492
+        ],
+        [
+          99.84,
+          1493
+        ],
+        [
+          99.86,
+          1494
+        ],
+        [
+          99.88,
+          1495
+        ],
+        [
+          99.9,
+          1496
+        ],
+        [
+          99.92,
+          1497
+        ],
+        [
+          99.94,
+          1498
+        ],
+        [
+          99.96000000000001,
+          1499
+        ],
+        [
+          99.98,
+          1500
+        ],
+        [
+          100.0,
+          1501
+        ]
+      ],
+      "samples_kept": 32,
+      "kept_samples_span_s": 0.6200000000000045,
+      "oldest_eligible_sample": [
+        99.38,
+        1470
+      ],
+      "newest_sample": [
+        100.0,
+        1501
+      ],
+      "branch": "last_sample_minus_first_sample",
+      "denominator_s": 0.6200000000000045,
+      "displayed_per_request_tps": 49.99999999999963,
+      "actual_common_window_s": 2.0,
+      "actual_common_window_new_tokens": 100,
+      "actual_common_window_per_request_tps": 50.0,
+      "eight_identical_requests_displayed_sum_tps": 399.99999999999704,
+      "eight_identical_requests_actual_common_window_tps": 400.0
+    },
+    {
+      "name": "one_second_without_output",
+      "now": 100.0,
+      "seconds_without_output": 1.0,
+      "state": {
+        "busy": true,
+        "first_token": 70.0,
+        "generated": 1451
+      },
+      "rate_samples": [
+        [
+          98.38,
+          1420
+        ],
+        [
+          98.4,
+          1421
+        ],
+        [
+          98.42,
+          1422
+        ],
+        [
+          98.44,
+          1423
+        ],
+        [
+          98.46000000000001,
+          1424
+        ],
+        [
+          98.48,
+          1425
+        ],
+        [
+          98.5,
+          1426
+        ],
+        [
+          98.52,
+          1427
+        ],
+        [
+          98.53999999999999,
+          1428
+        ],
+        [
+          98.56,
+          1429
+        ],
+        [
+          98.58,
+          1430
+        ],
+        [
+          98.6,
+          1431
+        ],
+        [
+          98.62,
+          1432
+        ],
+        [
+          98.64,
+          1433
+        ],
+        [
+          98.66,
+          1434
+        ],
+        [
+          98.68,
+          1435
+        ],
+        [
+          98.7,
+          1436
+        ],
+        [
+          98.72,
+          1437
+        ],
+        [
+          98.74,
+          1438
+        ],
+        [
+          98.76,
+          1439
+        ],
+        [
+          98.78,
+          1440
+        ],
+        [
+          98.8,
+          1441
+        ],
+        [
+          98.82,
+          1442
+        ],
+        [
+          98.84,
+          1443
+        ],
+        [
+          98.86,
+          1444
+        ],
+        [
+          98.88,
+          1445
+        ],
+        [
+          98.9,
+          1446
+        ],
+        [
+          98.92,
+          1447
+        ],
+        [
+          98.94,
+          1448
+        ],
+        [
+          98.96000000000001,
+          1449
+        ],
+        [
+          98.98,
+          1450
+        ],
+        [
+          99.0,
+          1451
+        ]
+      ],
+      "samples_kept": 32,
+      "kept_samples_span_s": 0.6200000000000045,
+      "oldest_eligible_sample": [
+        98.38,
+        1420
+      ],
+      "newest_sample": [
+        99.0,
+        1451
+      ],
+      "branch": "last_sample_minus_first_sample",
+      "denominator_s": 0.6200000000000045,
+      "displayed_per_request_tps": 49.99999999999963,
+      "actual_common_window_s": 2.0,
+      "actual_common_window_new_tokens": 50,
+      "actual_common_window_per_request_tps": 25.0,
+      "eight_identical_requests_displayed_sum_tps": 399.99999999999704,
+      "eight_identical_requests_actual_common_window_tps": 200.0
+    },
+    {
+      "name": "three_seconds_without_output",
+      "now": 100.0,
+      "seconds_without_output": 3.0,
+      "state": {
+        "busy": true,
+        "first_token": 70.0,
+        "generated": 1351
+      },
+      "rate_samples": [
+        [
+          96.38,
+          1320
+        ],
+        [
+          96.4,
+          1321
+        ],
+        [
+          96.42,
+          1322
+        ],
+        [
+          96.44,
+          1323
+        ],
+        [
+          96.46000000000001,
+          1324
+        ],
+        [
+          96.48,
+          1325
+        ],
+        [
+          96.5,
+          1326
+        ],
+        [
+          96.52,
+          1327
+        ],
+        [
+          96.53999999999999,
+          1328
+        ],
+        [
+          96.56,
+          1329
+        ],
+        [
+          96.58,
+          1330
+        ],
+        [
+          96.6,
+          1331
+        ],
+        [
+          96.62,
+          1332
+        ],
+        [
+          96.64,
+          1333
+        ],
+        [
+          96.66,
+          1334
+        ],
+        [
+          96.68,
+          1335
+        ],
+        [
+          96.7,
+          1336
+        ],
+        [
+          96.72,
+          1337
+        ],
+        [
+          96.74,
+          1338
+        ],
+        [
+          96.76,
+          1339
+        ],
+        [
+          96.78,
+          1340
+        ],
+        [
+          96.8,
+          1341
+        ],
+        [
+          96.82,
+          1342
+        ],
+        [
+          96.84,
+          1343
+        ],
+        [
+          96.86,
+          1344
+        ],
+        [
+          96.88,
+          1345
+        ],
+        [
+          96.9,
+          1346
+        ],
+        [
+          96.92,
+          1347
+        ],
+        [
+          96.94,
+          1348
+        ],
+        [
+          96.96000000000001,
+          1349
+        ],
+        [
+          96.98,
+          1350
+        ],
+        [
+          97.0,
+          1351
+        ]
+      ],
+      "samples_kept": 32,
+      "kept_samples_span_s": 0.6200000000000045,
+      "oldest_eligible_sample": null,
+      "newest_sample": [
+        97.0,
+        1351
+      ],
+      "branch": "whole_request_mean_fallback",
+      "denominator_s": 30.0,
+      "displayed_per_request_tps": 45.03333333333333,
+      "actual_common_window_s": 2.0,
+      "actual_common_window_new_tokens": 0,
+      "actual_common_window_per_request_tps": 0.0,
+      "eight_identical_requests_displayed_sum_tps": 360.26666666666665,
+      "eight_identical_requests_actual_common_window_tps": 0.0
+    }
+  ],
+  "scope": [
+    "The webpage live.tok_s and ANSWER sum each active request rate; they are not one-request rates.",
+    "The 2s cutoff is also capped at32 per-token observations, about0.62s at50 tokens/s.",
+    "The sampled-window denominator stops at the newest token, not the observation time.",
+    "When no eligible recent samples remain, the code returns the whole-request mean rather than zero.",
+    "Rejected MTP drafts and cached prompt tokens are not added to these counters.",
+    "Server-inserted wrap/tool-opening tokens also enter the API generated count.",
+    "The newer Terminal ALL REQUESTS counter-difference metric uses a common time interval; this reproduction does not apply to it.",
+    "This proves that300–400 displayed tokens/s can coexist with lower or zero current output. It does not establish what happened at21:44 without corresponding production observations."
+  ]
+}

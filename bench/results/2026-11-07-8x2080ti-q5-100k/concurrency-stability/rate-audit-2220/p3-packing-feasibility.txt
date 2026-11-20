@@ -1,0 +1,77 @@
+P3：局部 MTP body packing 可行性审计
+2026-11-07；只读源码分析，未实施 packing，未运行 GPU 或远端操作。
+源码：/Users/fu/project/HAI/Strata-decode-head；generate.cpp 行号对应 P2 异步采样工作树。
+
+决定建议
+
+先验证 P1 target head offload、P2 async sampling 后的关键路径，再决定 P3。当前八槽、PP8、groups8、每槽一个 MTP proposal 并不天然提供一个可直接合并的八路 ready batch。最小候选是注意力之后的 MLP/MoE 局部合批，保持各 slot 的 front、KV 和 attention 原路径。仅消费已经自然积压的 ready job，不设置凑批时间，不改变 prefill 分层，也不通过 groups8→4 人为改变流水线组数。
+
+一、当前为何没有天然 ready 批
+
+1. /Users/fu/project/HAI/Strata-decode-head/src/program/generate.cpp:14810：GS = batch / batch_groups，当前8/8=1。
+2. 同文件15081、15096：pump 每轮只检查每 stage 当前一个 stage_group；末 stage 一次完成一个 group，立即调用 pmtp_verdict。15149 的 busy 检查禁止该 stage 同时再运行另一组。
+3. 同文件14918、15006：verdict 为本组每个 active slot 复制 residual 后立即 chain_launch；GS=1 时一次 verdict 只有一个新 draft job。
+4. 同文件14892、15165：pm_drafting 表示已启动但尚未回收的异步 chain；stage0 检查 draft 未完成就跳过该组。多个 pm_drafting 不等于多个尚未提交、可以重新拼接的 body。
+5. /Users/fu/project/HAI/Strata-decode-head/src/core/mtp.cpp:2080–2094：chain_launch 将 body、head 与 tail 按原顺序立即入队。已提交到 CUDA 的多个 graph 不能在 host 端事后改成一个 batched graph。
+
+因此，真实可合批机会取决于末段 verdict 的到达间隔、MTP body 服务时长和 GPU7 争用。若一个 body 在下一个 verdict 到来前已处理完，任何“等第二路”的策略都会直接延迟第一路的下一轮 target decode。P1/P2 可能改变这两个时长的比例，目前不能假设仍有积压。
+
+二、不能把 record_front(T) 当作不同 slot 的 T 行
+
+- /Users/fu/project/HAI/Strata-decode-head/src/core/mtp.cpp:2061–2075：chain_launch 对同一请求按 p+t 生成位置，另用 a 指定最后接受行。
+- 同文件1037–1142：record_front 的输入虽有 T 行，但所有 K/V append 都使用这个 MtpDrafter 的同一 st_、page_table、KV pool 和 host backing；T 表示一个 slot 的 catch-up 行。
+- 同文件1466–1484：capture_round 先 front(T) 写 catch-up KV，再按 a 把选中行的 R/inj/mixed 移到 row0，只为该行执行后半层。
+- 同文件1032、1165：完整 record_forward 限制 T=1，record_rest 也明确 const T=1。
+- 同文件418–445：attention scratch 只按单查询分配；KV window/floor、step、positions、输出 token/probability 都是私有状态，不能通过把 T 改大自动扩展成跨 slot 语义。
+
+即使两个 slot 的 catch-up T 都为2，它们仍是两个独立 KV 序列、两个 a、两个窗口位置。直接拼接成 T=4 会写错 KV，并只保留一个选中行，不是安全优化。
+
+三、推荐的最小候选：post-attention MLP/MoE 合批
+
+候选边界：/Users/fu/project/HAI/Strata-decode-head/src/core/mtp.cpp:1207–1224，attention 输出已写回并完成 MLP mixer 之后。每个 slot 先照旧完成 front、KV append 和 attention，然后形成一份明确的 post-attention ready 记录。
+
+新路径仅对已经 ready 的两路起步（之后才考虑四路）：
+  私有 front/attention → ready event → gather R/mixed/inj2/精确Q8 → packed MoE/最终mixer → scatter各slot finalR/headQ8 → 原各slot head3/5及选择tail。
+
+现成可复用部分：
+- 同文件1271–1293：multi-router/top10、moe_group_resident、moe_grouped_s2 已能表达多 token 的共享权重计算；当前 T=1 没有得到跨 slot 复用。
+- 同文件1305–1337：combine_multi、gr_write_multi、fused mixer 有多行形式。
+- /Users/fu/project/HAI/Strata-decode-head/include/strata/kernels/shared_expert.hpp:73–83：shared_expert_multi 支持最多8行并声明逐行精确语义。现有 MTP 的 shared_rows 是逐行调用，需要为 packed path 使用正确的多行 scratch/输入布局。
+
+仍需明确新增或改造的内容：
+- 新的有限容量 ready/pending 描述，至少含 slot、slot-generation、round、位置、接受行、KV前段完成事件、源/目标 buffer 指针；取消和 slot reuse 不能混到上一请求。
+- 拆分现有 round body graph 为私有前半段、packed后半段和原每slot tail；不能仅在已提交的完整 body 后插一个队列。
+- 共享 packed workspace 和 pack/scatter kernel（或先用逐段精确复制建立基线）；它只共享只读权重，不共享 slot KV。
+- 每个 slot 独立的 gather-ready、packed-done、head/tail-done 事件，以及参与 packed job 时禁止改写原 R/xq 的生命周期。
+- 对 packed 后半段独立 capture graph，key 至少包含 packed行数、相关算子模式；不要让每种 slot排列触发大量新权重或无界 graph。
+- 保持原 router/top10、expert reduction、quantize、shared combine、最终Q8和draft概率的算术顺序。逐位不一致即不作为精确候选部署。
+
+它不需要第一版就写新的多slot KV/attention数学内核。若后续扩展到完整 body，则必须进一步拆开共享 front 投影和各slot KV append；attention 可以评估现有 /Users/fu/project/HAI/Strata-decode-head/include/strata/kernels/qsa_decode_attn.hpp:61–66 的 qsa_decode_attn_slots，但需为每query提供自己的 pools、positions、ids、scratch与窗口边界。unsupported/mixed KV格式必须回退逐slot路径。这是第二阶段，不能作为“只把T调大”的小改动。
+
+四、不凑批的调度约束
+
+- 新 ready job 在 worker 空闲且没有第二个现成 ready job 时立即走原单路；不得等待固定微秒数、未来 verdict 或下一次 poll 来凑两路。
+- 仅在 worker 因现有工作忙碌、自然产生的未提交 ready 队列已有至少两路时合并；idle GPU 上不能为追求 batch 大小人为制造队列。
+- 不把已经提交/正在执行的 body 计为可合批 ready 项。当前调度没有该未提交队列，观测只能估计机会；最终需独立候选验证重新调度的净影响。
+- 初版不更改 groups8、总slot数、prefill切分、MTP draft数量或接受规则，避免无法归因。
+- 为 draft 下游阻塞设置单路优先/逃生条件；确认 stage0 的 draft-wait 与请求停顿没有上升。若几乎总是只有一路ready，则不实施packing。
+- 应比较实际 accepted output tok/s、逐请求尾部停顿、100k prefill和TTFT；更高GPU忙碌率不是验收目标，且不能预先承诺零prefill损失或具体增速。
+
+五、先加独立、默认关闭的 per-slot 观测
+
+建议观测项（无需保存 prompt、输出文本或 token 内容）：
+1. slot-generation/round id，verdict到达时间、residual-copy就绪时间、body提交时间。
+2. 本slot body开始/结束，以及可选 post-attention/MLP边界时间；remote head与tail各自完成时间。
+3. 按真实语义区分未提交ready、已提交body、head pending、draft ready，记录数量分布。
+4. stage0 因 draft未就绪跳过的次数和累计墙钟时间；与last-stage到达间隔对齐。
+5. 相邻两job的 post-attention-ready 与 MoE完成区间重叠，作为局部合批机会估计。它不能被称为已存在的可合批队列或测得的收益。
+
+每 slot/每在途 round 必须有独立 event/timestamp存储。仅在完成事件已就绪后回收数据；不为观测在pump内cudaStreamSynchronize，不覆盖尚未消费的事件。不同GPU的cudaEventElapsedTime不可相减；各device自己的区间分别测，再用host monotonic与事件因果关系对齐。source-stream事件计时包含GPU争用和依赖等待，不等于纯kernel active时间。新增观测本身增加event/node成本，需记录并与无观测对照。
+
+不能直接启用现有 STRATA_MTP_PROFILE 作为并发slot证据：
+- /Users/fu/project/HAI/Strata-decode-head/src/core/mtp.cpp:881–936 只有一个全局 g_mp、单一device stamp buffer d，stamp地址为 base*kMpSlots+i。
+- 每个slot捕获round都使用base=0（1462），并发round会写同一组位置；多slot之间没有隔离。
+- collect 位于同步 draft 路径1924，chain_launch/chain_poll没有等价逐slot收集。
+- 因此不能把该旧profile打印值解释为并发MTP body的可靠归因。应新增默认off的per-slot观测或使用有明确窗口和扰动说明的外部profile。
+
+推荐执行顺序：完成 P1/P2 的正确性和独立 A/B → 收集上述 per-slot 数据 → 仅在自然 ready 重叠与 post-attention MoE 占比足够时实现两路局部候选 → 精确 parity及混合业务 A/B → 再决定是否扩展到四路或完整body。

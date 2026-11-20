@@ -1,0 +1,53 @@
+loading the vision encoder ...
+loading the model (the first start takes a minute or two) ...
+[strata] the config has a "vision" section but no --vision in its args: added --vision (run setup again with --vision to write them)
+[strata] layer split across GPUs [0, 1, 2, 3, 4, 5, 6, 7] (6,12,18,24,30,36,42)
+[strata] the config has a "vision" section but no --vision in its args: added --vision (run setup again with --vision to write them)
+[strata] the config has a "vision" section but no --vision in its args: added --vision (run setup again with --vision to write them)
+[strata] the config has a "vision" section but no --vision in its args: added --vision (run setup again with --vision to write them)
+[strata] the config has a "vision" section but no --vision in its args: added --vision (run setup again with --vision to write them)
+[strata] starting the engine: reading the model's weights ...
+[strata] loading the most-used experts into RAM (up to 119 GiB; the rest are read from the model files as needed) and locking part of them for the GPU.
+         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.
+         Please wait and don't close this window; the server says when it is ready.
+[strata] still starting (32 s) - please wait ...
+[strata] still starting (52 s) - please wait ...
+[strata] still starting (72 s) - please wait ...
+Traceback (most recent call last):
+  File "/srv/Strata-0157/serve/server.py", line 10533, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/srv/Strata-0157/serve/server.py", line 9885, in main
+    return _main(argv, lifecycle_event=lifecycle_event, interrupt_exit_code=interrupt_exit_code)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/srv/Strata-0157/serve/server.py", line 10218, in _main
+    engine = start_engine_or_fallback(cfg, exe, effort_end, env, lazy, tok, offline=a.offline, batch_telemetry=a.batch_telemetry)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/srv/Strata-0157/serve/server.py", line 9495, in start_engine_or_fallback
+    return StrataEngine(exe, engine_args(cfg, exe) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/srv/Strata-0157/serve/server.py", line 1313, in __init__
+    raise EngineDied(why + (f" (see {log})" if log else "") + note +
+EngineDied: the engine exited before it was ready (see /srv/bench100k-20261107-piped-target-head/p3-diagnostic/01-off/engine.log)
+the engine process ended: killed by signal 11 (SIGSEGV, Segmentation fault)
+the engine log's last lines:
+  strata generate: KV streaming: 32768 of 262144 cells per QSA layer in VRAM, the K/V in 0.26 GiB of pinned RAM
+  strata generate: PLE on, table 320001536 rows of /models/orcarouter/Qwen3.8-Flash-Next-Uncensored-Q5/Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf
+  strata generate: layer split: CUDA1 holds its weights, session [6, 12); 19.26 GiB free
+  strata generate: layer split: CUDA2 holds its weights, session [12, 18); 20.55 GiB free
+  strata generate: layer split: CUDA3 holds its weights, session [18, 24); 20.49 GiB free
+  strata generate: layer split: CUDA4 holds its weights, session [24, 30); 20.54 GiB free
+  strata generate: layer split: CUDA5 holds its weights, session [30, 36); 20.49 GiB free
+  strata generate: layer split: CUDA6 holds its weights, session [36, 42); 20.54 GiB free
+  strata generate: layer split: CUDA7 holds its weights, session [42, 48) and the head; 19.99 GiB free
+  strata generate: --batch: 8 slot sessions on CUDA0 (0.15 GiB each); 19.20 GiB free
+  strata generate: --batch: 8 slot sessions on CUDA1 (0.21 GiB each); 17.54 GiB free
+  strata generate: --batch: 8 slot sessions on CUDA2 (0.15 GiB each); 19.31 GiB free
+  strata generate: --batch: 8 slot sessions on CUDA3 (0.21 GiB each); 18.76 GiB free
+  strata generate: --batch: 8 slot sessions on CUDA4 (0.15 GiB each); 19.29 GiB free
+  strata generate: --batch: 8 slot sessions on CUDA5 (0.21 GiB each); 18.75 GiB free
+  strata generate: --batch: 8 slot sessions on CUDA6 (0.15 GiB each); 19.28 GiB free
+  strata generate: --batch: 8 slot sessions on CUDA7 (0.21 GiB each); 18.24 GiB free
+  strata generate: --batch 8: the slot sessions take 1.21 GiB of VRAM on CUDA0 that the expert cache would otherwise hold
+  strata generate: STRATA_PIPED_MTP: 8 pipelined groups of 1 slot draft up to 1 MTP proposal per slot each window
+  strata mtp: draft layer loaded, 837 MiB of VRAM (experts 675, dense 111), files read in 0.64 s (1221 MiB/s)

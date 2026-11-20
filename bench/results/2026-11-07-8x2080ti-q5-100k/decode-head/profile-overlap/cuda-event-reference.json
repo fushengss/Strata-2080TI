@@ -1,0 +1,20 @@
+{
+  "source": {
+    "title": "CUDA Programming Guide 13.1.0 — Multi-Device Stream, Event, and Memory Copy Behavior",
+    "url": "https://docs.nvidia.com/cuda/archive/13.1.0/cuda-programming-guide/03-advanced/multi-gpu-systems.html#multi-device-stream-event-and-memory-copy-behavior",
+    "section": "3.4.1.3",
+    "checked_date": "2026-11-07"
+  },
+  "documented_behavior": [
+    "cudaEventQuery and cudaEventSynchronize can operate on an event belonging to a device other than the calling thread's current device.",
+    "cudaStreamWaitEvent supports an event and stream belonging to different devices.",
+    "cudaEventRecord requires its stream and event to belong to the same device.",
+    "Kernel launches require the calling thread's current device to match the launch stream's device."
+  ],
+  "application_to_decode_head": {
+    "completion_poll": "The CUDA-only DecodeHeadWindow::done path can query its completion event without switching to the head device; launch, allocation, capture and resource cleanup retain device ownership scopes.",
+    "producer_dependency": "Each remote head stream waits on the source verifier's already-recorded producer event before reading the published Q8_1 handoff.",
+    "backend_scope": "This documentation establishes CUDA behavior only; the HIP device scope is retained.",
+    "performance_status": "Removing device switches reduces host API work per completion poll. The resulting decode speed change requires end-to-end measurement and is not established by the API documentation."
+  }
+}

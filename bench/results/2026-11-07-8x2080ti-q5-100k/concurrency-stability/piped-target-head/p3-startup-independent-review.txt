@@ -1,0 +1,9 @@
+P3 startup failure: independent local read-only audit
+
+Confirmed build defect: the 5-step P3 build compiled mtp.cpp and prefill.cpp, then linked; it did not compile generate.cpp. All four changed P3 archive members have epoch mtime 1794064131 (Taipei 23:08:51), earlier than the P2 build interval 1794064142.360–1794064225.673. Incremental build timestamps therefore accepted the newer P2 generate.o even though P3 source and mtp.hpp bytes were different. Source hash verification alone cannot prove object freshness.
+
+P3 mtp.hpp:331–333 inserts a boolean, 32 CUDA event pointers and ChainObservation before existing fields. On the deployed 64-bit ABI this adds approximately 368 bytes and shifts subsequent offsets. generate.cpp:7020 constructs MtpDrafter by value with the inline default constructor (mtp.hpp:42); generate.cpp:7220 also allocates clone objects using sizeof(MtpDrafter). A stale generate.o can allocate/initialize the old layout while rebuilt mtp.cpp writes the new layout, causing memory corruption even with observation disabled. This is a concrete binary incompatibility.
+
+The last startup log is mtp.cpp:544, at the end of load(). The observation event allocation call is only later at generate.cpp:11922. There is no P3 timing data and no evidence that event recording/query caused this crash. The small added arrays alone do not establish a normal stack exhaustion defect. Exact SIGSEGV causation still requires a core or successful startup with fresh objects; the stale-layout build must be discarded regardless.
+
+Recommendation: after verifying unchanged source hashes, touch all changed sources/header (or clean rebuild), confirm generate.cpp and every mtp.hpp consumer compile, give the rebuilt executable a new immutable path/hash and retry the diagnostic. Preserve this failed run. Do not deploy P3 or claim runtime measurements from it. No source files were modified by this review; no remote, GPU or service actions were performed.

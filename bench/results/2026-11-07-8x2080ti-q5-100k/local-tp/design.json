@@ -1,0 +1,19 @@
+{
+  "status": "prototype_written_not_cuda_compiled_or_gpu_run",
+  "source": "/Users/fu/project/HAI/Strata-decode-head/tests/core/local_tp_bench.cu",
+  "baseline_commit": "235e2021",
+  "scope": "One real Q5_K routed-expert sublayer, not a complete MoE/model layer or serving-engine TP implementation",
+  "devices": [[0, 1], [0, 1, 2, 3]],
+  "layers": [3, 6],
+  "token_rows": [1, 2, 3, 8],
+  "experts": [5, 42, 79, 116, 153, 190, 227, 264, 301, 338],
+  "routing_limit": "All token rows use the same ten ordered experts; high reuse, no router or dynamic routing benchmark",
+  "production_reference": "native_expert_grouped with cap_groups=cap_entries=10*T, followed by native_moe_combine_multi; current environment controls production dispatch",
+  "decomposed_reference": "Full native_mmvq gate/up, native_swiglu_quantize_q8_1, full native_mmvq down, unchanged expert-order native_moe_combine_multi",
+  "tp_path": "Broadcast original Q8_1 input; GU output rows split on whole 32-value blocks; publish exact hidden Q8_1 blocks into their original positions in portable host memory; allgather hidden; down OUTPUT rows split with the complete K=640 dot; same expert-order combine; allgather final F32 output to every rank",
+  "transport": "CUDA kernels reading/writing portable pinned host memory, producer events and cross-device cudaStreamWaitEvent, no P2P APIs or NCCL",
+  "parity": ["Exact hidden Q8_1 bytes against decomposed reference", "Full combined F32 output bitwise/difference counts/nonfinite/max-absolute/max-relative against decomposed and production references", "Zero input and three deterministic nonzero activations by default", "Raw-bit allgather check on every rank"],
+  "timing": ["All allocations, model reads, warmup and graph capture/upload excluded", "Ten warmup rounds and 100 measured rounds by default", "Production/decomposed/TP order rotates every round", "Wall time includes submissions, device changes, host traffic and all-rank stream synchronization", "Per-rank compute-phase CUDA events exclude host exchange; sum/max are not a critical-path measurement", "Standalone allgather per-row payloads 6912,7200,10240,24576,40960 bytes at T=1,2,3,8; event times include waits/copy kernels", "Runner records GPU clock/power/temperature samples without modifying clocks"],
+  "interpretation": "A speedup versus decomposed reference alone is insufficient. Non-bitwise production comparisons are reported and prohibit calling the prototype an exact production replacement. The prototype launches separate per-expert GEMVs while production fuses groups; a loss measures this implementation and does not disprove a future fused TP kernel. Prefill and end-to-end engine performance remain unmeasured.",
+  "not_changed": ["CMake", "serving core", "online service", "GPU state", "model files"]
+}

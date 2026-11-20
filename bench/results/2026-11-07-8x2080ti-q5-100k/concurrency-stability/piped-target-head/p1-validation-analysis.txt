@@ -1,0 +1,85 @@
+P1 full reverse validation independent audit
+Recommendation: P1_ELIGIBLE_FOR_MEASURED_C8_GAIN_WITH_MIXED_STABILITY_LIMITS
+01-on: COMPLETE
+  Arm checks=True; C8 API 284.404 tok/s, native 311.990 tok/s.
+  100k cold: median read 16.453s, TTFT 16.646s, solo decode 122.40 tok/s; n=3.
+  100k warm: median read 2.187s, TTFT 2.289s, solo decode 123.30 tok/s; n=3.
+  C4 API 105.532 tok/s; actual prompts [8794, 52081, 8794, 8794, 8794, 8794]; nominal tolerance all pass=False.
+  C4 native 113.317 tok/s, associated by suite/log order and exact neighboring summaries, not wall timestamps.
+  C4 mixed maximum silence 10.380s; byte-fairness 0.99580; sustained recovery start 6.0 seconds.
+02-off: COMPLETE
+  Arm checks=True; C8 API 271.876 tok/s, native 297.411 tok/s.
+  100k cold: median read 16.481s, TTFT 16.668s, solo decode 122.80 tok/s; n=3.
+  100k warm: median read 2.263s, TTFT 2.351s, solo decode 123.20 tok/s; n=3.
+  C4 API 105.688 tok/s; actual prompts [8794, 52081, 8794, 8794, 8794, 8794]; nominal tolerance all pass=False.
+  C4 native 113.529 tok/s, associated by suite/log order and exact neighboring summaries, not wall timestamps.
+  C4 mixed maximum silence 10.501s; byte-fairness 0.99955; sustained recovery start 2.0 seconds.
+Pilot off/on C8 API change: +4.972%; native +4.972%.
+Available completed prefill parity=True
+  cold_read_ms: 16481.000000 -> 16453.000000 (-0.170%)
+  cold_ttft_s: 16.668378 -> 16.645700 (-0.136%)
+  cold_decode_tps: 122.800000 -> 122.400000 (-0.326%)
+  warm_read_ms: 2263.000000 -> 2187.000000 (-3.358%)
+  warm_ttft_s: 2.350738 -> 2.288935 (-2.629%)
+  warm_decode_tps: 123.200000 -> 123.300000 (+0.081%)
+Available completed c8 parity=True
+  api_tokens_per_s: 271.876080 -> 284.404264 (+4.608%)
+  native_tokens_per_s: 297.411286 -> 311.989932 (+4.902%)
+Available completed c4mixed parity=True
+  whole_api_tokens_per_s: 105.687887 -> 105.531544 (-0.148%)
+  baseline_resident_output_bytes_per_s: 1111.560195 -> 1091.362063 (-1.817%)
+  baseline_max_observed_no_output_interval_s: 0.025159 -> 0.026686 (+6.071%)
+  baseline_jain_fairness_of_output_byte_rates: 0.994902 -> 0.993514 (-0.139%)
+  mixed_resident_output_bytes_per_s: 104.912184 -> 106.813983 (+1.813%)
+  mixed_max_observed_no_output_interval_s: 10.500574 -> 10.380280 (-1.146%)
+  mixed_jain_fairness_of_output_byte_rates: 0.999552 -> 0.995796 (-0.376%)
+  recovery_resident_output_bytes_per_s: 986.482831 -> 974.483249 (-1.216%)
+  recovery_max_observed_no_output_interval_s: 0.026564 -> 0.027097 (+2.007%)
+  recovery_jain_fairness_of_output_byte_rates: 0.997483 -> 0.997901 (+0.042%)
+  injected-0-10000_ttft_s: 5.824714 -> 5.838926 (+0.244%)
+  injected-1-60000_ttft_s: 10.078761 -> 10.042812 (-0.357%)
+  first_sustained_recovery_start_s: 2.000000 -> 6.000000 (+200.000%)
+Full comparison exact correctness/identity: True
+c8_api: 271.876080 -> 284.404264 (+4.608% on vs off)
+c8_native: 297.411286 -> 311.989932 (+4.902% on vs off)
+c4_api: 105.687887 -> 105.531544 (-0.148% on vs off)
+long_api: 26.202565 -> 25.862460 (-1.298% on vs off)
+long_native: 34.535297 -> 34.421665 (-0.329% on vs off)
+long_max_ttft_s: 70.416426 -> 71.312087 (+1.272% on vs off)
+c4_native: 113.529013 -> 113.317111 (-0.187% on vs off)
+prefill_cold_read_ms: 16481.000000 -> 16453.000000 (-0.170% on vs off)
+prefill_cold_ttft_s: 16.668378 -> 16.645700 (-0.136% on vs off)
+prefill_cold_decode_tps: 122.800000 -> 122.400000 (-0.326% on vs off)
+prefill_warm_read_ms: 2263.000000 -> 2187.000000 (-3.358% on vs off)
+prefill_warm_ttft_s: 2.350738 -> 2.288935 (-2.629% on vs off)
+prefill_warm_decode_tps: 123.200000 -> 123.300000 (+0.081% on vs off)
+c4_baseline_resident_output_bytes_per_s: 1111.560195 -> 1091.362063 (-1.817% on vs off)
+c4_baseline_resident_token_rate_estimate: 271.832248 -> 266.842764 (-1.836% on vs off)
+c4_baseline_max_observed_no_output_interval_s: 0.025159 -> 0.026686 (+6.071% on vs off)
+c4_baseline_jain_fairness_of_output_byte_rates: 0.994902 -> 0.993514 (-0.139% on vs off)
+c4_mixed_resident_output_bytes_per_s: 104.912184 -> 106.813983 (+1.813% on vs off)
+c4_mixed_resident_token_rate_estimate: 25.675245 -> 26.155742 (+1.871% on vs off)
+c4_mixed_max_observed_no_output_interval_s: 10.500574 -> 10.380280 (-1.146% on vs off)
+c4_mixed_jain_fairness_of_output_byte_rates: 0.999552 -> 0.995796 (-0.376% on vs off)
+c4_recovery_resident_output_bytes_per_s: 986.482831 -> 974.483249 (-1.216% on vs off)
+c4_recovery_resident_token_rate_estimate: 241.292629 -> 238.376684 (-1.208% on vs off)
+c4_recovery_max_observed_no_output_interval_s: 0.026564 -> 0.027097 (+2.007% on vs off)
+c4_recovery_jain_fairness_of_output_byte_rates: 0.997483 -> 0.997901 (+0.042% on vs off)
+injected-0-10000_ttft_s: 5.824714 -> 5.838926 (+0.244% on vs off)
+injected-0-10000_first_visible_content_s: 7.045744 -> 7.055580 (+0.140% on vs off)
+injected-1-60000_ttft_s: 10.078761 -> 10.042812 (-0.357% on vs off)
+injected-1-60000_first_visible_content_s: 12.475991 -> 12.313605 (-1.302% on vs off)
+Prefill upward medians: []
+No blocking correctness or measured median100k prefill regression found. P1 may remain the enabled baseline for independent P2 validation.
+P1 alone is an eligible deployment candidate for the repeated4.6–5.0% C8 API gain, with unchanged prefill configuration.
+Mixed C4 API/native throughput remains essentially flat in this pair; four-cold100k whole-request throughput is1.30% lower and native0.33% lower. One pair cannot distinguish such small changes from run variability.
+Do not describe P1 as solving mixed-admission stability: long-prefill output stalls remain about10s. Recovery byte-threshold sensitivity is separately documented.
+This audit does not authorize or evaluate untested P2/P3 settings; select the final engine/flags only after their independent validation.
+Only one pilot off/on pair and one broader reverse on/off pair; no confidence interval or production SLO proof.
+100k prefill has three cold and three warm requests per arm; 256-token solo decode is secondary evidence.
+C4 phases use output bytes and usage-weighted token estimates, not per-token timestamps. Inter-chunk gaps are not TBT.
+C4 fixture nominal prompt sizes miss its ±10% targets; compare matched actual token counts, not label as exact10k/60k.
+Native piped blocks and whole API request/scenario rates have different boundaries and token counts.
+Budget and long cases must pass exact logical output/usage, but cancellation compares a valid nonempty common prefix.
+Native log has no wall timestamps; C4 native association uses sequential suite order and matching neighboring numeric batch signatures.
+C4 recovery threshold is sensitive to byte composition: off 4–6s bin barely exceeds90% baseline, while on falls below; recovery gaps stay25–27ms. The2s vs6s threshold result does not mean an extra4s GPU/output stall.

@@ -1,0 +1,20 @@
+GPU utilization audit — existing local artifacts only
+Window: 2026-11-07T21:17:36.611674+08:00 to 2026-11-07T21:17:53.516973+08:00 (16.905s).
+All eight nonempty-content streams overlap; trim 1s at each end. Not 21:44; short prompts, not 100k.
+CSV UTC inferred and checked against metadata ready/finished epoch anchors.
+GPU | n | GPU active % | memory active % | mean power W | SM MHz mean(min-max) | memory MHz | temp C mean(max)
+0 | 30 | 65.17 | 48.63 | 230.02 | 1856.0(1845-1860) | 6800 | 63.4(66)
+1 | 30 | 57.57 | 40.27 | 217.43 | 1844.5(1830-1845) | 6800 | 68.9(71)
+2 | 29 | 57.38 | 40.62 | 215.32 | 1860.0(1860-1860) | 6800 | 62.0(64)
+3 | 30 | 64.80 | 45.13 | 222.04 | 1810.0(1800-1815) | 6800 | 72.2(75)
+4 | 30 | 55.13 | 40.53 | 217.08 | 1828.5(1815-1830) | 6800 | 66.9(69)
+5 | 30 | 64.07 | 43.80 | 228.41 | 1827.5(1815-1830) | 6800 | 67.0(69)
+6 | 30 | 54.40 | 39.67 | 195.74 | 1857.0(1845-1860) | 6800 | 63.5(66)
+7 | 30 | 96.57 | 72.93 | 248.85 | 1647.5(1620-1665) | 6800 | 67.1(69)
+Equal-card mean GPU active: 64.385%; total mean power: 1774.89W.
+GPU7 is 96.57% busy while GPUs0–6 average 54.40–65.17%. Whole-machine average hides imbalance.
+GPU7 averages 248.85W and 1647.5MHz; its temperature is 65–69C. No throttle reason or per-card cap recorded, so power limiting cannot be ruled out or proven.
+NVML busy-time percentage is not compute-capacity percentage; memory active percentage is not bandwidth percentage.
+The separate 22:22:14 snapshot had 2 occupied slots, 25.25% mean GPU active and 1138.40W/2000W aggregate cap. Its 60-sample history max was 36.62%; no clocks/throttle reasons saved.
+No service, source implementation, or GPU changes; no inference requests.
+Reproduce: python3 gpu-util-audit.py

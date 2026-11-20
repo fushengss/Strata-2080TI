@@ -1,0 +1,1327 @@
+From 235e20211a243d48b8af838794596fa38c9dfd95 Mon Sep 17 00:00:00 2001
+From: fusheng <2259418425@qq.com>
+Date: Sat, 7 Nov 2026 17:43:26 +0800
+Subject: [PATCH] [Engine] Add opt-in PW2 decode head offload and vocabulary
+ sharding
+
+---
+ CMakeLists.txt                         |   6 +-
+ docs/MULTI_GPU.md                      |  14 ++
+ include/strata/core/decode_head.hpp    |  70 ++++++
+ include/strata/core/verify.hpp         |  17 ++
+ include/strata/kernels/decode_head.hpp |  13 ++
+ metal/CMakeLists.txt                   |   1 +
+ metal/src/decode_head_stub.cpp         |  47 ++++
+ src/core/decode_head.cpp               | 272 +++++++++++++++++++++
+ src/core/verify.cpp                    | 137 ++++++++++-
+ src/kernels/cuda/decode_head.cu        |  37 +++
+ src/program/generate.cpp               |  78 +++++++
+ tests/core/decode_head_test.cpp        | 312 +++++++++++++++++++++++++
+ 12 files changed, 999 insertions(+), 5 deletions(-)
+ create mode 100644 include/strata/core/decode_head.hpp
+ create mode 100644 include/strata/kernels/decode_head.hpp
+ create mode 100644 metal/src/decode_head_stub.cpp
+ create mode 100644 src/core/decode_head.cpp
+ create mode 100644 src/kernels/cuda/decode_head.cu
+ create mode 100644 tests/core/decode_head_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d273c7c4..5487272c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -522,6 +522,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+                           src/kernels/cuda/qsa_select.cu
+                           src/kernels/cuda/qsa_pattn.cu
+                           src/kernels/cuda/verify_kernels.cu
++                          src/kernels/cuda/decode_head.cu
+                           src/kernels/cuda/dflash2.cu
+                           src/kernels/cuda/iq_kernels.cu
+                           src/kernels/ngram.cpp
+@@ -707,12 +708,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
+   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+     src/core/remote_expert_opt.cu
+-    src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
++    src/core/expert_cache.cpp src/core/native_head.cpp src/core/decode_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
+     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
++    # Manual integration test: two GPUs and --gguf are required; do not run it implicitly in CTest.
++    add_executable(decode_head_test tests/core/decode_head_test.cpp)
++    target_link_libraries(decode_head_test PRIVATE strata_engine Threads::Threads)
+     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
+     target_include_directories(host_graph_launch_test PRIVATE include)
+     target_link_libraries(host_graph_launch_test PRIVATE CUDA::cudart Threads::Threads)
+diff --git a/docs/MULTI_GPU.md b/docs/MULTI_GPU.md
+index 86acf672..3af6d50b 100644
+--- a/docs/MULTI_GPU.md
++++ b/docs/MULTI_GPU.md
+@@ -152,9 +152,23 @@ restart. Defaults are off unless the table says otherwise.
+ | `--prefill-pipe R` (or `STRATA_PREFILL_PIPE=R`) | Reads each prompt in the chunk count with the least pipeline time for b/a = R tokens. `1` evens out today's chunk count. | Opt-in. `./setup.sh --calibrate` measures it per PC and writes it to the config. |
+ | `STRATA_SPLIT_RING=N` | Sets the prompt path's streamed ring to N slots (`0`: the pinned-share rule). A split uses 96 when at least 75% of the (layer, expert) pairs sit in some card's cache. | The startup line `lend sizing: ...` shows the result. |
+ | `STRATA_SPLIT_CHUNK16K=1` | Keeps the 16384-token auto chunk on AMD gfx12 splits (default 8192). | |
++| `STRATA_DECODE_HEAD_GPU=D` or `D1,D2` | Experimental: the native output head on one other GPU, or two vocabulary shards for greedy solo PW2 decode. Unset or `-1`: off. | Needs `--pipeline-windows 2` and a different GPU already in the split. The original prefill, layer, draft and batch placement stays in place. Adds one head copy per selected card plus per-window buffers; refuses a head that spills to RAM. |
+ | `STRATA_SPLIT_OVERLAP=1` | Overlapped hand-off between stages on different cards. | Helps AMD; no gain on NVIDIA. See [below](#overlapped-hand-off). |
+ | `--split-device D1[,D2..]` | The later stages' devices (default: the next visible ones). `--layer-split K --split-device 0` runs both stages on one card; a bit-exact hand-off check, not a speed mode. | |
+ 
++This switch is experimental in CUDA/HIP builds and has only been validated on CUDA. It is unavailable on Metal and SYCL.
++The decode-head experiment transfers each window's final Q8_1 activation through portable pinned RAM to a separate
++stream on the chosen card. The head and sampling run there, and only picks and non-finite flags return; asking for
++logprobs copies the requested logits too. No P2P link is needed. The two PW2 window parities own separate buffers.
++Requests with a history penalty or logit bias keep the ordinary head path. With one target card, sampled PW2 requests
++without those features use their original seed and position counter there. With two target cards, only greedy
++requests use the shards; sampled requests keep the ordinary head path. Each shard returns its best token and raw
++logit, and the CPU chooses the largest value with ties going to the lowest original token id. No softmax or dot
++product is repartitioned. Row sharding requires the original quantized row layout, not an in-place repack.
++A startup line names the placement, and
++`strata decode head: ... windows offloaded` reports the actual count per PW2 request. This setting does not change
++the batch scheduler or move any prefill layers; benchmark both decode and cold prefill before using it on a server.
++
+ **The resident RAM mode works on a split.** `--resident-experts` (the low-RAM mode) leaves out of the RAM copy the experts any
+ card's cache holds. An adaptive swap copies the evicted expert back into RAM from the card that owns its layer. A RAM budget
+ (`--resident-budget-gib`) works on a split as well ([UNSLOTH_Q4.md](UNSLOTH_Q4.md)). With `--pcie-frac 0 --adapt-every 0` the
+diff --git a/include/strata/core/decode_head.hpp b/include/strata/core/decode_head.hpp
+new file mode 100644
+index 00000000..8b75e76a
+--- /dev/null
++++ b/include/strata/core/decode_head.hpp
+@@ -0,0 +1,70 @@
++#pragma once
++
++#include "strata/kernels/sampler.hpp"
++
++#include <cuda_runtime.h>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace strata::core {
++
++class NativeHead;
++
++/// Merge shard-local argmax results after converting their ids to global vocabulary ids. Scores are unchanged
++/// logits, not probabilities. NaN/-inf provide no candidate; equal values (including +/-0) choose the lowest id.
++int32_t decode_head_merge_argmax(const int32_t* global_ids, const float* scores, int count);
++
++/// One verifier parity's decode-only head on another GPU. The shared NativeHead must outlive this object.
++/// The producer writes exact Q8_1 rows to handoff(), then finishes its stream or records producer_ready. No P2P is required.
++/// Sampling with a history or logit bias stays on the caller's ordinary path.
++class DecodeHeadWindow {
++public:
++    DecodeHeadWindow() = default;
++    ~DecodeHeadWindow();
++    DecodeHeadWindow(const DecodeHeadWindow&) = delete;
++    DecodeHeadWindow& operator=(const DecodeHeadWindow&) = delete;
++
++    bool init(const NativeHead& target, int source_device, int n, int vocab, int max_t,
++              bool use_il, bool use_argmax, bool nan_guard, std::string& err, int row_begin = 0, int row_count = 0);
++    void* handoff() const { return handoff_source_; }
++    size_t row_bytes() const { return row_bytes_; }
++    bool capture_all(std::string& err);
++    /// A null sampler keeps the graph's greedy pick. Otherwise only history-free, bias-free sampling is accepted.
++    /// producer_ready, when supplied, must already be recorded after the producer's handoff writes.
++    bool launch(int t, const strata::kernels::SamplerParams* sampler, uint64_t counter, std::string& err,
++                cudaEvent_t producer_ready = nullptr);
++    /// False while in flight; false with err on a CUDA failure. Results remain valid until the next launch.
++    bool done(std::string& err);
++    const int32_t* picks() const { return out_host_; }
++    /// Partial heads return local ids and their original logits; full heads do not allocate scores.
++    const float* scores() const { return scores_host_; }
++    int row_begin() const { return row_begin_; }
++    int row_count() const { return vocab_; }
++    /// T * kNonfiniteBlocks words, or nullptr when the guard is disabled.
++    const uint32_t* nonfinite() const { return nf_host_; }
++    bool copy_logits(int row, float* host) const;
++
++private:
++    void reset() noexcept;
++    bool capture(int t, std::string& err);
++    const NativeHead* head_ = nullptr;
++    const void* weights_ = nullptr;
++    int device_ = -1, n_ = 0, vocab_ = 0, max_t_ = 0, last_t_ = 0;
++    int row_begin_ = 0;
++    bool partial_ = false;
++    bool use_il_ = false, argmax_ = false, nan_guard_ = false, live_ = false;
++    size_t row_bytes_ = 0;
++    void *handoff_host_ = nullptr, *handoff_source_ = nullptr, *handoff_target_ = nullptr;
++    void *q8_ = nullptr, *interleaved_ = nullptr, *arg_scratch_ = nullptr;
++    float* logits_ = nullptr;
++    int32_t *out_host_ = nullptr, *out_device_ = nullptr;
++    float *scores_host_ = nullptr, *scores_device_ = nullptr;
++    uint32_t *nf_host_ = nullptr, *nf_device_ = nullptr;
++    cudaStream_t stream_ = nullptr;
++    cudaEvent_t finished_ = nullptr;
++    std::vector<cudaGraphExec_t> graphs_;
++};
++
++}  // namespace strata::core
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index 258ba76e..bd24baba 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -24,6 +24,7 @@
+ #include <cstdio>
+ 
+ #include "strata/core/expert_source.hpp"
++#include "strata/core/decode_head.hpp"
+ #include "strata/core/layer.hpp"
+ #include "strata/core/session.hpp"
+ #include "strata/kernels/sampler.hpp"
+@@ -36,12 +37,14 @@
+ #include <chrono>
+ #include <functional>
+ #include <map>
++#include <memory>
+ #include <cstdint>
+ #include <string>
+ #include <vector>
+ 
+ namespace strata::core {
+ 
++
+ /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
+ /// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their
+ /// bytes arrive layer by layer: `run` holds a layer's plan (the first thing that lets the GPU read the layer's expert
+@@ -337,6 +340,12 @@ public:
+     int device() const { return device_; }
+     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
+     bool capture_all(std::string& err);
++    /// Optional PW2 decode-only head on another GPU. Normal prompt/run/batch graphs stay intact.
++    /// The NativeHead must outlive this verifier. Call after init, before capture_all.
++    bool set_decode_head(const NativeHead& head, std::string& err, const NativeHead* second = nullptr);
++    void set_decode_head_active(bool on) { decode_head_active_ = on; }
++    bool prepare_decode_head(std::string& err);
++    uint64_t decode_head_windows() const { return decode_head_windows_; }
+     bool pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+     /// Stage a window ahead of its launch (positions, and the PLE rows from `ple_prev` = the two tokens before the
+     /// window as they WILL be, their pages prefetched).  A later `pl_launch` of the same window (T, pos0, tokens, and
+@@ -620,6 +629,13 @@ private:
+     SessionState* ss_ = nullptr;
+     VerifyHits hits_;
+     const NativeHead* head_ = nullptr;
++    std::unique_ptr<DecodeHeadWindow> decode_head_;
++    std::unique_ptr<DecodeHeadWindow> decode_head_second_;
++    bool decode_head_active_ = false;   // only the PW2 decode scope enables it, never prompt reads
++    bool record_decode_head_ = false;  // capturing the separate headless body variant
++    bool fl_decode_head_ = false;      // snapshotted at launch: drain/cancel must finish the same path
++    uint64_t decode_head_windows_ = 0;
++    bool last_decode_head_ = false;    // the location of the last completed logits
+     int max_t_ = 0;
+     float* ple_key_ = nullptr;   ///< STRATA_PLE_BATCH: the window rows' PLE key / value projections
+     float* ple_val_ = nullptr;
+@@ -640,6 +656,7 @@ private:
+     // scores; see run()); without it only [0] is ever captured
+     // (per window size T = 1..kVerifyLongT: a solo window is at most 8 rows (16 with --lookup-max-t), but a merge window of a wide batch is not)
+     cudaGraphExec_t exec_[2][strata::kernels::kVerifyLongT + 1] = {};
++    cudaGraphExec_t exec_decode_head_[2][strata::kernels::kVerifyLongT + 1] = {};
+     cudaGraphExec_t exec_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+     bool launched_[2][strata::kernels::kVerifyLongT + 1] = {}, launched_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+     int sel_long_ = 0;
+diff --git a/include/strata/kernels/decode_head.hpp b/include/strata/kernels/decode_head.hpp
+new file mode 100644
+index 00000000..12dd524f
+--- /dev/null
++++ b/include/strata/kernels/decode_head.hpp
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include <cstdint>
++
++namespace strata::kernels {
++
++/// Copy logits[row][ids[row]] to scores[row], preserving every float bit.
++/// IDs must be local to the supplied vocabulary. One 32-thread block serves all rows.
++/// The producer of ids and this gather must be ordered on the supplied stream.
++void gather_head_scores(const float* logits, int n_rows, int n_vocab, const int32_t* ids,
++                        float* scores, void* stream);
++
++}  // namespace strata::kernels
+diff --git a/metal/CMakeLists.txt b/metal/CMakeLists.txt
+index 85ff9112..17d6f654 100644
+--- a/metal/CMakeLists.txt
++++ b/metal/CMakeLists.txt
+@@ -97,6 +97,7 @@ set(STRATA_METAL_HOST_SOURCES
+   ${S}/core/device.cu ${S}/core/pinned.cu ${S}/platform/memory.cpp ${S}/core/graph.cpp ${S}/core/weights.cpp ${S}/core/layout.cpp
+   ${S}/core/layer.cpp ${S}/core/session.cpp ${S}/core/expert_source.cpp ${S}/core/remote_experts.cpp ${S}/core/expert_cache.cpp
+   ${S}/core/native_head.cpp ${S}/core/native_dense.cpp ${S}/core/verify.cpp ${S}/core/mtp.cpp
++  ${CMAKE_CURRENT_SOURCE_DIR}/src/decode_head_stub.cpp
+   ${S}/core/conversation_snapshot.cpp ${S}/core/conversation_state.cpp ${S}/core/conversation_memory.cpp
+   ${S}/core/peer_experts.cpp ${S}/core/arch_defaults.cpp ${S}/core/vmm.cpp ${S}/core/conversation_file.cpp
+   ${S}/kernels/ngram.cpp ${S}/ngram/ple_reader.cpp ${S}/platform/direct_file.cpp ${S}/platform/io_priority.cpp
+diff --git a/metal/src/decode_head_stub.cpp b/metal/src/decode_head_stub.cpp
+new file mode 100644
+index 00000000..a16e61b9
+--- /dev/null
++++ b/metal/src/decode_head_stub.cpp
+@@ -0,0 +1,47 @@
++// Metal keeps its existing output-head path. The shared verifier still references this CUDA-only experiment
++// when it is disabled, so provide its host interface without linking CUDA graphs or device kernels.
++#include "strata/core/decode_head.hpp"
++
++#include <cstring>
++
++namespace strata::core {
++namespace {
++bool unsupported(std::string& err) {
++    err = "decode head: this experiment requires CUDA and is unavailable on Metal";
++    return false;
++}
++}  // namespace
++
++DecodeHeadWindow::~DecodeHeadWindow() = default;
++
++bool DecodeHeadWindow::init(const NativeHead&, int, int, int, int, bool, bool, bool, std::string& err, int, int) {
++    return unsupported(err);
++}
++bool DecodeHeadWindow::capture_all(std::string& err) { return unsupported(err); }
++bool DecodeHeadWindow::launch(int, const strata::kernels::SamplerParams*, uint64_t, std::string& err, cudaEvent_t) {
++    return unsupported(err);
++}
++bool DecodeHeadWindow::done(std::string& err) { return unsupported(err); }
++bool DecodeHeadWindow::copy_logits(int, float*) const { return false; }
++
++// Keep the pure comparison identical to src/core/decode_head.cpp. It has no GPU dependency, and giving it the
++// same behavior avoids a silent wrong result if a future host-only caller uses it outside the disabled path.
++int32_t decode_head_merge_argmax(const int32_t* global_ids, const float* scores, int count) {
++    uint32_t best_key = 0;
++    int32_t best_id = 0;
++    bool found = false;
++    for (int i = 0; i < count; ++i) {
++        uint32_t bits;
++        std::memcpy(&bits, scores + i, sizeof bits);
++        const uint32_t magnitude = bits & 0x7fffffffu;
++        if (global_ids[i] < 0 || magnitude > 0x7f800000u || bits == 0xff800000u) continue;
++        if (magnitude == 0) bits = 0;
++        const uint32_t key = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
++        if (!found || key > best_key || (key == best_key && global_ids[i] < best_id)) {
++            best_key = key; best_id = global_ids[i]; found = true;
++        }
++    }
++    return best_id;
++}
++
++}  // namespace strata::core
+diff --git a/src/core/decode_head.cpp b/src/core/decode_head.cpp
+new file mode 100644
+index 00000000..16fb19a0
+--- /dev/null
++++ b/src/core/decode_head.cpp
+@@ -0,0 +1,272 @@
++#include "strata/core/decode_head.hpp"
++#include "strata/core/native_head.hpp"
++#include "strata/kernels/decode_head.hpp"
++#include "strata/kernels/elementwise.hpp"
++#include "strata/kernels/fused_gr.hpp"
++#include "strata/kernels/native_mmvq.hpp"
++#include "strata/kernels/verify_kernels.hpp"
++
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++
++namespace strata::core {
++namespace {
++// Unlike an unchecked device scope, a failed switch must never run an allocation/launch on the caller's GPU.
++struct DeviceScope {
++    int previous = -1;
++    bool changed = false;
++    cudaError_t status;
++    explicit DeviceScope(int device) : status(cudaGetDevice(&previous)) {
++        if (status == cudaSuccess && previous != device) {
++            status = cudaSetDevice(device);
++            changed = status == cudaSuccess;
++        }
++    }
++    ~DeviceScope() { if (changed) (void) cudaSetDevice(previous); }
++};
++bool checked(cudaError_t status, const char* what, std::string& err) {
++    if (status == cudaSuccess) return true;
++    err = std::string("decode head: ") + what + ": " + cudaGetErrorString(status);
++    return false;
++}
++}  // namespace
++
++int32_t decode_head_merge_argmax(const int32_t* global_ids, const float* scores, int count) {
++    uint32_t best_key = 0;
++    int32_t best_id = 0;
++    bool found = false;
++    for (int i = 0; i < count; ++i) {
++        uint32_t bits;
++        std::memcpy(&bits, scores + i, sizeof bits);
++        const uint32_t magnitude = bits & 0x7fffffffu;
++        if (global_ids[i] < 0 || magnitude > 0x7f800000u || bits == 0xff800000u) continue;
++        if (magnitude == 0) bits = 0;   // +0 and -0 compare equal in the GPU argmax
++        // IEEE binary32 order without host floating-point arithmetic or denormal/fast-math assumptions.
++        const uint32_t key = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
++        if (!found || key > best_key || (key == best_key && global_ids[i] < best_id)) {
++            best_key = key; best_id = global_ids[i]; found = true;
++        }
++    }
++    return best_id;   // the ordinary argmax returns token zero when no score exceeds -inf
++}
++
++DecodeHeadWindow::~DecodeHeadWindow() { reset(); }
++
++void DecodeHeadWindow::reset() noexcept {
++    if (device_ < 0) return;
++    const DeviceScope device(device_);
++    if (device.status != cudaSuccess) return;   // do not release another device's objects after a failed switch
++    if (stream_) (void) cudaStreamSynchronize(stream_);
++    for (auto graph : graphs_) if (graph) (void) cudaGraphExecDestroy(graph);
++    graphs_.clear();
++    if (finished_) (void) cudaEventDestroy(finished_);
++    if (stream_) (void) cudaStreamDestroy(stream_);
++    if (q8_) (void) cudaFree(q8_);
++    if (interleaved_) (void) cudaFree(interleaved_);
++    if (arg_scratch_) (void) cudaFree(arg_scratch_);
++    if (logits_) (void) cudaFree(logits_);
++    if (handoff_host_) (void) cudaFreeHost(handoff_host_);
++    if (out_host_) (void) cudaFreeHost(out_host_);
++    if (scores_host_) (void) cudaFreeHost(scores_host_);
++    if (nf_host_) (void) cudaFreeHost(nf_host_);
++    head_ = nullptr;
++    weights_ = nullptr;
++    device_ = -1;
++    stream_ = nullptr;
++    finished_ = nullptr;
++    q8_ = interleaved_ = arg_scratch_ = nullptr;
++    logits_ = nullptr;
++    handoff_host_ = handoff_source_ = handoff_target_ = nullptr;
++    out_host_ = out_device_ = nullptr;
++    scores_host_ = scores_device_ = nullptr;
++    nf_host_ = nf_device_ = nullptr;
++    live_ = false;
++    last_t_ = 0;
++}
++
++bool DecodeHeadWindow::init(const NativeHead& target, int source_device, int n, int vocab, int max_t,
++                            bool use_il, bool use_argmax, bool nan_guard, std::string& err, int row_begin, int row_count) {
++    if (head_ || device_ >= 0) { err = "decode head: already initialized"; return false; }
++    if (!target.loaded() || target.on_host() || target.device() < 0 || source_device < 0 ||
++        target.device() == source_device || n <= 0 || n % 256 || vocab <= 0 ||
++        max_t < 1 || max_t > strata::kernels::kVerifyLongT || row_begin < 0 || row_begin >= vocab ||
++        row_count < 0 || row_count > vocab - row_begin) {
++        err = "decode head: invalid devices, head or window shape";
++        return false;
++    }
++    const DeviceScope device(target.device());
++    if (!checked(device.status, "select target device", err)) return false;
++    device_ = target.device();
++    n_ = n; vocab_ = row_count > 0 ? row_count : vocab - row_begin; max_t_ = max_t;
++    row_begin_ = row_begin;
++    partial_ = row_begin_ != 0 || vocab_ != vocab;
++    use_il_ = use_il; argmax_ = use_argmax; nan_guard_ = nan_guard;
++    auto fail = [&]() { reset(); return false; };
++    try {
++        using namespace strata::kernels;
++        if (target.weight_bytes() != native_mmvq_weight_bytes(target.type(), n, vocab)) {
++            err = "decode head: the target weight size differs from the requested shape";
++            return fail();
++        }
++        if (partial_ && ((target.type() == 14 && native_q6_k_packed_enabled()) ||
++                        (target.type() == 8 && (native_q8_0_packed_enabled() || std::getenv("STRATA_Q8_SM60") != nullptr)))) {
++            err = "decode head: row ranges require the original, unpacked head layout";
++            return fail();
++        }
++        weights_ = (const uint8_t*) target.weights() + (size_t) row_begin_ * target.row_bytes();
++        row_bytes_ = native_q8_1_bytes(n, 1);
++        const size_t activation_bytes = row_bytes_ * (size_t) max_t;
++        if (!checked(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "create stream", err) ||
++            !checked(cudaEventCreateWithFlags(&finished_, cudaEventDisableTiming), "create event", err) ||
++            !checked(cudaHostAlloc(&handoff_host_, activation_bytes, cudaHostAllocMapped | cudaHostAllocPortable), "allocate handoff", err) ||
++            !checked(cudaHostGetDevicePointer(&handoff_target_, handoff_host_, 0), "map target handoff", err)) return fail();
++        {
++            const DeviceScope source(source_device);
++            if (!checked(source.status, "select source device", err) ||
++                !checked(cudaHostGetDevicePointer(&handoff_source_, handoff_host_, 0), "map source handoff", err)) return fail();
++        }
++        std::memset(handoff_host_, 0, activation_bytes);
++        if (!checked(cudaMalloc(&q8_, activation_bytes), "allocate Q8 rows", err) ||
++            !checked(cudaMalloc(&interleaved_, native_q8_1_il_bytes(n, std::min(max_t, kFusedGrMaxT))), "allocate interleaved rows", err) ||
++            !checked(cudaMalloc((void**) &logits_, (size_t) max_t * (size_t) vocab_ * sizeof(float)), "allocate logits", err) ||
++            !checked(cudaMalloc(&arg_scratch_, argmax_rows_scratch_bytes(max_t)), "allocate argmax scratch", err) ||
++            !checked(cudaMemset(arg_scratch_, 0, argmax_rows_scratch_bytes(max_t)), "clear argmax scratch", err) ||
++            !checked(cudaHostAlloc((void**) &out_host_, (size_t) max_t * sizeof(int32_t), cudaHostAllocMapped | cudaHostAllocPortable), "allocate picks", err) ||
++            !checked(cudaHostGetDevicePointer((void**) &out_device_, out_host_, 0), "map picks", err)) return fail();
++        std::memset(out_host_, 0, (size_t) max_t * sizeof(int32_t));
++        if (partial_) {
++            if (!checked(cudaHostAlloc((void**) &scores_host_, (size_t) max_t * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable), "allocate scores", err) ||
++                !checked(cudaHostGetDevicePointer((void**) &scores_device_, scores_host_, 0), "map scores", err)) return fail();
++            std::memset(scores_host_, 0, (size_t) max_t * sizeof(float));
++        }
++        if (nan_guard_) {
++            const size_t bytes = (size_t) max_t * kNonfiniteBlocks * sizeof(uint32_t);
++            if (!checked(cudaHostAlloc((void**) &nf_host_, bytes, cudaHostAllocMapped | cudaHostAllocPortable), "allocate nonfinite flags", err) ||
++                !checked(cudaHostGetDevicePointer((void**) &nf_device_, nf_host_, 0), "map nonfinite flags", err)) return fail();
++            std::memset(nf_host_, 0, bytes);
++        }
++        graphs_.assign((size_t) max_t + 1, nullptr);
++        head_ = &target;
++        return true;
++    } catch (const std::exception& e) {
++        err = std::string("decode head: init: ") + e.what();
++        return fail();
++    }
++}
++
++bool DecodeHeadWindow::capture(int t, std::string& err) {
++    using namespace strata::kernels;
++    if (graphs_[(size_t) t]) return true;
++    if (!checked(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin capture", err)) return false;
++    bool ok = true;
++    try {
++        // Only this small activation is read over PCIe. GEMV repeatedly reads its target-local Q8 copy.
++        copy_from_mapped((float*) q8_, (const float*) handoff_target_, (int64_t) (row_bytes_ * t / sizeof(float)), stream_);
++        for (int h0 = 0; h0 < t; h0 += kFusedGrMaxT) {
++            const int ht = std::min(t - h0, kFusedGrMaxT);
++            const void* x = (const uint8_t*) q8_ + (size_t) h0 * row_bytes_;
++            float* y = logits_ + (size_t) h0 * vocab_;
++            if (use_il_ && native_mmvq_il_supported(head_->type(), ht, vocab_)) {
++                if (ht >= 2) native_q8_1_interleave(x, interleaved_, n_, ht, stream_);
++                native_mmvq_il(head_->type(), weights_, x, interleaved_, y, n_, vocab_, ht, stream_);
++            } else native_mmvq(head_->type(), weights_, x, y, n_, vocab_, ht, stream_);
++        }
++        if (argmax_) argmax_rows(logits_, t, vocab_, arg_scratch_, out_device_, stream_);
++        else {
++            SamplerParams sp;
++            sp.greedy = true; sp.temperature = 0.0f;
++            sample_tokens(logits_, t, vocab_, nullptr, 0, sp, out_device_, stream_);
++        }
++        if (partial_) gather_head_scores(logits_, t, vocab_, out_device_, scores_device_, stream_);
++        if (nan_guard_) logits_nonfinite_rows(logits_, t, vocab_, nf_device_, stream_);
++    } catch (const std::exception& e) {
++        err = std::string("decode head: record: ") + e.what();
++        ok = false;
++    }
++    cudaGraph_t graph = nullptr;
++    const cudaError_t ended = cudaStreamEndCapture(stream_, &graph);
++    if (ok) ok = checked(ended, "end capture", err);
++    if (ok) ok = checked(cudaGraphInstantiate(&graphs_[(size_t) t], graph, nullptr, nullptr, 0), "instantiate graph", err);
++    if (graph) (void) cudaGraphDestroy(graph);
++    if (ok) ok = checked(cudaGraphUpload(graphs_[(size_t) t], stream_), "upload graph", err);
++    if (!ok && graphs_[(size_t) t]) {
++        (void) cudaGraphExecDestroy(graphs_[(size_t) t]);
++        graphs_[(size_t) t] = nullptr;
++    }
++    return ok;
++}
++
++bool DecodeHeadWindow::capture_all(std::string& err) {
++    if (!head_ || live_) { err = "decode head: capture needs an initialized idle window"; return false; }
++    const DeviceScope device(device_);
++    if (!checked(device.status, "select capture device", err)) return false;
++    for (int t = 1; t <= max_t_; ++t) if (!capture(t, err)) return false;
++    return checked(cudaStreamSynchronize(stream_), "finish graph upload", err);
++}
++
++bool DecodeHeadWindow::launch(int t, const strata::kernels::SamplerParams* sampler, uint64_t counter, std::string& err,
++                              cudaEvent_t producer_ready) {
++    if (!head_ || live_ || t < 1 || t > max_t_ || !graphs_[(size_t) t]) {
++        err = "decode head: launch needs a captured idle window of the requested size";
++        return false;
++    }
++    if (sampler && (sampler->logit_bias || sampler->penalty_last_n > 0)) {
++        err = "decode head: history and logit bias require the ordinary head path";
++        return false;
++    }
++    if (partial_ && sampler && !sampler->greedy && sampler->temperature > 0.0f) {
++        err = "decode head: row ranges only support greedy sampling";
++        return false;
++    }
++    const DeviceScope device(device_);
++    if (!checked(device.status, "select launch device", err)) return false;
++    // Cross-device events do not need P2P. Keep the wait outside the captured graph, on this window's private
++    // head stream: a target-card layer stream must remain free to produce subsequent pipeline windows.
++    if (producer_ready && !checked(cudaStreamWaitEvent(stream_, producer_ready, 0), "wait for producer", err)) return false;
++    if (!checked(cudaGraphLaunch(graphs_[(size_t) t], stream_), "launch graph", err)) return false;
++    try {
++        if (sampler && !sampler->greedy && sampler->temperature > 0.0f) {
++            auto sp = *sampler;
++            sp.counter = counter;
++            strata::kernels::sample_tokens(logits_, t, vocab_, nullptr, 0, sp, out_device_, stream_);
++        }
++    } catch (const std::exception& e) {
++        (void) cudaStreamSynchronize(stream_);
++        err = std::string("decode head: sampling: ") + e.what();
++        return false;
++    }
++    if (!checked(cudaEventRecord(finished_, stream_), "record completion", err)) {
++        (void) cudaStreamSynchronize(stream_);
++        return false;
++    }
++    last_t_ = t;
++    live_ = true;
++    return true;
++}
++
++bool DecodeHeadWindow::done(std::string& err) {
++    if (!head_ || last_t_ == 0) { err = "decode head: no launched window"; return false; }
++    if (!live_) return true;
++#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
++    const DeviceScope device(device_);
++    if (!checked(device.status, "select completion device", err)) return false;
++#endif
++    // CUDA event queries accept events from a different current device (Programming Guide, multi-GPU).
++    // Avoid two device switches per shard on every host poll. The query still fences mapped results.
++    const cudaError_t status = cudaEventQuery(finished_);
++    if (status == cudaErrorNotReady) return false;
++    if (!checked(status, "head completion", err)) return false;
++    live_ = false;
++    return true;
++}
++
++bool DecodeHeadWindow::copy_logits(int row, float* host) const {
++    if (!head_ || live_ || !host || row < 0 || row >= last_t_) return false;
++    const DeviceScope device(device_);
++    return device.status == cudaSuccess &&
++           cudaMemcpy(host, logits_ + (size_t) row * vocab_, (size_t) vocab_ * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
++}
++
++}  // namespace strata::core
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 47977c15..ff33a75d 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -29,6 +29,7 @@
+ #endif
+ 
+ #include "strata/core/native_head.hpp"
++#include "strata/core/decode_head.hpp"
+ #include "strata/core/on_device.hpp"
+ #include "strata/core/peer_experts.hpp"
+ #include "strata/kernels/iq_kernels.hpp"
+@@ -710,10 +711,15 @@ Verifier::~Verifier() {
+         slot.compare_exchange_strong(me, nullptr);
+     }
+     if (cs_) cudaStreamSynchronize(cs_);
++    decode_head_.reset();
++    decode_head_second_.reset();
+     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+     for (auto& row : exec_)
+         for (auto& e : row)
+             if (e) cudaGraphExecDestroy(e);
++    for (auto& row : exec_decode_head_)
++        for (auto& e : row)
++            if (e) cudaGraphExecDestroy(e);
+     for (auto& row : exec_nr_)
+         for (auto& e : row)
+             if (e) cudaGraphExecDestroy(e);
+@@ -2609,6 +2615,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+             try {
+                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
+                 if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
++                if (record_decode_head_) {
++                    // Keep the final mixer's exact Q8_1 image. Each chunk has its own portable staging rows;
++                    // xq_ is reused by the next chunk, so publish it here before proceeding.
++                    const size_t row_bytes = strata::kernels::native_q8_1_bytes((int) N, 1);
++                    for (auto* window : {decode_head_.get(), decode_head_second_.get()}) {
++                        if (!window) continue;
++                        auto* dst = static_cast<unsigned char*>(window->handoff()) + (size_t) h0 * row_bytes;
++                        copy_from_mapped(reinterpret_cast<float*>(dst), reinterpret_cast<const float*>(xq_),
++                                         (int64_t) HT * (int64_t) row_bytes / sizeof(float), cs);
++                    }
++                    continue;
++                }
+                 if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
+                     if (HT >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);
+                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, hl, (int) N,
+@@ -2624,6 +2642,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
+         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
+         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
++        if (!record_decode_head_) {
+         if (argmax_rows_wanted()) {   // sm_80 to sm_89 (sm_7x opt-in): the pick over many blocks a row (bitwise the one-block kernel's)
+             argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
+         } else {
+@@ -2634,6 +2653,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         }
+         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
+         if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
++        }
+     }
+     stamp(g.n_layers, 1, 0);
+     if (tap_on_ && !batch_rec_ && tap_file_ != nullptr) copy_from_mapped(m_tap_, tap_dev_, (int64_t) T * (int64_t) tap_layers_.size() * N, cs);
+@@ -2747,7 +2767,8 @@ void Verifier::refresh_ar() {
+ 
+ bool Verifier::capture(int T, std::string& err) {
+     const auto cap_t0 = std::chrono::steady_clock::now();
+-    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];
++    cudaGraphExec_t& exec_t = record_decode_head_ ? exec_decode_head_[sel_long_][T]
++                                                 : ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];
+     if (exec_t != nullptr) return true;
+     {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
+         size_t free_b = 0, total_b = 0;
+@@ -3252,6 +3273,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+     using namespace strata::kernels;
+     const OnDevice on_device(device_);
+     last_batch_ = false;
++    last_decode_head_ = false;
+     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+     // a layer split's hand-off buffers hold kVerifyMaxT rows
+     if (T > kVerifyMaxT && (next_ != nullptr || lb_ > 0)) { err = "verify: windows past 8 tokens need one stage"; return false; }
+@@ -3799,7 +3821,13 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
+     }
+     // run() synchronized cs_ before returning, so the head of this window is complete
+     std::vector<float> h((size_t) T * (size_t) n_vocab_);
+-    if (cudaMemcpy(h.data(), head_logits_, h.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
++    if (last_decode_head_ && decode_head_) {
++        for (int t = 0; t < T; ++t)
++            if (!copy_logits(t, h.data() + (size_t) t * (size_t) n_vocab_)) {
++                err = "window_logprobs: the remote head logits copy failed";
++                return false;
++            }
++    } else if (cudaMemcpy(h.data(), head_logits_, h.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+         err = "window_logprobs: the head logits copy failed";
+         return false;
+     }
+@@ -4639,6 +4667,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
+     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
+     row_base_ = hbase;   // the graphs' key (and nothing else) reads it until the next stage_batch
+     last_batch_ = true;
++    last_decode_head_ = false;
+     for (int t = 0; t < S; ++t) { last_tokens_[t] = tokens[t]; last_pos_b_[t] = pos[t]; }
+     ms_host += ms_since(t0);
+     return true;
+@@ -4661,6 +4690,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
+     last_t_ = S;
+     for (int t = 0; t < S; ++t) { last_rows_[t] = rows[t]; last_tokens_[t] = tokens[t]; last_pos_b_[t] = pos[t]; }
+     last_batch_ = true;
++    last_decode_head_ = false;
+     // a slot with its own sampling, penalties or logit bias (set_slot_sampling / set_slot_history / set_slot_logit_bias): its row is drawn again from the
+     // window's logits with Philox(seed, position), as a solo window draws it; a plain greedy slot keeps the window's argmax token
+     {
+@@ -5112,6 +5142,10 @@ bool Verifier::copy_logits(int t, float* host) const {
+     return strata::metal_engine::window_copy_logits(metal_, t, host);
+ #endif
+     if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
++    if (last_decode_head_ && decode_head_) {
++        if (!decode_head_->copy_logits(t, host)) return false;
++        return !decode_head_second_ || decode_head_second_->copy_logits(t, host + decode_head_second_->row_begin());
++    }
+     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
+     return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
+                       cudaMemcpyDeviceToHost) == cudaSuccess;
+@@ -5141,6 +5175,53 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
+                  rd(h_flagB_), ev(ev_done_), ev(ev_commit_), (int) commit_live_);
+ }
+ 
++bool Verifier::set_decode_head(const NativeHead& head, std::string& err, const NativeHead* second) {
++    const OnDevice on_device(device_);
++    if (!g_ || !last_stage() || !head_ || !head_->loaded() || !head.loaded() || head.device() == device_ ||
++        head.type() != head_->type() || head.weight_bytes() != head_->weight_bytes() || fl_active_) {
++        err = "decode head: requires an idle final verifier and the same native weights on another GPU";
++        return false;
++    }
++    if (second && (!second->loaded() || second->device() == device_ || second->device() == head.device() ||
++                   second->type() != head.type() || second->weight_bytes() != head.weight_bytes())) {
++        err = "decode head: the second shard needs the same weights on another GPU";
++        return false;
++    }
++    // Whole quantized rows, with a tile-aligned boundary; every row retains its original dot-product order.
++    const int cut = second ? ((int) n_vocab_ / 2 / 128) * 128 : 0;
++    if (second && (cut <= 0 || cut >= n_vocab_)) { err = "decode head: vocabulary too small to shard"; return false; }
++    auto window = std::make_unique<DecodeHeadWindow>();
++    if (!window->init(head, device_, (int) g_->n_embd, (int) n_vocab_, max_t_,
++                      g_mmvq_il(), strata::kernels::argmax_rows_wanted(), nan_guard_on(), err, 0, cut)) return false;
++    std::unique_ptr<DecodeHeadWindow> other;
++    if (second) {
++        other = std::make_unique<DecodeHeadWindow>();
++        if (!other->init(*second, device_, (int) g_->n_embd, (int) n_vocab_, max_t_,
++                         g_mmvq_il(), strata::kernels::argmax_rows_wanted(), nan_guard_on(), err,
++                         cut, (int) n_vocab_ - cut)) return false;
++    }
++    decode_head_ = std::move(window);
++    decode_head_second_ = std::move(other);
++    return true;
++}
++
++bool Verifier::prepare_decode_head(std::string& err) {
++    if (!decode_head_) return true;
++    const OnDevice on_device(device_);
++    if (fl_active_ || ar_off_) { err = "decode head: prepare requires idle, resident PW windows"; return false; }
++    struct Reset { bool& flag; ~Reset() { flag = false; } } reset{record_decode_head_};
++    struct NoEvict { bool& flag; bool old; ~NoEvict() { flag = old; } } keep{no_window_eviction_, no_window_eviction_};
++    no_window_eviction_ = true;
++    record_decode_head_ = true;
++    for (int sl = 0; sl < (select_long_on() ? 2 : 1); ++sl) {
++        sel_long_ = sl;
++        for (int T = 1; T <= max_t_; ++T)
++            if (!capture(T, err)) { sel_long_ = 0; return false; }
++    }
++    sel_long_ = 0;
++    return decode_head_->capture_all(err) && (!decode_head_second_ || decode_head_second_->capture_all(err));
++}
++
+ bool Verifier::capture_all(std::string& err) {
+     const OnDevice on_device(device_);
+     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
+@@ -5221,6 +5302,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
+     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+     const Clock::time_point t0 = Clock::now();
+     last_batch_ = false;
++    last_decode_head_ = false;
+     bool staged = pl_prestaged_ && last_t_ == T && last_pos0_ == pos0;
+     for (int t = 0; staged && t < T; ++t) staged = last_tokens_[t] == tokens[t];
+     if (staged && ss.ple.ready() && ple_stage())
+@@ -5237,11 +5319,24 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
+     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
+     ms_host += ms_since(t0);
+     strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
+-    const cudaError_t le = cudaGraphLaunch(exec_[sl][T], cs_);
++    // Only PW2 decode enables this. Bias/history and probability acceptance keep the original graph.
++    fl_decode_head_ = decode_head_active_ && decode_head_ && !ar_off_ && head_sampling_ &&
++                      hist_d_ == nullptr && sampling_.penalty_last_n <= 0 && sampling_.logit_bias == nullptr &&
++                      spec_q_ == nullptr && !spec_measure_ &&
++                      (!decode_head_second_ || sampling_.greedy || sampling_.temperature <= 0.0f);
++    cudaGraphExec_t graph = fl_decode_head_ ? exec_decode_head_[sl][T] : exec_[sl][T];
++    if (graph == nullptr) { err = "decode head: body graph was not prepared"; return false; }
++    const cudaError_t le = cudaGraphLaunch(graph, cs_);
+     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
+     if (cudaEventRecord(ev_done_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
++    if (fl_decode_head_) {
++        // Queue the remote head now. Its independent stream waits for the producer event across devices,
++        // so completion does not need a host round trip before the projection can start.
++        if (!decode_head_->launch(T, &sampling_, (uint64_t) pos0, err, ev_done_) ||
++            (decode_head_second_ && !decode_head_second_->launch(T, &sampling_, (uint64_t) pos0, err, ev_done_))) return false;
++    }
+     (void) cudaStreamQuery(cs_);   // WDDM: submit now
+     fl_active_ = true;
+     fl_since_ms_ = fl_flush_ms_ = fl_launch_ms_ = now_ms();
+@@ -5358,6 +5453,15 @@ bool Verifier::done(std::string& err) {
+         if (cudaStreamQuery(copy_) == cudaErrorNotReady) return false;
+         copy_used_ = false;
+     }
++    if (fl_decode_head_) {
++        const bool first_done = decode_head_->done(err);
++        if (!err.empty()) return false;
++        const bool second_done = !decode_head_second_ || decode_head_second_->done(err);
++        if (!first_done || !second_done) {
++            if (err.empty() && now_ms() - fl_since_ms_ > 20000.0) err = "decode head: remote projection timed out";
++            return false;
++        }
++    }
+     return true;
+ }
+ 
+@@ -5371,8 +5475,33 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
+     trace_ev("DONE (pipelined)", -1, -1, (int64_t) (now_ms() - fl_launch_ms_));
+     if (le_ < g.n_layers) return true;   // an earlier stage: the hand-off is written
+     const int T = fl_T_;
++    last_decode_head_ = fl_decode_head_;
++    if (fl_decode_head_) {
++        ++decode_head_windows_;
++        if (decode_head_second_) {
++            for (int t = 0; t < T; ++t) {
++                const int32_t ids[] = {decode_head_->picks()[t],
++                    decode_head_second_->row_begin() + decode_head_second_->picks()[t]};
++                const float scores[] = {decode_head_->scores()[t], decode_head_second_->scores()[t]};
++                h_out_[t] = decode_head_merge_argmax(ids, scores, 2);
++                if (nan_guard_on()) {
++                    // The diagnostics consume a per-row OR; the shards' bin boundaries differ from the full head.
++                    uint32_t bad = 0;
++                    for (int b = 0; b < kNonfiniteBlocks; ++b)
++                        bad |= decode_head_->nonfinite()[t * kNonfiniteBlocks + b] |
++                               decode_head_second_->nonfinite()[t * kNonfiniteBlocks + b];
++                    std::memset(h_nf_ + t * kNonfiniteBlocks, 0, kNonfiniteBlocks * sizeof(uint32_t));
++                    h_nf_[t * kNonfiniteBlocks] = bad;
++                }
++            }
++        } else {
++            std::memcpy(h_out_, decode_head_->picks(), (size_t) T * sizeof(int32_t));
++            if (nan_guard_on()) std::memcpy(h_nf_, decode_head_->nonfinite(),
++                                          (size_t) T * kNonfiniteBlocks * sizeof(uint32_t));
++        }
++    }
+     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+-    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
++    if (!fl_decode_head_ && head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
+         SamplerParams sp = sampling_;
+         sp.counter = (uint64_t) last_pos0_;
+         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+diff --git a/src/kernels/cuda/decode_head.cu b/src/kernels/cuda/decode_head.cu
+new file mode 100644
+index 00000000..bbddbb6b
+--- /dev/null
++++ b/src/kernels/cuda/decode_head.cu
+@@ -0,0 +1,37 @@
++#include "strata/kernels/decode_head.hpp"
++
++#include <cuda_runtime.h>
++
++#include <cassert>
++#include <cstddef>
++#include <stdexcept>
++#include <string>
++
++namespace strata::kernels {
++namespace {
++
++__global__ void gather_head_scores_kernel(const float* __restrict__ logits, int n_rows, int n_vocab,
++                                          const int32_t* __restrict__ ids, float* __restrict__ scores) {
++    for (int row = (int) threadIdx.x; row < n_rows; row += (int) blockDim.x) {
++        const int id = ids[row];
++        assert(id >= 0 && id < n_vocab);
++        if (id < 0 || id >= n_vocab) return;   // retain the bounds guard in release builds
++        const unsigned bits = __float_as_uint(logits[(size_t) row * (size_t) n_vocab + (size_t) id]);
++        scores[row] = __uint_as_float(bits);
++    }
++}
++
++}  // namespace
++
++void gather_head_scores(const float* logits, int n_rows, int n_vocab, const int32_t* ids,
++                        float* scores, void* stream) {
++    if (n_rows == 0) return;
++    if (n_rows < 0 || n_vocab <= 0 || !logits || !ids || !scores)
++        throw std::invalid_argument("gather_head_scores: invalid shape or buffers");
++    gather_head_scores_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(logits, n_rows, n_vocab, ids, scores);
++    const cudaError_t status = cudaGetLastError();
++    if (status != cudaSuccess)
++        throw std::runtime_error(std::string("gather_head_scores: ") + cudaGetErrorString(status));
++}
++
++}  // namespace strata::kernels
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 6d20b830..19b0461f 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -5727,6 +5727,16 @@ int main(int argc, char** argv) {
+     }
+     // ---- layer split across GPUs: each later stage's own copy of the dense weights, its session and (the last) the
+     // head, made on its device before the host arena is mapped (as the drafter below, for the same WDDM reason)
++    // Declared before the stage verifiers so the replicated head outlives their offload graphs.
++    struct DecodeHeadOwner {
++        strata::core::NativeHead head[2];
++        ~DecodeHeadOwner() {
++            for (auto& h : head) {
++                const strata::core::OnDevice on(h.device());
++                h.unload();
++            }
++        }
++    } decode_head_owner;
+     std::vector<std::unique_ptr<GpuStage>> stages;
+     // One stage's dense weights on its device (the caller has made it current): `trim` = only layers [lb, le).
+     auto load_stage_weights = [&](GpuStage& st, int64_t lb, int64_t le, bool trim) -> bool {
+@@ -11739,6 +11749,58 @@ int main(int argc, char** argv) {
+         // prompt read, a stage-1 window waits until the drafter has read the rows of the same parity's previous window)
+         strata::core::Verifier* PV[2][2] = {{&ver, &ver_b}, {pipe ? &stages.back()->ver : nullptr, pipe ? &stages.back()->ver_b : nullptr}};
+         SplitDrive* PSD[2] = {&split_drive, &split_drive_b};
++        // Experimental main-head placement for solo PW2 decode only. The prefill layers, original head,
++        // drafter and every normal graph retain their placement. Unset/-1 keeps the original engine path.
++        int decode_head_device = -1;
++        std::vector<int> decode_head_devices;
++        if (const char* v = std::getenv("STRATA_DECODE_HEAD_GPU"); v != nullptr && v[0] != '\0' && std::strcmp(v, "-1") != 0) {
++            const char* at = v;
++            while (*at) {
++                char* end = nullptr;
++                const long d = std::strtol(at, &end, 10);
++                if (end == at || (*end != '\0' && *end != ',') || d < 0 || d > 31 ||
++                    decode_head_devices.size() >= 2 || (*end == ',' && end[1] == '\0')) {
++                    std::fprintf(stderr, "strata serve: STRATA_DECODE_HEAD_GPU must be -1 (off), D or D1,D2\n");
++                    return 1;
++                }
++                decode_head_devices.push_back((int) d);
++                at = *end == ',' ? end + 1 : end;
++            }
++        }
++        if (!decode_head_devices.empty()) {
++            decode_head_device = decode_head_devices.front();
++            if (decode_head_devices.size() == 2 && decode_head_devices[0] == decode_head_devices[1]) {
++                std::fprintf(stderr, "strata serve: decode head shards need different GPUs\n");
++                return 1;
++            }
++            for (size_t i = 0; i < decode_head_devices.size(); ++i) {
++                const int target = decode_head_devices[i];
++                bool in_split = target == 0;
++                for (const auto& st : stages) in_split = in_split || st->dev == target;
++                if (!pipe || o.pipeline_windows != 2 || !last_st || target == last_st->dev ||
++                    !in_split || o.native_head_shards.empty()) {
++                    std::fprintf(stderr, "strata serve: decode head needs PW2 and different GPUs already in the layer split\n");
++                    return 1;
++                }
++                const strata::core::OnDevice on_head(target);
++                auto& head = decode_head_owner.head[i];
++                if (!head.load(o.native_head_shards, g.n_embd, n_vocab, err) || head.on_host()) {
++                    std::fprintf(stderr, "strata serve: decode head on CUDA%d must fit in VRAM: %s\n", target, err.c_str());
++                    return 1;
++                }
++            }
++            const auto* second = decode_head_devices.size() == 2 ? &decode_head_owner.head[1] : nullptr;
++            for (int par = 0; par < 2; ++par)
++                if (!stage_ver_p(n_stages - 1, par).set_decode_head(decode_head_owner.head[0], err, second)) {
++                    std::fprintf(stderr, "strata serve: decode head: %s\n", err.c_str());
++                    return 1;
++                }
++            std::fprintf(stderr, "strata serve: decode head on CUDA%d%s: %llu MiB replicated per GPU, Q8_1 handoff, "
++                                 "PW2 solo decode%s; prefill and batch placement unchanged\n", decode_head_device,
++                         second ? (std::string("+") + std::to_string(decode_head_devices[1])).c_str() : "",
++                         (unsigned long long) (decode_head_owner.head[0].weight_bytes() >> 20),
++                         second ? " (two vocabulary shards, greedy only)" : " only");
++        }
+         cudaEvent_t pl_mtp_ev[2] = {nullptr, nullptr};
+         bool pl_mtp_live[2] = {false, false};
+         bool pl_prepared = false;
+@@ -11751,6 +11813,8 @@ int main(int argc, char** argv) {
+                     const strata::core::OnDevice on(v.device());
+                     if (!v.capture_all(e)) return false;
+                 }
++            for (int par = 0; par < 2; ++par)
++                if (!stage_ver_p(n_stages - 1, par).prepare_decode_head(e)) return false;
+             if (!mtp.prepare_prefill(e)) return false;
+             if (o.pipeline_windows >= 2 && pl_snap_ok && !mtp.prepare_chain(e)) return false;
+             const strata::core::OnDevice on(mtp.device());
+@@ -17918,6 +17982,16 @@ int main(int argc, char** argv) {
+                     std::printf("ERR %s\n", err.c_str());
+                     return 1;
+                 }
++                // Scope ends only after pl_drain: prompt reads and serial fallbacks always select normal graphs.
++                struct DecodeHeadScope {
++                    strata::core::Verifier& a;
++                    strata::core::Verifier& b;
++                    DecodeHeadScope(strata::core::Verifier& av, strata::core::Verifier& bv) : a(av), b(bv) {
++                        a.set_decode_head_active(true); b.set_decode_head_active(true);
++                    }
++                    ~DecodeHeadScope() { a.set_decode_head_active(false); b.set_decode_head_active(false); }
++                } decode_scope(*PV[1][0], *PV[1][1]);
++                const uint64_t head_windows_before = PV[1][0]->decode_head_windows() + PV[1][1]->decode_head_windows();
+                 struct PW {
+                     int T = 0, seq = 0;
+                     int64_t p = 0;
+@@ -18533,6 +18607,10 @@ int main(int argc, char** argv) {
+                 mtp.set_source_R(ver.final_R_all());   // the serial loop's rows again
+                 const double pl_ms = std::chrono::duration<double, std::milli>(Clock::now() - pl_t0).count();
+                 dt_run += pl_ms;
++                if (decode_head_device >= 0)
++                    std::fprintf(stderr, "strata decode head: CUDA%d, %llu PW2 windows offloaded in this request\n",
++                                 decode_head_device, (unsigned long long) (PV[1][0]->decode_head_windows() +
++                                 PV[1][1]->decode_head_windows() - head_windows_before));
+                 if (dec_timing) {
+                     auto avg = [](double s_, double n_) { return n_ > 0 ? s_ / n_ : 0.0; };
+                     std::fprintf(stderr, "strata pipeline: %lld windows in %.0f ms (%.2f ms/window): %lld speculative, %lld on "
+diff --git a/tests/core/decode_head_test.cpp b/tests/core/decode_head_test.cpp
+new file mode 100644
+index 00000000..0d9b9988
+--- /dev/null
++++ b/tests/core/decode_head_test.cpp
+@@ -0,0 +1,312 @@
++// Manual two-GPU integration test; requires the model's GGUF, not a running engine.
++// decode_head_test --gguf MODEL.gguf --source 7 --target 0 [--target2 4] [--cycles 4]
++#include "strata/artifact/gguf_reader.hpp"
++#include "strata/core/decode_head.hpp"
++#include "strata/core/native_head.hpp"
++#include "strata/core/on_device.hpp"
++#include "strata/kernels/elementwise.hpp"
++#include "strata/kernels/native_mmvq.hpp"
++#include "strata/kernels/verify_kernels.hpp"
++
++#include <cuda_runtime.h>
++#include <chrono>
++#include <climits>
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace {
++void require(bool ok, const std::string& what) { if (!ok) throw std::runtime_error(what); }
++void gpu(cudaError_t e) { require(e == cudaSuccess, cudaGetErrorString(e)); }
++void current_is(int wanted) { int d = -1; gpu(cudaGetDevice(&d)); require(d == wanted, "helper changed the caller's CUDA device"); }
++struct HeadOwner {
++    strata::core::NativeHead head;
++    ~HeadOwner() { const strata::core::OnDevice on(head.device()); head.unload(); }
++};
++struct SourceBuffers {
++    int device;
++    cudaStream_t stream = nullptr;
++    cudaEvent_t ready = nullptr;
++    float *mixed = nullptr, *logits = nullptr;
++    void *q8 = nullptr, *il = nullptr, *scratch = nullptr;
++    int32_t* picks = nullptr;
++    uint32_t* nf = nullptr;
++    explicit SourceBuffers(int d) : device(d) {}
++    ~SourceBuffers() {
++        const strata::core::OnDevice on(device);
++        if (stream) cudaStreamSynchronize(stream);
++        if (mixed) cudaFree(mixed);
++        if (logits) cudaFree(logits);
++        if (q8) cudaFree(q8);
++        if (il) cudaFree(il);
++        if (scratch) cudaFree(scratch);
++        if (picks) cudaFree(picks);
++        if (nf) cudaFree(nf);
++        if (ready) cudaEventDestroy(ready);
++        if (stream) cudaStreamDestroy(stream);
++    }
++};
++struct Expected {
++    std::vector<float> logits;
++    std::vector<int32_t> picks;
++    std::vector<uint32_t> nf;
++};
++float from_bits(uint32_t bits) { float f; std::memcpy(&f, &bits, sizeof f); return f; }
++void test_merge() {
++    const int32_t ids[2] = {41, 7};
++    auto check = [&](uint32_t a, uint32_t b, int32_t want) {
++        const float scores[2] = {from_bits(a), from_bits(b)};
++        require(strata::core::decode_head_merge_argmax(ids, scores, 2) == want, "shard argmax merge edge case");
++    };
++    check(0x3f800000, 0x3f800000, 7);   // equal finite values: smallest global id
++    check(0x00000000, 0x80000000, 7);   // +0 == -0
++    check(0x80000000, 0x00000000, 7);
++    check(0x7f800000, 0x7f800000, 7);   // +inf ties are still valid argmax candidates
++    check(0x3f800000, 0x7f800000, 7);
++    check(0x7fc00000, 0xbf800000, 7);   // NaN is ignored, including negative NaN
++    check(0x3f800000, 0xffc00000, 41);
++    check(0xff800000, 0x7fc00000, 0);   // no value above -inf: original argmax returns zero
++    check(0xff800000, 0xff800000, 0);
++    check(0x00000001, 0x00000000, 41);  // positive subnormal beats zero without host FTZ arithmetic
++    check(0x80000001, 0x80000002, 41);  // negative subnormals retain their IEEE order
++}
++
++size_t test_shards(const strata::core::NativeHead& original, const strata::core::NativeHead& first,
++                   const strata::core::NativeHead& second, SourceBuffers& b, int n, int vocab, int cycles) {
++    using namespace strata::kernels;
++    const int cut = vocab / 2 / 128 * 128;
++    require(cut > 0 && cut < vocab, "vocabulary too small for two aligned row shards");
++    const size_t row_bytes = native_q8_1_bytes(n, 1);
++    std::string err;
++    strata::core::DecodeHeadWindow halves[2];
++    require(halves[0].init(first, b.device, n, vocab, 8, true, true, true, err, 0, cut), err);
++    require(halves[1].init(second, b.device, n, vocab, 8, true, true, true, err, cut, 0), err);
++    for (auto& half : halves) {
++        require(half.capture_all(err), err);
++        SamplerParams sampled;
++        err.clear(); require(!half.launch(1, &sampled, 0, err) && !err.empty(), "sharded sampling was not rejected");
++        err.clear();
++    }
++    size_t cases = 0;
++    for (int t : {1, 2, 3, 8}) for (int cycle = 0; cycle < cycles; ++cycle) {
++        const bool inject_nf = cycle + 1 == cycles;
++        std::vector<float> mixed((size_t) t * n, 0.0f);
++        uint32_t state = 0x56781234u + cycle * 997u + t;
++        if (cycle > 0) for (float& f : mixed) {
++            state = state * 1664525u + 1013904223u;
++            f = (float) ((int) (state >> 16) - 32768) / 8192.0f;
++        }   // cycle zero exercises a full-vocabulary tie
++        Expected expected;
++        expected.logits.resize((size_t) t * vocab); expected.picks.resize(t); expected.nf.resize(t * kNonfiniteBlocks);
++        gpu(cudaMemcpyAsync(b.mixed, mixed.data(), mixed.size() * sizeof(float), cudaMemcpyHostToDevice, b.stream));
++        native_quantize_q8_1(b.mixed, b.q8, n, t, b.stream);
++        const uint16_t half_nan = 0x7e00;
++        if (inject_nf) gpu(cudaMemcpyAsync((uint8_t*) b.q8 + (size_t) (t - 1) * row_bytes,
++                                           &half_nan, sizeof half_nan, cudaMemcpyHostToDevice, b.stream));
++        if (native_mmvq_il_supported(original.type(), t, vocab)) {
++            if (t >= 2) native_q8_1_interleave(b.q8, b.il, n, t, b.stream);
++            native_mmvq_il(original.type(), original.weights(), b.q8, b.il, b.logits, n, vocab, t, b.stream);
++        } else native_mmvq(original.type(), original.weights(), b.q8, b.logits, n, vocab, t, b.stream);
++        argmax_rows(b.logits, t, vocab, b.scratch, b.picks, b.stream);
++        logits_nonfinite_rows(b.logits, t, vocab, b.nf, b.stream);
++        for (auto& half : halves)
++            copy_from_mapped((float*) half.handoff(), (const float*) b.q8, (int64_t) t * row_bytes / sizeof(float), b.stream);
++        gpu(cudaEventRecord(b.ready, b.stream));
++        // Both target streams wait on the same producer event, before any reference D2H copy can block the host.
++        for (auto& half : halves) require(half.launch(t, nullptr, 0, err, b.ready), err);
++        gpu(cudaMemcpyAsync(expected.logits.data(), b.logits, expected.logits.size() * sizeof(float), cudaMemcpyDeviceToHost, b.stream));
++        gpu(cudaMemcpyAsync(expected.picks.data(), b.picks, t * sizeof(int32_t), cudaMemcpyDeviceToHost, b.stream));
++        gpu(cudaMemcpyAsync(expected.nf.data(), b.nf, expected.nf.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, b.stream));
++        gpu(cudaStreamSynchronize(b.stream));
++        for (auto& half : halves) {
++            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
++            while (!half.done(err)) {
++                require(err.empty(), err);
++                require(std::chrono::steady_clock::now() < deadline, "shard timed out");
++                std::this_thread::yield();
++            }
++            std::vector<float> got(half.row_count());
++            for (int r = 0; r < t; ++r) {
++                require(half.copy_logits(r, got.data()), "shard logits copy failed");
++                const float* want = expected.logits.data() + (size_t) r * vocab + half.row_begin();
++                require(std::memcmp(got.data(), want, got.size() * sizeof(float)) == 0, "sharded logits differ from full logits");
++                require(std::memcmp(half.scores() + r, want + half.picks()[r], sizeof(float)) == 0, "shard score is not its selected logit");
++            }
++        }
++        for (int r = 0; r < t; ++r) {
++            const int32_t ids[2] = {halves[0].row_begin() + halves[0].picks()[r], halves[1].row_begin() + halves[1].picks()[r]};
++            const float scores[2] = {halves[0].scores()[r], halves[1].scores()[r]};
++            require(strata::core::decode_head_merge_argmax(ids, scores, 2) == expected.picks[r], "merged shard pick differs");
++            bool have_nf = false, want_nf = false;
++            for (int k = 0; k < kNonfiniteBlocks; ++k) {
++                have_nf |= halves[0].nonfinite()[r * kNonfiniteBlocks + k] != 0 || halves[1].nonfinite()[r * kNonfiniteBlocks + k] != 0;
++                want_nf |= expected.nf[r * kNonfiniteBlocks + k] != 0;
++            }
++            require(have_nf == want_nf, "sharded nonfinite row guard differs");
++        }
++        current_is(b.device);
++        ++cases;
++    }
++    return cases;
++}
++}  // namespace
++
++int main(int argc, char** argv) {
++    try {
++        test_merge();
++        if (argc == 2 && std::strcmp(argv[1], "--merge-only") == 0) { std::puts("PASS: CPU shard-argmax merge edge cases"); return 0; }
++        std::string gguf;
++        int source = 1, target = 0, target2 = -1, cycles = 4;
++        for (int i = 1; i < argc; ++i) {
++            const std::string a = argv[i];
++            require(i + 1 < argc, "missing value for " + a);
++            if (a == "--gguf") gguf = argv[++i];
++            else if (a == "--source") source = std::stoi(argv[++i]);
++            else if (a == "--target") target = std::stoi(argv[++i]);
++            else if (a == "--target2") target2 = std::stoi(argv[++i]);
++            else if (a == "--cycles") cycles = std::stoi(argv[++i]);
++            else throw std::runtime_error("unknown argument: " + a);
++        }
++        if (target2 < 0) target2 = target;
++        require(!gguf.empty() && source >= 0 && target >= 0 && source != target && source != target2 && cycles >= 3,
++                "usage: decode_head_test --gguf MODEL.gguf --source N --target N [--target2 N] [--cycles 4, at least 3]");
++        int devices = 0;
++        const cudaError_t count = cudaGetDeviceCount(&devices);
++        if (count != cudaSuccess || source >= devices || target >= devices || target2 >= devices) {
++            std::fprintf(stderr, "SKIP: requested two GPUs unavailable (count=%d, CUDA=%s)\n", devices, cudaGetErrorString(count));
++            return 77;
++        }
++        const auto paths = strata::gguf_split_paths(gguf);
++        int n = 0, vocab = 0;
++        {
++            const strata::GgufModel model(paths);
++            const auto* tensor = model.find("output.weight");
++            require(tensor && tensor->shape.size() == 2 && tensor->shape[0] <= INT_MAX && tensor->shape[1] <= INT_MAX,
++                    "invalid output.weight shape");
++            n = (int) tensor->shape[0]; vocab = (int) tensor->shape[1];
++        }
++        using namespace strata::kernels;
++        std::string err;
++        HeadOwner original, replica, replica2;
++        gpu(cudaSetDevice(source));
++        require(original.head.load(paths, n, vocab, err), err);
++        require(!original.head.on_host(), "source head spilled to host");
++        gpu(cudaSetDevice(target));
++        require(replica.head.load(paths, n, vocab, err), err);
++        require(!replica.head.on_host(), "target head spilled to host");
++        if (target2 != target) {
++            gpu(cudaSetDevice(target2));
++            require(replica2.head.load(paths, n, vocab, err), err);
++            require(!replica2.head.on_host(), "second target head spilled to host");
++        }
++        gpu(cudaSetDevice(source));
++        constexpr int max_t = 8;
++        const size_t row_bytes = native_q8_1_bytes(n, 1);
++        SourceBuffers b(source);
++        gpu(cudaStreamCreateWithFlags(&b.stream, cudaStreamNonBlocking));
++        gpu(cudaEventCreateWithFlags(&b.ready, cudaEventDisableTiming));
++        gpu(cudaMalloc((void**) &b.mixed, (size_t) max_t * n * sizeof(float)));
++        gpu(cudaMalloc((void**) &b.logits, (size_t) max_t * vocab * sizeof(float)));
++        gpu(cudaMalloc(&b.q8, max_t * row_bytes));
++        gpu(cudaMalloc(&b.il, native_q8_1_il_bytes(n, max_t)));
++        gpu(cudaMalloc(&b.scratch, argmax_rows_scratch_bytes(max_t)));
++        gpu(cudaMemset(b.scratch, 0, argmax_rows_scratch_bytes(max_t)));
++        gpu(cudaMalloc((void**) &b.picks, max_t * sizeof(int32_t)));
++        gpu(cudaMalloc((void**) &b.nf, max_t * kNonfiniteBlocks * sizeof(uint32_t)));
++        size_t cases = 0, compared_logits = 0;
++        for (bool il : {false, true}) for (bool argmax : {false, true}) {
++            // Two independent parity windows run on separate remote streams and reuse the same read-only head.
++            strata::core::DecodeHeadWindow windows[2];
++            for (auto& window : windows) {
++                require(window.init(replica.head, source, n, vocab, max_t, il, argmax, true, err), err);
++                require(window.capture_all(err), err);
++                current_is(source);
++                SamplerParams bad; bad.penalty_last_n = 8;
++                err.clear(); require(!window.launch(1, &bad, 0, err) && !err.empty(), "history was not rejected");
++                bad.penalty_last_n = 0; bad.logit_bias = (const float*) &bad;
++                err.clear(); require(!window.launch(1, &bad, 0, err) && !err.empty(), "bias was not rejected");
++                err.clear(); require(!window.launch(0, nullptr, 0, err) && !err.empty(), "invalid T was not rejected");
++                err.clear();
++            }
++            for (int t : {1, 2, 3, 8}) for (int cycle = 0; cycle < cycles; ++cycle) {
++                Expected expected[2];
++                const bool inject_nf = cycle + 1 == cycles;
++                const bool sampled = !inject_nf && (cycle % 2 != 0);
++                SamplerParams sp;
++                sp.greedy = !sampled; sp.temperature = sampled ? 0.7f : 0.0f;
++                sp.top_k = 20; sp.top_p = 0.9f; sp.seed = 0x68a0135;
++                for (int parity = 0; parity < 2; ++parity) {
++                    Expected& e = expected[parity];
++                    e.logits.resize((size_t) t * vocab); e.picks.resize(t); e.nf.resize(t * kNonfiniteBlocks);
++                    std::vector<float> mixed((size_t) t * n);
++                    uint32_t state = 0x12435678u + 131u * cycle + 17u * parity + t;
++                    for (float& f : mixed) { state = state * 1664525u + 1013904223u; f = (float) ((int) (state >> 16) - 32768) / 8192.0f; }
++                    gpu(cudaMemcpyAsync(b.mixed, mixed.data(), mixed.size() * sizeof(float), cudaMemcpyHostToDevice, b.stream));
++                    native_quantize_q8_1(b.mixed, b.q8, n, t, b.stream);
++                    // Exercise nonfinite reporting without quantizing an invalid float input: poison one Q8 scale.
++                    const uint16_t half_nan = 0x7e00;
++                    if (inject_nf) gpu(cudaMemcpyAsync((uint8_t*) b.q8 + (size_t) (t - 1) * row_bytes,
++                                                       &half_nan, sizeof half_nan, cudaMemcpyHostToDevice, b.stream));
++                    if (il && native_mmvq_il_supported(original.head.type(), t, vocab)) {
++                        if (t >= 2) native_q8_1_interleave(b.q8, b.il, n, t, b.stream);
++                        native_mmvq_il(original.head.type(), original.head.weights(), b.q8, b.il, b.logits, n, vocab, t, b.stream);
++                    } else native_mmvq(original.head.type(), original.head.weights(), b.q8, b.logits, n, vocab, t, b.stream);
++                    if (argmax) argmax_rows(b.logits, t, vocab, b.scratch, b.picks, b.stream);
++                    else { SamplerParams greedy; greedy.greedy = true; greedy.temperature = 0;
++                           sample_tokens(b.logits, t, vocab, nullptr, 0, greedy, b.picks, b.stream); }
++                    sp.counter = 100000 + 97 * cycle + 11 * parity + t;
++                    if (sampled) sample_tokens(b.logits, t, vocab, nullptr, 0, sp, b.picks, b.stream);
++                    logits_nonfinite_rows(b.logits, t, vocab, b.nf, b.stream);
++                    copy_from_mapped((float*) windows[parity].handoff(), (const float*) b.q8,
++                                     (int64_t) t * row_bytes / sizeof(float), b.stream);
++                    gpu(cudaEventRecord(b.ready, b.stream));
++                    // Launch before even the pageable reference-result copies: a pageable cudaMemcpyAsync may
++                    // block the host, accidentally turning an intended cross-device-event test into a sync test.
++                    if (parity == 1) require(windows[parity].launch(t, sampled ? &sp : nullptr, sp.counter, err, b.ready), err);
++                    gpu(cudaMemcpyAsync(e.logits.data(), b.logits, e.logits.size() * sizeof(float), cudaMemcpyDeviceToHost, b.stream));
++                    gpu(cudaMemcpyAsync(e.picks.data(), b.picks, t * sizeof(int32_t), cudaMemcpyDeviceToHost, b.stream));
++                    gpu(cudaMemcpyAsync(e.nf.data(), b.nf, e.nf.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, b.stream));
++                    gpu(cudaStreamSynchronize(b.stream));
++                    if (parity == 0) require(windows[parity].launch(t, sampled ? &sp : nullptr, sp.counter, err), err);
++                    current_is(source);
++                }
++                for (int parity = 0; parity < 2; ++parity) {
++                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
++                    while (!windows[parity].done(err)) {
++                        require(err.empty(), err);
++                        require(std::chrono::steady_clock::now() < deadline, "remote head timed out");
++                        std::this_thread::yield();
++                    }
++                    current_is(source);
++                    const Expected& e = expected[parity];
++                    std::vector<float> row(vocab);
++                    for (int r = 0; r < t; ++r) {
++                        require(windows[parity].copy_logits(r, row.data()), "remote logits copy failed");
++                        require(std::memcmp(row.data(), e.logits.data() + (size_t) r * vocab, (size_t) vocab * sizeof(float)) == 0,
++                                "logits differ: IL=" + std::to_string(il) + " argmax=" + std::to_string(argmax) +
++                                " T=" + std::to_string(t) + " cycle=" + std::to_string(cycle) + " row=" + std::to_string(r));
++                    }
++                    require(std::memcmp(windows[parity].picks(), e.picks.data(), t * sizeof(int32_t)) == 0, "sampled/greedy picks differ");
++                    require(std::memcmp(windows[parity].nonfinite(), e.nf.data(), e.nf.size() * sizeof(uint32_t)) == 0, "nonfinite flags differ");
++                    bool any_nf = false; for (uint32_t f : e.nf) any_nf |= f != 0;
++                    require(any_nf == inject_nf, "nonfinite injection did not exercise the expected guard");
++                    current_is(source);
++                    ++cases; compared_logits += (size_t) t * vocab;
++                }
++            }
++        }
++        std::printf("PASS: %zu head windows, %zu bitwise logits; T=1,2,3,8; both IL/argmax settings; greedy/seeded sampling; "
++                    "nonfinite flags; two parity buffers; host/event handoffs; source=%d target=%d\n", cases, compared_logits, source, target);
++        const size_t shard_cases = test_shards(original.head, replica.head, target2 == target ? replica.head : replica2.head,
++                                               b, n, vocab, cycles);
++        std::printf("PASS: %zu sharded windows; bitwise full logits, gathered scores, merged greedy picks, row NF guards; "
++                    "source=%d targets=%d,%d\n", shard_cases, source, target, target2);
++        return 0;
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "FAIL: %s\n", e.what());
++        return 1;
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+
