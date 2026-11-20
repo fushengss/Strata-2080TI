@@ -1,0 +1,454 @@
+diff --git a/include/strata/core/conversation_buffer.hpp b/include/strata/core/conversation_buffer.hpp
+index 2ba8aaa6..bb9fb311 100644
+--- a/include/strata/core/conversation_buffer.hpp
++++ b/include/strata/core/conversation_buffer.hpp
+@@ -62,8 +62,11 @@ public:
+             (count > SIZE_MAX / sizeof(Segment) || !add(total, count * sizeof(Segment)))) return SIZE_MAX;
+         return total;
+     }
+-    void resize(size_t n, uint8_t value = 0) { resize_impl(n, &value); }
+-    void resize_impl(size_t n, const uint8_t* value) {
++    void resize(size_t n, uint8_t value = 0) { resize_impl(n, &value, segment_bytes); }
++    // `piece`: the largest segment this call adds (segment_bytes unless a caller asks for less).  A fresh capture in pieces of
++    // 1 MiB leaves segments that are all one size, so those of an evicted or superseded image are exactly what the next
++    // capture needs and a block cache hands them out again with their pages in (see conversation_kv_save).
++    void resize_impl(size_t n, const uint8_t* value, size_t piece) {
+         if (n > size_) {
+             const size_t held = size_;
+             const bool growing = held != 0;
+@@ -77,7 +80,7 @@ public:
+                 size_ += extend;
+             }
+             while (size_ < n) {
+-                const size_t count = std::min(segment_bytes, n - size_);
++                const size_t count = std::min(piece, n - size_);
+                 const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
+                 Segment segment;
+                 segment.reserve(segment_capacity(count, previous, growing, held));
+@@ -99,7 +102,7 @@ public:
+     void pop_back() { resize(size_ - 1); }
+     // resize() without the zero fill of what it adds (the fresh pages are not touched here): only for a caller that
+     // writes every added byte before anything reads it (STRATA_PARK_ASYNC's background copy)
+-    void resize_for_overwrite(size_t n) { resize_impl(n, nullptr); }
++    void resize_for_overwrite(size_t n, size_t piece = segment_bytes) { resize_impl(n, nullptr, piece > 0 ? piece : segment_bytes); }
+ 
+     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
+     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) {
+diff --git a/src/core/conversation_snapshot.cpp b/src/core/conversation_snapshot.cpp
+index 0e4c440b..93c4ee02 100644
+--- a/src/core/conversation_snapshot.cpp
++++ b/src/core/conversation_snapshot.cpp
+@@ -249,11 +249,25 @@ bool on_device(const void* p) {
+ // STRATA_PARK_TRACE: where conversation_kv_save's time goes since the park's begin (ms): the pointer-attribute
+ // queries, the host buffer resizes and the copies (into the stage, or the synchronous ones).  Read by the park trace.
+ struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; };
+-KvSaveTrace& kv_save_trace() { static KvSaveTrace t; return t; }
++// (per thread: a layer split's stages are saved on threads of their own, STRATA_PARK_THREADS)
++KvSaveTrace& kv_save_trace() { thread_local KvSaveTrace t; return t; }
+ bool park_trace_on() {
+     static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr;
+     return on;
+ }
++// STRATA_KV_PIECE_KIB (read once; default 1024, 16384 gives the 16 MiB segments of before): the size of the pieces a K/V part
++// is captured in.  1 MiB pieces are all one size, so the pieces of an evicted or superseded image are exactly what the next
++// park needs (a block cache keeps their pages in); with 16 MiB segments the tail of every part (0-16 MiB, ~40% of a
++// conversation's K/V on the 8x RTX 2080 Ti split) came in a size no other part shared.  A copy per MiB costs ~15 us.
++size_t kv_piece_bytes() {
++    static const size_t v = [] {
++        const char* e = std::getenv("STRATA_KV_PIECE_KIB");
++        long long k = e != nullptr ? std::atoll(e) : 1024;
++        k = std::max<long long>(64, std::min<long long>(k, 16384));
++        return (size_t) k << 10;
++    }();
++    return v;
++}
+ 
+ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
+     if (!n) return true;
+@@ -339,7 +353,8 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
+                             return true;
+                         })) return false;
+                 } else {
+-                    dst[i]->resize(sizes[i]);
++                    // every byte past the kept prefix is written by the copy below (or the save fails): no zero fill first
++                    dst[i]->resize_for_overwrite(sizes[i], kv_piece_bytes());
+                     if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
+                             return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                         })) return false;
+@@ -357,8 +372,9 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
+         const bool staged = a.active && src[i] != nullptr && sizes[i] > keep && a.used + (sizes[i] - keep) <= a.cap &&
+                             (st.kv_mode == 0 || on_device(src[i]));
+         const auto t1 = tick();
+-        if (staged) dst[i]->resize_for_overwrite(sizes[i]);
+-        else dst[i]->resize(sizes[i]);
++        // staged or not, every byte past the kept prefix is written by the copy below (or the save fails): no zero fill first.
++        // (A zero fill touched the fresh pages one more time: 36-72 ms of a stage's 45-90 ms K/V save on the 8x RTX 2080 Ti split.)
++        dst[i]->resize_for_overwrite(sizes[i], kv_piece_bytes());
+         const auto t2 = tick();
+         const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
+                 const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
+@@ -594,6 +610,8 @@ void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& cop
+ 
+ bool conversation_park_async_begin(size_t need) {
+     if (park_trace_on()) kv_save_trace() = {};   // (the sums cover this park's saves)
++    // switch off: none of the shared stage state is touched (a layer split's stages begin their saves on threads of their own)
++    if (!park_async_on()) return false;
+     conversation_park_join();   // (the stage is reused)
+     ParkAsync& a = park_async();
+     a.active = false;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 9a0d92e4..217f0ec5 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -401,6 +401,29 @@ bool ckpt_threads_env() {
+     }();
+     return on;
+ }
++// STRATA_PARK_THREADS (read once; on by default, =0 turns it off): a layer split parks and restores every stage's image at
++// once, each on a thread of its own device, instead of one stage after the other.  The bytes are the same.
++bool park_threads_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_PARK_THREADS");
++        return !(v && v[0] == '0');
++    }();
++    return on;
++}
++// STRATA_SLOT_DRAFT_DIRECT (read once; off by default): a batch slot's draft K/V is copied card-to-card from the solo drafter's
++// (and back) instead of through a host image, as the main K/V already is (STRATA_SLOT_COPY_DIRECT).
++bool slot_draft_direct_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_SLOT_DRAFT_DIRECT");
++        return v && v[0] != '\0' && v[0] != '0';
++    }();
++    return on;
++}
++// STRATA_PARK_TRACE (read once): the admission's copies say where their time goes
++bool slot_trace_env() {
++    static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr;
++    return on;
++}
+ // STRATA_SLOT_CKPT_MOVE=1 (read once; off by default): a batch admission MOVES its own turn checkpoint into the slot
+ // instead of copying it (~112 MB of host vectors).  The main session's chain no longer holds it, so the request path
+ // looks for it in the slots' checkpoints too: while the main session's cells still hold its tokens it is restored there
+@@ -12173,6 +12196,7 @@ int main(int argc, char** argv) {
+             });
+         };
+         pool_topup();   // the first request's checkpoints find the pool full
++        StageThreads park_threads;   // STRATA_PARK_THREADS: a park's and a restore's stages at once (started on first use)
+         auto park_source = [&](const ParkSource& src, size_t held) -> bool {
+             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
+             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
+@@ -12332,23 +12356,55 @@ int main(int argc, char** argv) {
+                     }
+                     checks.erase(checks.begin() + (std::ptrdiff_t) w, checks.end());
+                 }
+-                const bool saved = strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, err,
+-                        std::move(reuse), &reused_bytes, storage.empty() ? nullptr : &storage,
+-                        moved.empty() ? nullptr : &moved);
++                // STRATA_PARK_THREADS (default on; =0 puts the stage-by-stage order back): each stage's image is the bytes of its
++                // own device, session, checkpoint parts and retained K/V, so the stages are captured at once - stage 0 on this
++                // thread (it also takes the pooled checkpoints), the later ones on park_threads' persistent threads (the copies'
++                // private streams belong to a thread) - and a park costs its slowest stage instead of the sum of all of them.
++                // On the 8x RTX 2080 Ti split a 48K-token park took 0.95 s stage after stage (per stage 100-170 ms).
++                struct StagePark {
++                    bool ok = false;
++                    std::string why;
++                    size_t reused = 0;
++                    strata::core::SavedConversation part;   // a later stage's image (stage 0's is `image`)
++                    std::exception_ptr thrown;
++                };
++                std::vector<StagePark> sp(n_st + 1);
++                const std::function<void(size_t)> park_job = [&](size_t j) {   // j = 0: stage 0, j >= 1: later stage j - 1
++                    StagePark& r = sp[j];
++                    try {
++                        if (j == 0) {
++                            r.ok = strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, r.why,
++                                    std::move(reuse), &r.reused, storage.empty() ? nullptr : &storage,
++                                    moved.empty() ? nullptr : &moved);
++                            return;
++                        }
++                        const size_t k = j - 1;   // the later stages (the last one with the draft layer's K/V)
++                        auto& st = stages[k];
++                        const strata::core::OnDevice on(st->dev);
++                        if (cudaDeviceSynchronize() != cudaSuccess) { r.why = "stage sync failed"; return; }
++                        const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
++                        r.ok = strata::core::conversation_snapshot_save(r.part, view_k, *src.stage_sessions[k], g, draft_of(k), r.why,
++                                std::move(stage_reuse[k]), &r.reused);
++                    } catch (...) {
++                        r.thrown = std::current_exception();   // (a failed allocation: rethrown below, as without the threads)
++                    }
++                };
++                if (park_threads_env() && n_st > 0) {
++                    park_threads.run(n_st + 1, park_job);
++                } else {
++                    for (size_t j = 0; j <= n_st; ++j) {
++                        park_job(j);
++                        if (sp[j].thrown || !sp[j].ok) break;   // as before: the later stages are not tried after a failure
++                    }
++                }
++                for (StagePark& r : sp)
++                    if (r.thrown) std::rethrow_exception(r.thrown);
+                 for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
+-                if (!saved) return false;
++                for (const StagePark& r : sp) reused_bytes += r.reused;
++                for (const StagePark& r : sp)
++                    if (!r.ok) { err = r.why; return false; }
+                 pool_topup();   // what the park took (and what moved out) is allocated again, in the background
+-                for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
+-                    auto& st = stages[k];
+-                    const strata::core::OnDevice on(st->dev);
+-                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+-                    const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
+-                    strata::core::SavedConversation part;
+-                    if (!strata::core::conversation_snapshot_save(part, view_k, *src.stage_sessions[k], g, draft_of(k), err,
+-                            std::move(stage_reuse[k]), &reused_bytes))
+-                        return false;
+-                    image.stage_images.push_back(std::move(part));
+-                }
++                for (size_t k = 0; k < n_st; ++k) image.stage_images.push_back(std::move(sp[k + 1].part));
+                 const auto mem_after = strata::core::sample_host_memory();
+                 if (!strata::core::conversation_memory_admit(
+                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
+@@ -14282,33 +14338,49 @@ int main(int argc, char** argv) {
+         }();
+         auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+             const int64_t upto = (int64_t) ids.size();
+-            auto sync_all = [&]() {
+-                bool ok = true;
+-                for (size_t k = 0; k < bslot_ss.size(); ++k) {
++            // STRATA_PARK_THREADS (default on): every stage's device is synchronized, copied and synchronized again on a thread
++            // of its own.  A streamed state's K/V pools are host memory, so its copies are host-to-host: one stage after the
++            // other they ran at 4-6 GB/s in all (130-370 ms an admission at 50K-150K tokens on the 8x RTX 2080 Ti split).
++            // =0: one stage after the other, as before.
++            // STRATA_SLOT_COPY_BATCHSYNC: every copy is only queued, and the sync at the end of a stage is the one wait per device
++            const bool queued = slot_copy_batchsync_env();
++            const size_t n_sc = bslot_ss.size();
++            std::vector<std::string> sc_why(n_sc);
++            std::vector<char> sc_ok(n_sc, 0);
++            std::vector<std::exception_ptr> sc_thrown(n_sc);
++            const std::function<void(size_t)> slot_copy_job = [&](size_t k) {
++                try {
+                     const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+-                    ok = cudaDeviceSynchronize() == cudaSuccess && ok;
++                    if (cudaDeviceSynchronize() != cudaSuccess) { sc_why[k] = "batch slot copy: device sync failed"; return; }
++                    strata::core::SessionState& main_ss = k == 0 ? ss : stages[k - 1]->ss;
++                    strata::core::SessionState& slot_ss = *bslot_ss[k][(size_t) b];
++                    strata::core::SessionState& from = into_slot ? main_ss : slot_ss;
++                    strata::core::SessionState& to = into_slot ? slot_ss : main_ss;
++                    bool good = strata::core::conversation_checkpoint_copy(from, to, ids, g, sc_why[k], queued);
++                    for (int64_t j = 0; good && j < from.qsa_alloc; ++j)
++                        good = strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
++                                                                  to.qsa_states[to.qsa_ord0 + j], g, upto, true, sc_why[k], queued);
++                    // a copy that fails part-way leaves earlier residency refreshes queued on the legacy stream: drain them
++                    // before the caller reuses the sessions (its zeroing runs on non-blocking streams, not ordered against these)
++                    const bool synced = cudaDeviceSynchronize() == cudaSuccess;
++                    if (good && !synced) sc_why[k] = "batch slot copy: device sync failed";
++                    sc_ok[k] = good && synced ? 1 : 0;
++                } catch (...) {
++                    sc_thrown[k] = std::current_exception();
+                 }
+-                return ok;
+             };
+-            // a copy that fails part-way leaves earlier residency refreshes queued on the legacy stream: drain them
+-            // before the caller reuses the sessions (its zeroing runs on non-blocking streams, not ordered against these)
+-            auto failed = [&]() { (void) sync_all(); return false; };
+-            if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
+-            // STRATA_SLOT_COPY_BATCHSYNC: every copy is only queued, and the sync_all below is the one wait per device
+-            const bool queued = slot_copy_batchsync_env();
+-            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+-                strata::core::SessionState& main_ss = k == 0 ? ss : stages[k - 1]->ss;
+-                strata::core::SessionState& slot_ss = *bslot_ss[k][(size_t) b];
+-                strata::core::SessionState& from = into_slot ? main_ss : slot_ss;
+-                strata::core::SessionState& to = into_slot ? slot_ss : main_ss;
+-                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+-                if (!strata::core::conversation_checkpoint_copy(from, to, ids, g, e, queued)) return failed();
+-                for (int64_t j = 0; j < from.qsa_alloc; ++j)
+-                    if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
+-                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued))
+-                        return failed();
++            if (park_threads_env() && n_sc > 1) {
++                park_threads.run(n_sc, slot_copy_job);
++            } else {
++                for (size_t k = 0; k < n_sc; ++k) {
++                    slot_copy_job(k);
++                    if (sc_thrown[k] || !sc_ok[k]) break;
++                }
+             }
+-            if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
++            for (std::exception_ptr& x : sc_thrown)
++                if (x) std::rethrow_exception(x);
++            for (size_t k = 0; k < n_sc; ++k)
++                if (!sc_ok[k]) { e = sc_why[k]; return false; }
+             return true;
+         };
+         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+@@ -14317,6 +14389,7 @@ int main(int argc, char** argv) {
+             // the running state and the K/V of the Metal window, not the session's device buffers
+             return strata::metal_engine::window_slot_copy_main(true, b, upto, false, e);
+ #endif
++            const Clock::time_point ts0 = Clock::now();
+             if (slot_copy_direct) {
+                 if (!direct_slot_copy(true, b, ids, e)) return false;
+             } else
+@@ -14340,6 +14413,7 @@ int main(int argc, char** argv) {
+                 }
+                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+             }
++            const Clock::time_point ts1 = Clock::now();
+             if (batch_df2) {
+                 // The solo drafter's ring holds the prompt (its taps came with the prompt read): the slot's drafter starts from an exact copy of it.
+ #if defined(STRATA_HAVE_DFLASH2)
+@@ -14351,15 +14425,27 @@ int main(int argc, char** argv) {
+                 // are on the drafter's device (the last stage's GPU with a layer split): the copy's ring refill is a
+                 // kernel launch there.
+                 const strata::core::OnDevice on_mtp(mtp.device());
+-                strata::core::ConversationKv image;
+-                if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
+-                    !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
+-                    !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(),
+-                                                           draft_geometry, upto, false, e) ||
+-                    cudaDeviceSynchronize() != cudaSuccess)
+-                    return false;
++                if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e)) return false;
++                if (slot_draft_direct_env()) {
++                    if (!strata::core::conversation_kv_copy(mtp.kv_state(), slot_mtp[(size_t) b]->kv_state(), draft_geometry,
++                                                            upto, false, e, false) ||
++                        cudaDeviceSynchronize() != cudaSuccess)
++                        return false;
++                } else {
++                    strata::core::ConversationKv image;
++                    if (!strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
++                        !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(),
++                                                               draft_geometry, upto, false, e) ||
++                        cudaDeviceSynchronize() != cudaSuccess)
++                        return false;
++                }
+                 slot_mtp[(size_t) b]->set_prompt_len(upto);
+             }
++            if (slot_trace_env())
++                std::fprintf(stderr, "strata parktrace: slot %d takes %lld tokens: stages %.1f ms, draft K/V %.1f ms%s\n", b, (long long) upto,
++                             std::chrono::duration<double, std::milli>(ts1 - ts0).count(),
++                             std::chrono::duration<double, std::milli>(Clock::now() - ts1).count(),
++                             slot_draft_direct_env() ? " (card to card)" : "");
+             return true;
+         };
+         // slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
+@@ -14374,6 +14460,7 @@ int main(int argc, char** argv) {
+             if (!strata::metal_engine::window_slot_copy_main(false, b, upto, at != nullptr, e)) return false;
+             return at == nullptr || strata::core::conversation_checkpoint_restore(*at, ss, g, e);   // (the checkpoint's running state)
+ #endif
++            const Clock::time_point ts0 = Clock::now();
+             if (slot_copy_direct && at == nullptr) {
+                 if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
+             } else
+@@ -14402,6 +14489,7 @@ int main(int argc, char** argv) {
+                 }
+                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
+             }
++            const Clock::time_point ts1 = Clock::now();
+             if (batch_df2) {
+ #if defined(STRATA_HAVE_DFLASH2)
+                 if (!df2.copy_state_from(*slot_df2[(size_t) b], e)) return false;   // a returning solo request goes on from the slot's ring
+@@ -14410,15 +14498,27 @@ int main(int argc, char** argv) {
+             if (batch_mtp) {
+                 // A returning solo request resumes from its slot's draft KV (on the drafter's device, as above).
+                 const strata::core::OnDevice on_mtp(mtp.device());
+-                strata::core::ConversationKv image;
+-                if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
+-                    !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
+-                                                        draft_geometry, upto, false, e) ||
+-                    !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
+-                    cudaDeviceSynchronize() != cudaSuccess)
+-                    return false;
++                if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e)) return false;
++                if (slot_draft_direct_env()) {
++                    if (!strata::core::conversation_kv_copy(slot_mtp[(size_t) b]->kv_state(), mtp.kv_state(), draft_geometry,
++                                                            upto, false, e, false) ||
++                        cudaDeviceSynchronize() != cudaSuccess)
++                        return false;
++                } else {
++                    strata::core::ConversationKv image;
++                    if (!strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
++                                                            draft_geometry, upto, false, e) ||
++                        !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
++                        cudaDeviceSynchronize() != cudaSuccess)
++                        return false;
++                }
+                 mtp.set_prompt_len(upto);
+             }
++            if (slot_trace_env())
++                std::fprintf(stderr, "strata parktrace: slot %d gives back %lld tokens: stages %.1f ms, draft K/V %.1f ms%s\n", b, (long long) upto,
++                             std::chrono::duration<double, std::milli>(ts1 - ts0).count(),
++                             std::chrono::duration<double, std::milli>(Clock::now() - ts1).count(),
++                             slot_draft_direct_env() ? " (card to card)" : "");
+             return true;
+         };
+         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
+@@ -16584,25 +16684,52 @@ int main(int argc, char** argv) {
+             }
+             if (incoming) {
+                 const auto t0 = Clock::now();
+-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
+-                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
+-                    strata::core::ConversationRestore::restored) {
++                // STRATA_PARK_THREADS: the stages' images go back at once - stage 0's on this thread, each later stage's on a
++                // thread of its own device (as in park_source) - and the restore costs its slowest stage, not the sum of them
++                const size_t n_rs = stages.size() + 1;
++                std::vector<std::string> rwhy(n_rs);
++                std::vector<char> rres(n_rs, 0);   // 0 not tried, 1 restored, 2 the restore failed, 3 the stage's sync failed
++                std::vector<std::exception_ptr> rthrown(n_rs);
++                const std::function<void(size_t)> restore_job = [&](size_t j) {   // j = 0: stage 0, j >= 1: later stage j - 1
++                    try {
++                        if (j == 0) {
++                            rres[0] = strata::core::conversation_snapshot_restore(*incoming, ss, g,
++                                    use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, rwhy[0]) ==
++                                      strata::core::ConversationRestore::restored ? 1 : 2;
++                            return;
++                        }
++                        const size_t i = j - 1;   // the later stages' parts
++                        const strata::core::OnDevice on(stages[i]->dev);
++                        if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
++                                use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, rwhy[j]) !=
++                            strata::core::ConversationRestore::restored) {
++                            rres[j] = 2;
++                            return;
++                        }
++                        rres[j] = cudaDeviceSynchronize() == cudaSuccess ? 1 : 3;
++                    } catch (...) {
++                        rthrown[j] = std::current_exception();
++                    }
++                };
++                if (park_threads_env() && !stages.empty()) {
++                    park_threads.run(n_rs, restore_job);
++                } else {
++                    for (size_t j = 0; j < n_rs; ++j) {
++                        restore_job(j);
++                        if (rthrown[j] || rres[j] != 1) break;
++                    }
++                }
++                for (std::exception_ptr& x : rthrown)
++                    if (x) std::rethrow_exception(x);
++                for (size_t j = 0; j < n_rs; ++j) {
++                    if (rres[j] == 1) continue;
+                     // Already prevalidated above: a failure here is fatal, never
+                     // permission to decode from a partially restored session.
+-                    std::printf("ERR restoring parked conversation: %s\n", err.c_str());
++                    if (j == 0) std::printf("ERR restoring parked conversation: %s\n", rwhy[0].c_str());
++                    else if (rres[j] == 3) std::printf("ERR stage sync\n");
++                    else std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[j - 1]->dev, rwhy[j].c_str());
+                     return 1;
+                 }
+-                for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
+-                    const strata::core::OnDevice on(stages[i]->dev);
+-                    if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
+-                            use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+-                        strata::core::ConversationRestore::restored) {
+-                        std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
+-                                    err.c_str());
+-                        return 1;
+-                    }
+-                    if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
+-                }
+                 if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
+                     uint64_t draft_hash = 0;
+                     const auto& draft_kv = stages.empty() || mtp_first ? incoming->kv.back() : incoming->stage_images.back().kv.back();

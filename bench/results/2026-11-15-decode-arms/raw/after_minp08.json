@@ -1,0 +1,192 @@
+{
+ "inflight_before": 0,
+ "mix": [
+  {
+   "same": true,
+   "len": 1726,
+   "base_len": 1726,
+   "first_diff": null
+  },
+  {
+   "same": true,
+   "len": 1726,
+   "base_len": 1726,
+   "first_diff": null
+  }
+ ],
+ "long64c": [
+  {
+   "ttft": 10.87,
+   "decode": 133.7
+  },
+  {
+   "ttft": 11.12,
+   "decode": 134.5
+  }
+ ],
+ "docq": [
+  {
+   "ttft": 5.83,
+   "tps": 113.5,
+   "text": "*   **Functionality:** `--pipeline-windows 2` allows the first GPU to begin processing the next verify window while the last GPU is still verifying the current one, using speculative execution to potentially skip half of the next window\u2019s work.\n*   **Default Behavior:** It is enabled by default for AMD RDNA4 cards in server mode with specific split configurations, but remains opt-in for NVIDIA and Intel Arc setups.\n*   **Draft Layer Placement:** When active, the draft layer loads on the first card to ensure its window is complete before the speculative chain begins, unless overridden by `STRATA_MTP_STAGE0=0`.\n*   **Limitations:** The feature is disabled for batch slots, peer devices, helper caches, single-GPU splits, missing draft layers, and requests involving repetition penalties or coupled sampling.\n*   **Resource Cost:** Enabling this mode requires a second verify window on each card, reduces expert cache space by 160 MiB"
+  },
+  {
+   "ttft": 6.63,
+   "tps": 113.2,
+   "text": "Based on the provided text, here is a summary of the pipeline window mechanics in five bullet points:\n\n*   **Serial Decode Timing:** In the serial serve loop, timing lines list wall-time parts in execution order: `adapt wait`, `verify`, `commit/emit`, `draft`, `adapt join`, and `other` (the remainder of decode time).\n*   **Pipelined Decode Format:** Pipelined decoding retains the older timing format (`ms/window = verify ...`) and does not cover batch slots, requiring scripts to handle both formats.\n*   **Adaptive Tier Swaps:** The adaptive tier (`--adapt-every`) manages VRAM expert swaps between decode windows; the `--adapt-async` flag moves these swaps to a helper thread to avoid blocking the main decode loop.\n*   **RAM Adaptation:** With `STRATA_RAM_ADAPT`, the RAM copy also follows the conversation, swapping up to 4 expert pairs per window based on"
+  },
+  {
+   "ttft": 3.03,
+   "tps": 117.2,
+   "text": "Based on the provided text, there is **no section titled \"pipeline windows.\"**\n\nHowever, the text contains a section on **`--prefill-pipe`** (which relates to pipeline processing for multi-GPU setups) and a section on **Memory Modes** (which often involves windowing/streaming concepts). Assuming you are referring to the **`--prefill-pipe`** setting mentioned in the \"Tuning for your PC\" section, here is the summary:\n\n*   **Purpose:** It controls prompt chunking to keep multiple GPU cards reading data simultaneously.\n*   **Use Case:** Specifically designed for multi-GPU setups using layer splitting.\n*   **Reference:** Detailed configuration is found in the separate `MULTI_GPU.md` file.\n*   **Context:** It is one of several PC-specific tuning flags (alongside `--pcie-frac` and `--pool-workers`).\n*   **Default:** The text does not specify a"
+  }
+ ],
+ "solo_c": [
+  97.7,
+  101.6,
+  94.3
+ ],
+ "code_c": [
+  152.3,
+  152.5,
+  152.4
+ ],
+ "agent": [
+  116.4,
+  122.2,
+  109.9,
+  120.5
+ ],
+ "four_c": {
+  "wall": 5.0,
+  "tokens": 1024,
+  "total_tps": 203.0,
+  "errors": 0
+ },
+ "eight_c": {
+  "wall": 7.6,
+  "tokens": 2048,
+  "total_tps": 269.9,
+  "errors": 0
+ },
+ "fresh8k": {
+  "ttft": 5.41,
+  "decode": 68.1
+ },
+ "fresh24k": {
+  "ttft": 7.0,
+  "decode": 69.0
+ },
+ "turn2_ttft": 0.26,
+ "fresh64k": {
+  "ttft": 10.95,
+  "decode": 65.7
+ },
+ "app3k": {
+  "first_ttft": 2.57,
+  "append_ttft": [
+   1.08,
+   1.1,
+   1.11
+  ],
+  "append_median": 1.1
+ },
+ "app120k": {
+  "first_ttft": 16.76,
+  "append_ttft": [
+   1.07,
+   1.11,
+   1.14
+  ],
+  "append_median": 1.11
+ },
+ "inflight_after": 0,
+ "busy_at_start": [
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0
+ ],
+ "name": "after_minp08",
+ "arm": {
+  "name": "after_minp08",
+  "live": true,
+  "tests": [
+   "mix",
+   "solo_c",
+   "code_c",
+   "agent",
+   "four_c",
+   "eight_c",
+   "docq",
+   "fresh8k",
+   "fresh24k",
+   "fresh64k",
+   "turn2",
+   "app3k",
+   "app120k",
+   "long64c"
+  ]
+ },
+ "ready_s": 0,
+ "engine_lines": [
+  "strata serve: prompt 23 tokens = 0 reused + 23 read in 224 ms (102.8 tok/s), 1 generated in 17 ms (59.7 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+  "strata serve: prompt 23 tokens = 0 reused + 23 read in 224 ms (102.9 tok/s), 1 generated in 17 ms (59.8 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+  "strata serve: prompt 8122 tokens = 0 reused + 8122 read in 5358 ms (1515.9 tok/s), 120 generated in 1780 ms (67.4 tok/s), drafts accepted 42 of 59, 1 checkpoints",
+  "strata serve: prompt 24292 tokens = 0 reused + 24292 read in 6928 ms (3506.3 tok/s), 119 generated in 1742 ms (68.3 tok/s), drafts accepted 45 of 61, 2 checkpoints",
+  "strata serve: prompt 24432 tokens = 24412 reused + 20 read in 205 ms (97.3 tok/s), 118 generated in 1668 ms (70.7 tok/s), drafts accepted 47 of 64, 3 checkpoints",
+  "strata serve: prompt 64712 tokens = 0 reused + 64712 read in 10820 ms (5980.5 tok/s), 118 generated in 1812 ms (65.1 tok/s), drafts accepted 41 of 57, 4 checkpoints",
+  "strata serve: prompt 3061 tokens = 0 reused + 3061 read in 2542 ms (1204.0 tok/s), 2 generated in 46 ms (43.3 tok/s), drafts accepted 2 of 2, 1 checkpoints",
+  "strata serve: prompt 4008 tokens = 3064 reused + 944 read in 1050 ms (899.5 tok/s), 4 generated in 65 ms (61.3 tok/s), drafts accepted 2 of 2, 2 checkpoints",
+  "strata serve: prompt 4957 tokens = 4012 reused + 945 read in 1073 ms (881.0 tok/s), 6 generated in 87 ms (68.7 tok/s), drafts accepted 4 of 6, 3 checkpoints",
+  "strata serve: prompt 5908 tokens = 4963 reused + 945 read in 1081 ms (874.5 tok/s), 8 generated in 87 ms (92.4 tok/s), drafts accepted 6 of 6, 4 checkpoints",
+  "strata serve: prompt 121296 tokens = 0 reused + 121296 read in 16556 ms (7326.3 tok/s), 2 generated in 49 ms (40.6 tok/s), drafts accepted 2 of 2, 8 checkpoints",
+  "strata serve: prompt 121834 tokens = 121299 reused + 535 read in 964 ms (555.1 tok/s), 4 generated in 68 ms (58.5 tok/s), drafts accepted 2 of 2, 9 checkpoints",
+  "strata serve: prompt 122374 tokens = 121838 reused + 536 read in 1008 ms (532.0 tok/s), 6 generated in 91 ms (65.7 tok/s), drafts accepted 4 of 6, 10 checkpoints",
+  "strata serve: prompt 122916 tokens = 122380 reused + 536 read in 1038 ms (516.5 tok/s), 8 generated in 90 ms (89.2 tok/s), drafts accepted 6 of 6, 11 checkpoints",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata batch (pipelined, 8 groups of 1): 618 group-steps, 1016 rows in 4694 ms = 216.5 rows/s (admissions included) (398 of 617 MTP proposals kept)",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata batch (pipelined, 8 groups of 1): 1248 group-steps, 2036 rows in 7247 ms = 280.9 rows/s (admissions included) (788 of 1244 MTP proposals kept)",
+  "strata serve: --pipeline-windows: a request with repetition penalties (penalty_last_n) decodes serially",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file",
+  "strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file"
+ ]
+}
