@@ -149,6 +149,7 @@ class Tokenizer:
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
         self._special_re = self._alt(list(self.special_tokens))
+        self._special_prefixes = frozenset(s[:i] for s in self.special_tokens for i in range(1, len(s)))
         # Initialize once, rather than allocating a default dict and looking it up
         # through __dict__.setdefault on each encoded segment or decoded token.
         self._piece_ids: dict[str, list[int]] = {}
@@ -333,6 +334,14 @@ class Tokenizer:
         marks: list[tuple[int, int]] = []
         return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain, marks), marks
 
+    def special_resume_limit(self, text: str, shared_end: int) -> int:
+        """First start of a special literal that could extend past the shared text, or its end."""
+        first = max(0, shared_end - self.max_special_len + 1)
+        for start in range(first, shared_end):
+            if text[start:shared_end] in self._special_prefixes:
+                return start
+        return shared_end
+
     def token_bytes(self, i: int) -> bytes:
         """The raw bytes of one token (a multi-byte character can be split across tokens)."""
         cache = self._bytes_cache
@@ -404,12 +413,12 @@ class PromptEncoder:
     WHY THAT IS EXACT.  Encoding splits the text at special-token matches and BPE-encodes each stretch between two
     matches on its own (`_encode_matching`): nothing crosses a match.  Whether a match is taken at position q
     depends only on text[q : q + max_special_len] and on whether q lies inside a `plain` span (#537: a </think>
-    quoted in a message is text).  So if the two texts agree up to L and their plain spans agree below L, every
-    decision the scan makes at a position before c = the end of some match, with c + max_special_len - 1 <= L, is
-    the same for both - the same matches, the same stretches, the same ids up to c - and from c the scan starts
-    afresh, exactly as it does on text[c:] with the spans shifted by c.  Hence encode(new) == ids_old[:ids at c] +
-    encode(new[c:]).  The margin matters only for a vocabulary where a literal overlaps another's end; it costs
-    re-encoding one short stretch.
+    quoted in a message is text).  If both agree below L, only a literal beginning with a nonempty suffix of
+    text[:L] and extending past L can change a match that starts before L.  Resume at a saved match end c at or
+    before the earliest possible start of such a literal.  Tokenizers without the literal test use the earliest
+    possible start based on length alone, L - max_special_len + 1.  All scan decisions that start before c then
+    agree, including matches skipped inside a plain span.  At c the scan starts afresh with the spans shifted by
+    c.  Hence encode(new) == ids_old[:ids at c] + encode(new[c:]).
 
     A few recent prompts are kept (one per conversation: a prompt replaces the one it continues, that is, one whose
     text it reuses for more than half; a prompt that shares only the template's head with every entry is a new
@@ -430,10 +439,12 @@ class PromptEncoder:
         with self.lock:
             entries = self.entries                      # replaced, never changed in place
         margin = self.tok.max_special_len - 1
+        resume_limit = getattr(self.tok, "special_resume_limit", None)
         src, cut_k = None, -1
         for e in entries:
             same = plain_agree_until(e[1], plain, common_prefix_len(e[0], text))
-            k = bisect.bisect_right(e[3], same - margin) - 1   # the last boundary c with c <= same - margin
+            limit = resume_limit(text, same) if resume_limit is not None else same - margin
+            k = bisect.bisect_right(e[3], limit) - 1       # the last saved boundary no later than the safe limit
             if k >= 0 and (src is None or e[3][k] > src[3][cut_k]):
                 src, cut_k = e, k
         if src is None:
