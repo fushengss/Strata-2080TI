@@ -14982,6 +14982,7 @@ int main(int argc, char** argv) {
         }
         struct PGroup {
             bool inflight = false;
+            bool early_handoff = false;     ///< stage is the next stage to submit; reaping does not advance it
             int stage = 0;                  ///< the stage it runs on or waits for
             int32_t tok[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
@@ -14996,6 +14997,42 @@ int main(int argc, char** argv) {
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
+        // A group owns its handoff buffer and events until the verdict. The next stage waits on the producer's event
+        // on its own stream, including on splits that use mapped host memory because CUDA peer access is unavailable.
+        bool early_handoff = false;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+        if (const char* e = std::getenv("STRATA_PIPED_EARLY_HANDOFF"); pmtp && e && std::atoi(e) != 0) {
+            early_handoff = true;
+            for (int k = 0; k < n_pipe; ++k) early_handoff &= stage_verifier(k).ar_live();
+        }
+#endif
+        struct BatchHandoffEvents {
+            std::vector<std::pair<int, cudaEvent_t>> events;
+            ~BatchHandoffEvents() {
+                for (auto [device, event] : events) {
+                    const strata::core::OnDevice on(device);
+                    cudaEventDestroy(event);
+                }
+            }
+        } handoff_events;
+        if (early_handoff) {
+            handoff_events.events.reserve(pg.size() * (size_t) (n_pipe - 1));
+            for (size_t gi = 0; gi < pg.size(); ++gi)
+                for (int k = 0; k < n_pipe - 1; ++k) {
+                    const int dev = stage_verifier(k).device();
+                    const strata::core::OnDevice on(dev);
+                    cudaEvent_t event = nullptr;
+                    if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: piped handoff event allocation failed\n");
+                        return 1;
+                    }
+                    handoff_events.events.emplace_back(dev, event);
+                }
+            std::fprintf(stderr, "strata serve: STRATA_PIPED_EARLY_HANDOFF: CUDA stream dependencies for %zu groups\n", pg.size());
+        }
+        auto handoff_event = [&](int gi, int k) {
+            return handoff_events.events[(size_t) gi * (n_pipe - 1) + k].second;
+        };
         int64_t pipe_tick = 0, rr = 0;
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
         auto group_active = [&](int gi) {
@@ -15251,6 +15288,11 @@ int main(int argc, char** argv) {
             for (int k = 0; k < n_pipe; ++k) {
                 const int gi = stage_group[(size_t) k];
                 if (gi < 0) continue;
+                PGroup& G = pg[(size_t) gi];
+                // Earlier operations can complete while this same pump turn is querying them. Reap them before a
+                // final verdict makes the group's scratch and events eligible for reuse.
+                if (G.early_handoff && k == n_pipe - 1 &&
+                    std::find(stage_group.begin(), stage_group.begin() + k, gi) != stage_group.begin() + k) continue;
                 strata::core::Verifier& vk = stage_verifier(k);
                 const auto p4_p0 = p4.now();
                 const int r = vk.batch_poll(win_pool_fn, win_pool_user, err);
@@ -15260,12 +15302,14 @@ int main(int argc, char** argv) {
                 p4.done(k, gi);
                 if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
                 stage_group[(size_t) k] = -1;
-                PGroup& G = pg[(size_t) gi];
-                if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
+                if (k + 1 < n_pipe) {
+                    if (!G.early_handoff) { G.stage = k + 1; G.since = pipe_tick; }
+                    continue;
+                }
                 // the last stage: the group's picks
                 const int32_t* outb = vk.batch_out();
-                if (pmtp && !pmtp_verdict(G, vk, outb)) return false;
                 const strata::program::PipeProbe::VerdictScope p4_verdict(p4);
+                if (pmtp && !pmtp_verdict(G, vk, outb)) return false;
                 for (int t = 0; t < G.S && !pmtp; ++t) {
                     BSlot& sl = bs[(size_t) (gi * GS + t)];
                     if (!sl.active) continue;
@@ -15387,6 +15431,7 @@ int main(int argc, char** argv) {
                     }
                     G.inflight = true;
                     G.stage = 0;
+                    G.early_handoff = early_handoff && !in_prompt_read;
                     if (batch_telemetry_enabled) G.started = Clock::now();
                     // (with the doorbells on their own thread, a failure it set for a window that left this stage is
                     // not cleared unseen)
@@ -15411,13 +15456,26 @@ int main(int argc, char** argv) {
                     }
                 }
                 const auto p4_l0 = p4.now();
-                if (!(pmtp ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err)
+                const cudaEvent_t upstream = G.early_handoff && k > 0 ? handoff_event(pick, k - 1) : nullptr;
+                if (!(pmtp ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err, upstream)
                            : stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err))) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
                 }
                 p4.launched(k, pick, p4_l0);
                 stage_group[(size_t) k] = pick;
+                if (G.early_handoff) {
+                    if (k < n_pipe - 1) {
+                        auto& vk = stage_verifier(k);
+                        const strata::core::OnDevice on(vk.device());
+                        if (cudaEventRecord(handoff_event(pick, k), vk.stream()) != cudaSuccess) {
+                            std::printf("ERR batch handoff event failed on stage %d\n", k + 1);
+                            return false;
+                        }
+                    }
+                    G.stage = k + 1;
+                    G.since = pipe_tick;
+                }
                 if (conc_serving) {   // the doorbell thread may be waiting between windows: the launch above is seen
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                     if (bell_waiting.load(std::memory_order_relaxed)) {

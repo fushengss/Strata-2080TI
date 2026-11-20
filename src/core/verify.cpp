@@ -4346,7 +4346,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
 }
 
 bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
-                                 std::string& err) {
+                                 std::string& err, cudaEvent_t upstream) {
     const OnDevice on_device(device_);
     if (dc_rows_ < 1) { err = "verify: batch_launch_rows without init_deferred_commit"; return false; }
     if (b_running_) { err = "verify: batch_launch_rows while this stage is busy"; return false; }
@@ -4356,6 +4356,11 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
     const bool staged = stage_batch(rows, S, hbase, tokens, pos, err);
     staging_deferred_ = false;
     if (!staged || !capture_deferred(rows, S, hbase, err)) return false;
+    // Staging and graph capture can synchronize this stream. Add the upstream dependency only once both have finished.
+    if (upstream && cudaStreamWaitEvent(cs_, upstream, 0) != cudaSuccess) {
+        err = "verify: waiting for the upstream batch handoff failed";
+        return false;
+    }
     b_target_head_ = piped_target_head_ != nullptr;
     const auto key = bkey(rows, S, hbase, b_target_head_);
     cudaError_t le = cudaGraphLaunch(exec_bm_[key], cs_);

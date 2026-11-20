@@ -268,7 +268,7 @@ public:
     /// The window over the slots `rows` (a slot's rows contiguous) at hand-off rows [hbase, hbase + S), its save right
     /// behind it, and no commit (batch_commit_rows, after the verdict).  The PLE history advances at the commit.
     bool batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
-                           std::string& err);
+                           std::string& err, cudaEvent_t upstream = nullptr);
     /// Queue the commit of that window's accepted prefixes on this stage's stream (no host wait): `keep` per slot ID,
     /// 1..the slot's rows.  `rows`, `S`, `hbase`, `tokens` and `pos` are the window's, as batch_launch_rows got them.
     bool batch_commit_rows(const int* rows, int S, int hbase, const int* keep, const int32_t* tokens,
