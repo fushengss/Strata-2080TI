@@ -462,12 +462,14 @@ private:
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
     int last_rows_[strata::kernels::kWindowMaxT] = {};                ///< the slots of the last batch window's rows
-    std::vector<int> bkey(const int* rows, int S, int hbase, bool target_head = false) const {   // #871: the doorbell variant has its own graphs
+    std::vector<int> bkey(const int* rows, int S, int hbase, bool target_head = false,
+                          bool direct_save = false) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
         // No ordinary row/layout key contains a negative slot. Keep headless deferred bodies distinct from the
         // ordinary batch graph even when an admission/adaptive step uses the same rows and handoff base.
         if (target_head) k.push_back(-1);
+        if (direct_save) k.push_back(-2);
         return k;
     }
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
@@ -526,7 +528,8 @@ private:
     void* dc_arena_ = nullptr;
     int32_t *h_commitd_ = nullptr, *m_commitd_ = nullptr, *commitd_ = nullptr;
     std::map<std::vector<int>, cudaGraphExec_t> save_bm_, dcommit_bm_;
-    bool capture_deferred(const int* rows, int S, int hbase, std::string& err);
+    bool direct_deferred_save(const int* rows, int S) const;
+    bool capture_deferred(const int* rows, int S, int hbase, bool direct_save, std::string& err);
     /// Free the graph pair of the least recently used batch layout other than `keep` (`evicted`: there was one).
     bool evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err);
     /// cudaGraphInstantiate; out of VRAM, batch layouts other than `key` are evicted (LRU) until it fits, and then (a
@@ -628,7 +631,7 @@ private:
     bool staged_ = false;
     bool copy_used_ = false;
     bool capture_commit(std::string& err);
-    bool record_window(int T, cudaStream_t cs, std::string& err);
+    bool record_window(int T, cudaStream_t cs, std::string& err, bool direct_save = false);
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
     // per layer and token group, written to mapped memory (null when the trace is off)
     void trace_ev(const char* what, int64_t step, int64_t layer, int64_t aux) const;

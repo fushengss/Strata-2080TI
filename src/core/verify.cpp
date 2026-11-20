@@ -1348,7 +1348,7 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) 
 // so the CPU computes A's experts of layer l while the GPU runs B's mixer and router of layer l, and B's experts
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
-bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, bool direct_save) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const WeightTable& wt = *wt_;
@@ -1426,6 +1426,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // a batch window: row t is slot t, whose state lives in its own session
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
+    // A deferred batch can use its saved rows as scratch for the tensors its commit will replay. The
+    // group's next window on this stream is ordered after its commit. Other groups use disjoint rows.
+    const int64_t saved_base = direct_save ? hrow0 : 0;
+    const int64_t saved_stride = direct_save ? dc_rows_ : MT;
+    float* const ple_snap = direct_save ? dc_hist_ + (size_t) saved_base * HS : hist_snap_;
     // STRATA_BATCH_SELF_COMMIT: the window keeps its rows (no commit graph, nothing to snapshot for one)
     const bool keep_rows = batch_rec_ && batch_self_commits(brow_, T);
 
@@ -1570,7 +1575,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else
                         for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
                     native_ple_postops_batch_snap(xn_ + (size_t) tb * HC * N, Rt(tb), z_ + (size_t) tb * N, ss.ple.hist,
-                                                  ss.ple.w, qn, gated, pgate, n, hist_snap_ + (size_t) tb * HS, cs);
+                                                  ss.ple.w, qn, gated, pgate, n, ple_snap + (size_t) tb * HS, cs);
                 } catch (const std::exception& e) {
                     err = std::string("verify PLE (window): ") + e.what();
                     return false;
@@ -1595,7 +1600,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     err = std::string("verify PLE: ") + e.what();
                     return false;
                 }
-                if (!keep_rows) copy_from_mapped(hist_snap_ + (size_t) t * HS, hist, HS, cs);
+                if (!keep_rows) copy_from_mapped(ple_snap + (size_t) t * HS, hist, HS, cs);
             }
             pending = false;
         }
@@ -1677,10 +1682,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const int64_t gi = gdn_idx[(size_t) l];
                 float* state = ss.gdn_state + (size_t) (gi - ss.gdn_ord0) * gdn_floats;
                 float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                float* qkv = qkv_L_ + (size_t) gi * MT * C;
-                float* hb = h_L_ + (size_t) gi * MT * C;
-                float* gate = gate_L_ + (size_t) gi * MT * HV;
-                float* beta = beta_L_ + (size_t) gi * MT * HV;
+                const size_t saved_row = (size_t) (gi * saved_stride + saved_base);
+                float* qkv = (direct_save ? dc_qkv_ : qkv_L_) + saved_row * C;
+                float* hb = (direct_save ? dc_h_ : h_L_) + saved_row * C;
+                float* gate = (direct_save ? dc_gate_ : gate_L_) + saved_row * HV;
+                float* beta = (direct_save ? dc_beta_ : beta_L_) + saved_row * HV;
                 if (sidem) {   // the gates (a few blocks, latency-bound) beside the projections, joined below
                     if (!branch(mfork_, cs, side_, "fork")) return false;
                     gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
@@ -1833,7 +1839,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                     norm_rope_on(data, norm, rows, cols, pos, cs);
                 };
-                float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
+                float* idx_raw = (direct_save ? dc_idx_ : idx_raw_L_) +
+                                 (size_t) (qi * saved_stride + saved_base) * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
                 // STRATA_DF_QB_Q4 (default on since 0.1.45; STRATA_DF_QB_Q4=0 gives the old token-by-token path): a Q4_0 KV cache
@@ -4023,7 +4030,8 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
 
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
     const bool target_head = staging_deferred_ && piped_target_head_ != nullptr;
-    const auto key = bkey(rows, S, hbase, target_head);
+    const bool direct_save = staging_deferred_ && direct_deferred_save(rows, S);
+    const auto key = bkey(rows, S, hbase, target_head, direct_save);
     cudaGraphExec_t& ex = exec_bm_[key];
     if (ex != nullptr) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
@@ -4036,7 +4044,7 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     for (int t = 0; t < S; ++t) brow_[t] = rows[t];
     std::string rerr;
     sel_long_ = 0;   // batch rows: the one-CTA select
-    const bool ok = record_window(S, cs_, rerr);
+    const bool ok = record_window(S, cs_, rerr, direct_save);
     record_piped_target_head_ = false;
     batch_rec_ = false;
     row_base_ = 0;
@@ -4054,7 +4062,8 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
         (void) cudaGetLastError();   // only a warm-up: the first launch uploads it (see capture)
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
-    std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
+    std::fprintf(stderr, "strata verify: captured the batch window over slots %s%s\n", list.c_str(),
+                 direct_save ? " (direct deferred rows)" : "");
     return true;
 }
 
@@ -4210,14 +4219,20 @@ bool Verifier::init_deferred_commit(int rows, std::string& err) {
     return true;
 }
 
-bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& err) {
+// STRATA_PIPED_DIRECT_SAVE=1 removes the post-body save graph for all-resident piped MTP.
+bool Verifier::direct_deferred_save(const int* rows, int S) const {
+    static const bool on = env_on("STRATA_PIPED_DIRECT_SAVE");
+    return on && ar_on() && !batch_self_commits(rows, S);
+}
+
+bool Verifier::capture_deferred(const int* rows, int S, int hbase, bool direct_save, std::string& err) {
     using namespace strata::kernels;
     // The save/commit pair must protect the same executable key while instantiate_evicting handles OOM. A
     // normal key here could evict the new headless body before batch_launch_rows gets a chance to launch it.
-    const auto key = bkey(rows, S, hbase, piped_target_head_ != nullptr);
-    cudaGraphExec_t& sex = save_bm_[key];
+    const auto key = bkey(rows, S, hbase, piped_target_head_ != nullptr, direct_save);
     cudaGraphExec_t& cex = dcommit_bm_[key];
-    if (sex != nullptr && cex != nullptr) return true;
+    cudaGraphExec_t* const sex = direct_save ? nullptr : &save_bm_[key];
+    if ((sex == nullptr || *sex != nullptr) && cex != nullptr) return true;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim, ID = g.idx_key_dim, MT = max_t_;
@@ -4244,7 +4259,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
         return made;
     };
     // the save: the window's rows [0, S) of the scratch the commit replays -> the group's saved rows [hbase, +S)
-    if (sex == nullptr) {
+    if (sex != nullptr && *sex == nullptr) {
         if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
             err = "verify: begin save capture failed";
             return false;
@@ -4268,7 +4283,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
             }
         }
         if (ple) copy(dc_hist_ + (size_t) hbase * HS, hist_snap_, S * HS);
-        if (!finish(sex, ok, "verify: save capture: ")) {
+        if (!finish(*sex, ok, "verify: save capture: ")) {
             if (ok && err.empty()) err = "verify: save capture failed";
             return false;
         }
@@ -4286,6 +4301,59 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                     copy_i32_from_mapped(commitd_ + (size_t) rows[t] * CB, m_commitd_ + (size_t) rows[t] * CB, CB, cs_);
             int64_t qsa_index = 0, gdn_index = 0;
             layer_index(qsa_index, gdn_index);
+            // STRATA_PIPED_COMMIT_LAYERS=1 reuses the solo commit's layer kernels for each
+            // slot's accepted prefix. All layer and slot state is independent here.
+            static const bool batch_layers = env_on("STRATA_PIPED_COMMIT_LAYERS");
+            bool gdn_done[kVerifyMaxT] = {}, qsa_done[kVerifyMaxT] = {};
+            if (batch_layers && ar_on()) {
+                int n_gdn = 0;
+                for (int64_t l = lb_; l < le_; ++l)
+                    if (!is_qsa_layer(g, l)) ++n_gdn;
+                for (int t = 0; t < S && ok;) {
+                    const int first = t, slot = rows[first];
+                    while (t < S && rows[t] == slot) ++t;
+                    const int n = t - first;
+                    const int64_t row = gdn_index * R + hbase + first;
+                    const int32_t* keep = commitd_ + (size_t) slot * CB;
+                    SessionState& sx = *slots_[(size_t) slot];
+                    if (n_gdn > 0 && n > 1) {
+                        gdn_done[first] = gdn_commit_layers(
+                            sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
+                            (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size,
+                            dc_qkv_ + (size_t) row * C, R * C, dc_h_ + (size_t) row * C, R * C,
+                            dc_gate_ + (size_t) row * HV, dc_beta_ + (size_t) row * HV, R * HV, (int) C,
+                            (int) g.ssm_k_heads, (int) HV, n, n_gdn, keep, cs_);
+                    }
+                    if (g_no_batch_kv) continue;
+                    QsaIndexerLayers il;
+                    int nq = 0;
+                    int64_t max_cells = -1;
+                    bool fits = true;
+                    for (int64_t l = lb_; l < le_ && fits; ++l) {
+                        if (!is_qsa_layer(g, l)) continue;
+                        const int64_t qi = qsa_index + nq;
+                        const QsaState& st = sx.qsa_states[qi];
+                        if (nq >= QsaIndexerLayers::kMax || (max_cells >= 0 && st.max_cells != max_cells)) {
+                            fits = false;
+                            break;
+                        }
+                        const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
+                        if (!wikn) { ok = false; break; }
+                        max_cells = st.max_cells;
+                        il.gamma[nq] = (const float*) wikn->data;
+                        il.tail_src[nq] = tail_snap_b_ + ((size_t) slot * nQ + qi) * TS;
+                        il.tail[nq] = st.idx_tail; il.dead[nq] = st.idx_dead; il.pooled[nq] = st.idx_pooled;
+                        il.block_pos[nq] = st.idx_block_pos;
+                        ++nq;
+                    }
+                    if (ok && fits && nq > 0) {
+                        native_qsa_indexer_append_steps_layers(
+                            dc_idx_ + (size_t) (qsa_index * R + hbase + first) * ID, R * ID,
+                            keep + 2, 1, n, 0, EPS, il, nq, s, max_cells, rope_scaling(), cs_);
+                        qsa_done[first] = true;
+                    }
+                }
+            }
             for (int64_t l = lb_; l < le_ && ok; ++l) {
                 const LayerView v(*wt_, l);
                 if (!is_qsa_layer(g, l)) {
@@ -4294,6 +4362,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                     for (int t = 0; t < S;) {
                         const int first = t;
                         while (t < S && rows[t] == rows[first]) ++t;
+                        if (gdn_done[first]) continue;
                         SessionState& sx = *slots_[(size_t) rows[first]];
                         const int32_t* keep = commitd_ + (size_t) rows[first] * CB;
                         float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
@@ -4314,6 +4383,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                     for (int t = 0; t < S;) {
                         const int first = t;
                         while (t < S && rows[t] == rows[first]) ++t;
+                        if (qsa_done[first]) continue;
                         const QsaState& st = slots_[(size_t) rows[first]]->qsa_states[qsa_index];
                         copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qsa_index) * TS, TS, cs_);
                         const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
@@ -4355,11 +4425,13 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
     staging_deferred_ = true;
     const bool staged = stage_batch(rows, S, hbase, tokens, pos, err);
     staging_deferred_ = false;
-    if (!staged || !capture_deferred(rows, S, hbase, err)) return false;
+    if (!staged) return false;
+    const bool direct_save = direct_deferred_save(rows, S);
+    if (!capture_deferred(rows, S, hbase, direct_save, err)) return false;
     b_target_head_ = piped_target_head_ != nullptr;
-    const auto key = bkey(rows, S, hbase, b_target_head_);
+    const auto key = bkey(rows, S, hbase, b_target_head_, direct_save);
     cudaError_t le = cudaGraphLaunch(exec_bm_[key], cs_);
-    if (le == cudaSuccess) le = cudaGraphLaunch(save_bm_[key], cs_);   // the rows the commit replays, kept for it
+    if (le == cudaSuccess && !direct_save) le = cudaGraphLaunch(save_bm_[key], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     if (b_target_head_ && !launch_piped_target_head(S, err)) return false;
     (void) cudaStreamQuery(cs_);
@@ -4373,7 +4445,7 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
 bool Verifier::batch_commit_rows(const int* rows, int S, int hbase, const int* keep, const int32_t* tokens,
                                  const int64_t* pos, std::string& err) {
     const OnDevice on_device(device_);
-    const auto it = dcommit_bm_.find(bkey(rows, S, hbase, piped_target_head_ != nullptr));
+    const auto it = dcommit_bm_.find(bkey(rows, S, hbase, piped_target_head_ != nullptr, direct_deferred_save(rows, S)));
     if (it == dcommit_bm_.end() || it->second == nullptr) { err = "verify: a deferred commit without its window"; return false; }
     const int64_t CB = 2 + max_t_;
     // Each slot's accepted prefix.  The graph reads it from mapped memory when it runs; this slot's entry is written
@@ -4636,7 +4708,8 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     refresh_ar();
     // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
-    const auto key = bkey(rows, S, hbase, staging_deferred_ && piped_target_head_ != nullptr);
+    const auto key = bkey(rows, S, hbase, staging_deferred_ && piped_target_head_ != nullptr,
+                          staging_deferred_ && direct_deferred_save(rows, S));
     bool evicted = false;
     if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
         !evict_batch_graph(key, evicted, err))
